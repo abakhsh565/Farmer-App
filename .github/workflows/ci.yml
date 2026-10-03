@@ -1,0 +1,60 @@
+name: CI
+
+# Every push and every pull request runs the same five gates a developer runs
+# locally, in the same order, so "it passed on my machine" is not a sentence
+# anybody has to say. The APK build is deliberately *not* here: it needs a JDK and
+# the Android SDK, it produces a binary nobody downloads from CI, and a red build
+# for a packaging step would train everyone to ignore red builds.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+
+      - run: npm ci
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Design-system conformance
+        run: npm run lint
+
+      - name: Migration chain
+        run: npm run lint:migrations
+
+      - name: Tests
+        run: npm test
+
+      - name: Production build
+        run: npm run build
+
+  # Vendor contracts drift: a field gets renamed, a unit changes, a code is added.
+# The only way to find out is to ask the real service, which is why this job
+# exists separately from the suite — the suite stays offline and deterministic,
+# and this one is allowed to fail for reasons that are not our bug.
+  live-contracts:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - name: Ask the real vendors
+        env:
+          LIVE: '1'
+        run: npx vitest run src/services/openMeteo.test.ts

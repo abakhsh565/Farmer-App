@@ -178,3 +178,54 @@ reader cannot mistake the staging table for the model.
 ```bash
 npx vitest run src/services
 ```
+
+## Connecting the real backend
+
+Ordered, because each step is verifiable before the next one starts. Nothing here
+requires a code change: every store is already on the repository boundary, and the
+providers are already written against the normalised tables and RPCs.
+
+1. **Create the project** — supabase.com/dashboard → New project. Region: Mumbai
+   (`ap-south-1`) or Singapore, closest to Punjab. Save the database password in a
+   password manager; it is not recoverable.
+
+2. **Apply the schema in one paste** — `npm run db:bundle` writes
+   `supabase/apply-all.sql` (the 17 migrations in filename order, in one
+   transaction). Dashboard → SQL Editor → paste the whole file → Run. Then
+   Advisors → Security, and confirm it reports no table without RLS.
+   Verify with `select count(*) from pg_tables where schemaname = 'public';` → 54.
+
+3. **Point the app at it** — `.env.local`:
+
+   ```
+   VITE_SUPABASE_URL=https://<ref>.supabase.co
+   VITE_SUPABASE_ANON_KEY=<publishable key>
+   VITE_WEATHER_PROVIDER=supabase      # or leave `auto`
+   ```
+
+   Those two values switch persistence, market, dealers and weather together.
+   Rebuild: `npm run build && npm run apk`.
+
+4. **Server-side secrets** — Edge Functions → Secrets. `OPENAI_API_KEY`, the SMS
+   provider's tokens, the FCM service account, AMIS credentials, the dealer
+   system's read-only connection string, `SUPABASE_SERVICE_ROLE_KEY`. None of
+   these may ever appear in `.env.local`: `VITE_*` values are shipped inside the
+   APK.
+
+5. **Deploy the functions** — AI gateway, weather ingest, market ingest, dealer
+   sync, notification dispatch, media processing. Then set `VITE_AI_ENDPOINT` and
+   `VITE_OTP_ENDPOINT`.
+
+6. **Vercel** — import the GitHub repository; `vercel.json` already carries the
+   build command, the SPA fallback and the asset caching. Add the same `VITE_*`
+   values in the project's Environment Variables. The result is a shareable web
+   build of the same app; the APK remains the primary delivery.
+
+7. **CI** — `.github/workflows/ci.yml` runs typecheck, design conformance, the
+   migration chain, the suite and the production build on every push. A scheduled
+   job runs the live vendor check (`LIVE=1`), which is allowed to fail: it is
+   there to notice a vendor renaming a field, not to gate a merge.
+
+**Attribution:** Open-Meteo's free tier asks for a credit link. The weather card
+prints `Source: Open-Meteo`; a visible link belongs in the release build's about
+screen before public launch.

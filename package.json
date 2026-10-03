@@ -14,7 +14,8 @@
     "test": "vitest run --passWithNoTests",
     "test:watch": "vitest",
     "cap:sync": "npm run build && cap sync android",
-    "apk": "npm run cap:sync && node scripts/build-apk.mjs"
+    "apk": "npm run cap:sync && node scripts/build-apk.mjs",
+    "db:bundle": "node scripts/bundle-migrations.mjs"
   },
   "dependencies": {
     "@capacitor/android": "^8.5.2",
