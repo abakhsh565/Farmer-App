@@ -42,3 +42,5 @@ artifacts/
 
 # Editor / agent scratch state
 .freebuff/
+
+.vercel
