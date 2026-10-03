@@ -43,6 +43,20 @@ export default defineConfig({
      */
     env: {
       VITE_WEATHER_PROVIDER: 'development',
+      /*
+       * The same rule for every other endpoint, and now it matters for all of
+       * them: a developer who has filled in `.env.local` — which is the normal
+       * state of a working copy — would otherwise have every screen test talking
+       * to a real project. Empty means "unconfigured", which is what resolves the
+       * suite to the development providers.
+       */
+      VITE_SUPABASE_URL: '',
+      VITE_SUPABASE_ANON_KEY: '',
+      VITE_AI_ENDPOINT: '',
+      VITE_OTP_ENDPOINT: '',
+      VITE_WEATHER_INGEST_ENDPOINT: '',
+      VITE_DEALER_ENDPOINT: '',
+      VITE_POSTHOG_KEY: '',
     },
   },
 });

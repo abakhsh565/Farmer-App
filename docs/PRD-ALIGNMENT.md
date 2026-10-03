@@ -23,10 +23,11 @@ Evidence commands, all currently passing:
 ```
 npx tsc --noEmit              → clean
 npm run lint                  → design check passed
-npm run lint:migrations       → 17 files, 54 tables, 54 with RLS
-npx vitest run                → 17 files, 222 tests passed
+npm run lint:migrations       → 19 files, 55 tables, 55 with RLS
+npm run lint:functions        → 7 sources, routes match, no inlined secrets
+npx vitest run                → 19 files, 238 tests passed (1 skipped)
 npm run build                 → built
-npm run apk                   → artifacts/farmer-app-debug.apk (5.4 MB)
+npm run apk                   → artifacts/farmer-app-debug.apk (5.5 MB)
 ```
 
 ---
@@ -61,19 +62,27 @@ scan result were a second copy of the dealer's price rather than the dealer's ow
 number. `src/App.journeys.test.tsx` and `src/App.resilience.test.tsx` are the
 tests that caught them, and they stay as regression cover.
 
-**Second gap:** there are no Edge Functions (`supabase/functions/` does not
-exist), so nothing is scheduled or integrated server-side: no ingestion, no
-notification dispatch, no AI gateway. The AI and OTP providers are written
-against endpoints that do not exist yet, and fail loudly rather than silently
-when they are unconfigured.
+**Second gap — closed.** `supabase/functions/` now exists and holds three
+functions: `ai` (knowledge-grounded answers and image diagnosis, with the OpenAI
+key read from the server's environment), `otp` (codes generated from a CSPRNG,
+stored as HMACs, rate-limited against stored rows rather than a client timer) and
+`weather-ingest` (Open-Meteo into `weather_readings`, so the UI and the AI read
+the same row). They are written and statically checked, and are **not deployed** —
+that needs a CLI login or a paste into the dashboard.
 
 **Third gap:** the migrations have never been executed. There is no local Postgres
 and no running container runtime in this environment, so they are checked
 statically by `scripts/check-migrations.mjs` (quoting balance, reference ordering,
-duplicate definitions, RLS coverage) and are labelled BUILT, not VERIFIED.
+duplicate definitions, RLS coverage) and are labelled BUILT, not VERIFIED. The
+target project `swmbmtvwgksicfnfsehg` is verified reachable and **empty** — no
+tables — so the schema has a clean slate; applying it needs a DDL-capable
+credential (see [CREDENTIALS-REQUIRED.md](./CREDENTIALS-REQUIRED.md)).
 
-**The APK is a debug build running in local mode.** It is genuinely installable
-and contains the real app, but with no backend credentials compiled in. See
+**The APK is a debug build wired to the real project.** It carries the project URL
+and the publishable key — verified present in the packaged assets, and verified to
+contain the secret key zero times — but the project has no schema yet, so the
+remote providers will report failure until the migrations land. Weather is live
+regardless, because Open-Meteo needs no backend. See
 [ANDROID-BUILD.md](./ANDROID-BUILD.md).
 
 ---

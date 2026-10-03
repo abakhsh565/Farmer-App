@@ -187,6 +187,7 @@ describe('Open-Meteo provider', () => {
       aiEndpoint: { url: null, configured: false },
       otpEndpoint: { url: null, configured: false },
       dealerEndpoint: { url: null, configured: false },
+      weatherIngestEndpoint: { url: null, configured: false },
       analytics: { key: null, host: 'https://eu.i.posthog.com', configured: false },
       weather: { provider: 'open-meteo' },
     };

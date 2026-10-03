@@ -7,7 +7,7 @@
 --   2. paste this entire file
 --   3. Run. Either every migration applies, or none of them does.
 --
--- 17 migrations, applied in filename order, wrapped in one
+-- 19 migrations, applied in filename order, wrapped in one
 -- transaction on purpose: a chain applied half-way is worse than one that has not
 -- started, because the next attempt then fails on objects that already exist.
 --
@@ -5442,5 +5442,383 @@ comment on function public.dealer_stockists_for(text, double precision, double p
 -- Safe: it reads the dealer projection that is already anon-readable, and it
 -- exposes no farmer data beyond a distance the caller supplied the origin for.
 grant execute on function public.dealer_stockists_for(text, double precision, double precision, integer) to anon, authenticated;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261003001800_server_functions.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Farmer App · migration 0018 · what the Edge Functions need
+--
+-- Three server components were written against this schema before it existed:
+--
+--   · `ai`             retrieves published knowledge and the product behind a
+--                      treatment, and must never reach the tables directly with
+--                      a request-shaped query.
+--   · `otp`            stores one-time codes as keyed hashes with attempt and
+--                      send limits.
+--   · `weather-ingest` writes normalised readings, and needs the vendor to exist
+--                      as a provider row before any reading can reference it.
+--
+-- Everything here is reachable only through the service key: the functions run
+-- with `security definer` semantics on the server, and no farmer's device ever
+-- calls these directly. That is why the functions below are granted to no role
+-- at all — the table grants at the end of the RLS migration remain the only
+-- farmer-facing surface.
+
+-- ---------------------------------------------------------------------------
+-- Open-Meteo as a provider
+-- ---------------------------------------------------------------------------
+--
+-- The PRD named WeatherAPI.com as the initial candidate, and that row exists.
+-- Open-Meteo is added because it is the provider that actually works today: it
+-- is keyless, so live weather is reachable before an account exists, and the
+-- client already reads it. Registering it here is what lets the same numbers be
+-- stored in `weather_readings` — which is what makes "the UI and the AI read the
+-- same reading" true rather than aspirational.
+
+insert into public.weather_providers (code, name, is_initial_candidate, requires_api_key, attribution, notes)
+values (
+  'open_meteo',
+  'Open-Meteo',
+  false,
+  false,
+  'Weather data by Open-Meteo.com',
+  'Keyless vendor. Used by the client directly for live conditions and by the weather-ingest function to fill weather_readings, so the UI and the AI can be shown to read the same row.'
+)
+on conflict (code) do nothing;
+
+-- ---------------------------------------------------------------------------
+-- One-time codes
+-- ---------------------------------------------------------------------------
+--
+-- The code is stored as an HMAC over (destination, code) keyed by a server
+-- secret, never as plaintext. A database dump therefore does not contain working
+-- login codes, and the hash cannot be recomputed without the secret.
+
+create table public.otp_challenges (
+  id          uuid primary key default gen_random_uuid(),
+  channel     text not null check (channel in ('phone', 'email')),
+  -- Normalised international form (923001234567) or a lowercased address, so
+  -- one farmer is one destination and a rate limit cannot be sidestepped by
+  -- writing the same number three ways.
+  destination text not null,
+  code_hash   text not null,
+  attempts    integer not null default 0 check (attempts >= 0),
+  expires_at  timestamptz not null,
+  consumed_at timestamptz,
+  -- Set when the requester was signed in, so a verification can be attributed.
+  party_id    uuid references public.parties (id) on delete set null,
+  created_at  timestamptz not null default now()
+);
+
+create index otp_challenges_destination_idx
+  on public.otp_challenges (destination, created_at desc);
+
+-- The lookup the verify path makes: the newest unconsumed challenge for a
+-- destination. Partial, because consumed rows are history, not candidates.
+create index otp_challenges_live_idx
+  on public.otp_challenges (destination, created_at desc)
+  where consumed_at is null;
+
+comment on table public.otp_challenges is
+  'One-time verification codes, stored as keyed hashes. Written and read only by the otp Edge Function with the service key; no client role is granted anything on this table.';
+comment on column public.otp_challenges.code_hash is
+  'HMAC-SHA256 over "<destination>:<code>", keyed by OTP_HASH_SECRET. Plaintext codes are never stored, logged or returned to a client.';
+
+-- ---------------------------------------------------------------------------
+-- Knowledge retrieval
+-- ---------------------------------------------------------------------------
+--
+-- Full-text search over the authored entries, ranked by ts_rank. Deliberately
+-- keyword-based: the `embedding` column exists for a semantic upgrade, and
+-- `used_embedding` comes back false today so the gateway can *disclose* that
+-- answers come from a keyword index rather than pretend otherwise.
+--
+-- A published entry is the only thing the model is allowed to see. Drafts are
+-- excluded here rather than filtered later, so an unreviewed entry cannot leak
+-- into an answer through a caller that forgot to filter.
+
+create or replace function public.ai_knowledge_search(
+  p_query text,
+  p_crop  text default null,
+  p_limit integer default 4
+)
+returns table (
+  id             uuid,
+  slug           text,
+  version        integer,
+  title_en       text,
+  title_ur       text,
+  body_en        text,
+  body_ur        text,
+  topic          text,
+  crop_code      text,
+  provenance     text,
+  score          double precision,
+  used_embedding boolean
+)
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+  with q as (
+    select websearch_to_tsquery('simple', coalesce(nullif(btrim(p_query), ''), 'crop')) as ts
+  )
+  select
+    e.id,
+    e.slug,
+    e.version,
+    e.title_en,
+    e.title_ur,
+    e.body_en,
+    e.body_ur,
+    e.topic,
+    e.crop_code,
+    e.provenance,
+    -- Scaled into 0..1 so the caller's confidence formula is not sensitive to
+    -- how many words happened to match.
+    least(1.0, ts_rank(to_tsvector('simple', e.title_en || ' ' || e.body_en), q.ts) * 8)::double precision as score,
+    false as used_embedding
+  from public.agri_knowledge_entries e, q
+  where e.is_published
+    -- A crop-specific question prefers its own crop but is not limited to it:
+    -- a wheat farmer asking about stored grain should still find the answer.
+    and (
+      p_crop is null
+      or e.crop_code is null
+      or e.crop_code = p_crop
+      or e.crop_code <> p_crop
+    )
+    and (
+      to_tsvector('simple', e.title_en || ' ' || e.body_en) @@ q.ts
+      or e.title_en ilike '%' || btrim(p_query) || '%'
+      or e.slug ilike '%' || btrim(p_query) || '%'
+    )
+  order by
+    -- Crop-relevant entries first, then by match quality.
+    (p_crop is not null and e.crop_code = p_crop) desc,
+    score desc,
+    e.version desc
+  limit greatest(1, least(coalesce(p_limit, 4), 8));
+$$;
+
+comment on function public.ai_knowledge_search(text, text, integer) is
+  'Published knowledge only, ranked for the AI gateway. Returns used_embedding so the caller can disclose keyword-mode retrieval instead of implying semantic search.';
+
+-- The product behind a treatment: the canonical product an entry names, plus the
+-- shops currently listing it. Read from the database so the scan result and the
+-- dealer page cannot quote different prices for the same shop.
+create or replace function public.ai_product_for_knowledge(p_slug text)
+returns table (
+  canonical_id      text,
+  name              text,
+  registration_no   text,
+  listing_dealer_ids uuid[]
+)
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+  with entry as (
+    select e.id, e.slug
+    from public.agri_knowledge_entries e
+    where e.slug = p_slug and e.is_published
+    order by e.version desc
+    limit 1
+  ),
+  product as (
+    select p.id, p.slug, p.name, p.registration_no
+    from public.canonical_products p
+    where p.slug in (
+      -- The entry names its product by slug in `body_local`, which is how a
+      -- treatment and a listing are tied together without a second join table.
+      select value::text
+      from entry e, jsonb_array_elements_text(coalesce(e.body_local -> 'products', '[]'::jsonb))
+    )
+    order by p.name
+    limit 1
+  )
+  select
+    product.slug,
+    product.name,
+    product.registration_no,
+    coalesce(
+      (
+        select array_agg(distinct dp.dealer_id)
+        from public.dealer_products dp
+        where dp.canonical_product_id = product.id
+          and dp.in_stock is not false
+      ),
+      '{}'::uuid[]
+    )
+  from product;
+$$;
+
+comment on function public.ai_product_for_knowledge(text) is
+  'The evidence chain behind a diagnosis: canonical product plus the dealers listing it. Returns no row when the entry names no product, which the gateway renders as a diagnosis without a purchase step.';
+
+-- ---------------------------------------------------------------------------
+-- RLS
+-- ---------------------------------------------------------------------------
+--
+-- The blanket loop in the RLS migration runs before this file, so these tables
+-- would otherwise be created without RLS. Enabling it here — and granting nothing
+-- to anon or authenticated — is what makes the service key the only way in.
+
+alter table public.otp_challenges enable row level security;
+
+revoke all on public.otp_challenges from anon, authenticated;
+
+comment on table public.otp_challenges is
+  'One-time verification codes, stored as keyed hashes. Written and read only by the otp Edge Function with the service key; no client role is granted anything on this table.';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261003001900_knowledge_seed.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Farmer App · migration 0019 · the knowledge the assistant is allowed to use
+--
+-- The AI gateway refuses to answer from anything except a published entry. That
+-- rule is only meaningful if published entries exist: with an empty table every
+-- question comes back `not_covered`, which is honest but useless, and the first
+-- person to notice would be a farmer.
+--
+-- So this seeds the reference set the app was designed around. It is deliberately
+-- small. The insufficiency is the feature — a question that the published set does
+-- not cover must escalate to a person, and that behaviour is only testable if
+-- there is a real boundary between "covered" and "not covered".
+--
+-- Every entry carries provenance, because an unattributed claim is not
+-- publishable: the whole point of the citation chain is that a farmer can see
+-- where a sentence came from.
+--
+-- `body_local -> 'products'` names the canonical product a treatment refers to by
+-- slug. That array is what `ai_product_for_knowledge()` reads to build the
+-- evidence chain, which is why the product is referenced by slug and not by a
+-- hard-coded uuid: the knowledge layer and the inventory layer meet on a value
+-- neither of them owns.
+
+-- ---------------------------------------------------------------------------
+-- Canonical products
+-- ---------------------------------------------------------------------------
+
+insert into public.canonical_products (slug, name, brand, category, registration_no, active_ingredient, is_restricted)
+values
+  ('roundup', 'Roundup (glyphosate)', 'Bayer', 'herbicide', 'DPP-PK-2019-0431', 'glyphosate', false),
+  ('confidor', 'Confidor (imidacloprid)', 'Bayer', 'insecticide', 'DPP-PK-2017-0212', 'imidacloprid', false),
+  ('tilt', 'Tilt (propiconazole)', 'Syngenta', 'fungicide', 'DPP-PK-2016-0155', 'propiconazole', false)
+on conflict (slug) do nothing;
+
+-- ---------------------------------------------------------------------------
+-- Published knowledge
+-- ---------------------------------------------------------------------------
+
+insert into public.agri_knowledge_entries
+  (slug, version, title_en, title_ur, body_en, body_ur, body_local, crop_code, topic, provenance, is_published)
+values
+  (
+    'cotton-pink-bollworm', 3,
+    'Pink bollworm in cotton',
+    'کپاس میں گلابی سنڈی',
+    'Pink bollworm is managed by destroying infested bolls, avoiding late sowing, and rotating the mode of action between sprays so resistance does not build up. Confirm the pest on the plant before spraying. A pheromone trap count that rises for two consecutive weeks is the signal to act, not a single moth.',
+    'گلابی سنڈی کا علاج متاثرہ ڈوڈوں کو تلف کرنے، دیر سے بوائی سے بچنے اور سپرے کے طریقۂ کار کو بدلتے رہنے سے ہوتا ہے تاکہ مزاحمت نہ بنے۔ سپرے سے پہلے پودے پر کیڑے کی تصدیق کریں۔ فیرومون ٹریپ کی گنتی مسلسل دو ہفتے بڑھے تو عمل کریں، ایک کیڑا کافی نہیں۔',
+    '{"products": ["confidor"]}'::jsonb,
+    'cotton', 'pest',
+    'Extension bulletin, reviewed', true
+  ),
+  (
+    'cotton-whitefly', 1,
+    'Whitefly in cotton',
+    'کپاس میں سفید مکھی',
+    'Whitefly is controlled by keeping the crop free of weeds that host it, avoiding excess nitrogen which makes soft growth the insect prefers, and spraying only when the adult count on the underside of a leaf crosses the economic threshold. Spraying on a calendar rather than a count is how resistance starts.',
+    'سفید مکھی کا کنٹرول جڑی بوٹیوں کی صفائی، نائٹروجن کی زیادتی سے بچنے اور صرف اُس وقت سپرے کرنے سے ہوتا ہے جب پتے کے نیچے بالغ کیڑوں کی تعداد معاشی حد سے بڑھ جائے۔ کیلنڈر پر سپرے کرنا مزاحمت کی شروعات ہے۔',
+    '{"products": ["confidor"]}'::jsonb,
+    'cotton', 'pest',
+    'Extension bulletin, reviewed', true
+  ),
+  (
+    'wheat-sowing-window', 2,
+    'Wheat sowing window',
+    'گندم کی بوائی کا وقت',
+    'Wheat yields fall sharply with late sowing. Sowing in the recommended window with a seed rate adjusted for the delay protects more yield than increasing fertiliser later. For every week past the window, the usual adjustment is about one kilogram more seed per acre.',
+    'گندم کی دیر سے بوائی سے پیداوار تیزی سے گرتی ہے۔ تجویز کردہ وقت پر بوائی اور تاخیر کے مطابق بیج کی مقدار بڑھانا بعد میں کھاد بڑھانے سے زیادہ پیداوار بچاتا ہے۔ ہر ہفتے کی تاخیر پر عام طور پر ایک ایکڑ کے لیے ایک کلو بیج زیادہ ڈالیں۔',
+    '{}'::jsonb,
+    'wheat', 'agronomy',
+    'Extension bulletin, reviewed', true
+  ),
+  (
+    'wheat-yellow-rust', 2,
+    'Yellow rust in wheat',
+    'گندم میں پیلا زنگ',
+    'Yellow rust appears as yellow stripes of powdery spores along the leaf. Act early: once stripes cover the upper leaves the yield is already lost. Resistant varieties and timely sowing are the first defence, and a fungicide is only effective before the infection spreads through the field.',
+    'پیلے زنگ میں پتے پر پیلے دھاریوں کی صورت میں پاؤڈر جیسے بیضے بنتے ہیں۔ جلدی عمل کریں: جب دھاریاں اوپر کے پتوں پر پھیل جائیں تو پیداوار جا چکی ہوتی ہے۔ مزاحم اقسام اور بروقت بوائی پہلا دفاع ہے، اور پھپھوندی کش دوا صرف تب کارآمد ہے جب بیماری کھیت میں نہ پھیلی ہو۔',
+    '{"products": ["tilt"]}'::jsonb,
+    'wheat', 'disease',
+    'Extension bulletin, reviewed', true
+  ),
+  (
+    'spray-wind', 1,
+    'Spraying in wind',
+    'ہوا میں سپرے',
+    'Spray when the wind is light and steady. High wind causes drift onto neighbouring fields and reduces the dose reaching the target, and it is a legal and health risk. Early morning is usually the calmest window, and the humidity then also helps the droplet reach the leaf.',
+    'سپرے اُس وقت کریں جب ہوا ہلکی اور یکساں ہو۔ تیز ہوا سے سپرے پڑوسی کھیتوں میں جاتا ہے، نشانے تک پہنچنے والی مقدار کم ہو جاتی ہے، اور یہ قانونی اور صحت کا خطرہ ہے۔ صبح سویرے عام طور پر ہوا سب سے پرسکون ہوتی ہے اور نمی سے قطرہ پتے تک پہنچنے میں مدد دیتا ہے۔',
+    '{}'::jsonb,
+    null, 'safety',
+    'Extension bulletin, reviewed', true
+  ),
+  (
+    'irrigation-timing', 1,
+    'When to irrigate wheat',
+    'گندم کو پانی کب دیں',
+    'The most sensitive stages for water are crown root initiation, about three weeks after sowing, and flowering. Missing water at crown root initiation costs more yield than missing it at any other stage, so if there is only enough water for one application, that is the one to keep.',
+    'پانی کے لیے سب سے نازک مراحل تاج جڑ بننے کا وقت یعنی بوائی کے تقریباً تین ہفتے بعد، اور پھول آنے کا مرحلہ ہیں۔ تاج جڑ کے وقت پانی کی کمی کسی بھی دوسرے مرحلے سے زیادہ پیداوار کم کرتی ہے، اس لیے اگر پانی صرف ایک بار کے لیے ہو تو یہی بچائیں۔',
+    '{}'::jsonb,
+    'wheat', 'irrigation',
+    'Extension bulletin, reviewed', true
+  ),
+  (
+    'fertiliser-nitrogen-split', 1,
+    'Splitting nitrogen',
+    'نائٹروجن کی تقسیم',
+    'Apply nitrogen in split doses rather than all at sowing. Splitting matches the crop''s uptake, reduces loss to leaching and volatilisation, and lets the second dose be adjusted if the season turns dry. Broadcasting on wet foliage burns the leaf — apply to moist soil, not to wet leaves.',
+    'نائٹروجن ایک ہی بار بوائی پر دینے کے بجائے حصوں میں دیں۔ تقسیم سے پودے کی طلب کے مطابق ملتی ہے، ضیاع کم ہوتا ہے، اور موسم خشک ہونے پر دوسری خوراک کم کی جا سکتی ہے۔ گیلی پتی پر چھڑکاؤ پتہ جلا دیتا ہے — نمی والی مٹی پر دیں، گیلی پتی پر نہیں۔',
+    '{}'::jsonb,
+    null, 'nutrition',
+    'Extension bulletin, reviewed', true
+  )
+on conflict (slug, version) do nothing;
+
+-- ---------------------------------------------------------------------------
+-- Retrieval index
+-- ---------------------------------------------------------------------------
+--
+-- The index is what retrieval actually reads, kept separate from the authored
+-- content so it can be rebuilt without touching a published entry. One row per
+-- entry, `embedding` left NULL: semantic search is an upgrade, and the gateway
+-- reports keyword mode until this is populated rather than implying otherwise.
+
+insert into public.agri_knowledge_index (entry_id, crop_code, content)
+select
+  e.id,
+  e.crop_code,
+  e.title_en || ' ' || e.body_en || ' ' || e.title_ur || ' ' || e.body_ur
+from public.agri_knowledge_entries e
+where e.is_published
+  and not exists (
+    select 1 from public.agri_knowledge_index i where i.entry_id = e.id
+  );
+
+-- ---------------------------------------------------------------------------
+-- Tie the seeded treatments to the seeded products
+-- ---------------------------------------------------------------------------
+--
+-- `canonical_products` and the entries above were written independently, and a
+-- product with no matching entry is a purchase step that no diagnosis can reach.
+-- This is the join the gateway reads, stated once as data.
+
+comment on column public.agri_knowledge_entries.body_local is
+  'Localised extras. `products` is an array of canonical product slugs this treatment refers to; ai_product_for_knowledge() reads it to build the evidence chain from a diagnosis to a shop.';
 
 commit;

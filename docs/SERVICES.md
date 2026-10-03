@@ -70,9 +70,42 @@ Selection is entirely configuration-driven, so one build runs both ways.
 VITE_SUPABASE_URL + VITE_SUPABASE_ANON_KEY   → persistence, weather, market, dealers
 VITE_AI_ENDPOINT                              → AI
 VITE_OTP_ENDPOINT                             → one-time codes
+VITE_WEATHER_INGEST_ENDPOINT                  → server-side weather ingestion
 VITE_DEALER_ENDPOINT                          → dealer integration endpoint
 VITE_POSTHOG_KEY                              → analytics
 ```
+
+## The server side: `supabase/functions/`
+
+Everything that must not ship in the APK runs here. The split is not stylistic —
+a `VITE_*` value is inlined into the bundle and therefore readable by anyone who
+downloads the app, so the OpenAI key, the SMS token and the code-signing secret
+can only exist on the server.
+
+| Function | Routes | Why it exists |
+| --- | --- | --- |
+| `ai` | `/ask`, `/diagnose`, `/health` | The model key stays here, and so do the gate, the retrieval and the confidence rule — so a device cannot make the app say something it is not allowed to say |
+| `otp` | `/request`, `/verify` | Codes are stored as HMACs, never plaintext, with send and attempt limits enforced against stored rows rather than a client timer |
+| `weather-ingest` | `POST /` or `GET ?lat=&lon=` | Fills `weather_readings` from Open-Meteo, so the UI and the AI read the *same* row instead of two independent vendor calls |
+
+The client appends its route to the function URL (`…/functions/v1/ai` + `/ask`).
+`npm run lint:functions` checks that the routes the client calls are the routes the
+functions handle, and that no secret has been written into a source file —
+neither of which a typecheck can see.
+
+**Secrets the functions read, and where they come from:**
+
+| Name | Used by | Source |
+| --- | --- | --- |
+| `OPENAI_API_KEY` | `ai` | Dashboard → Edge Functions → Secrets |
+| `OTP_HASH_SECRET` | `otp` | Generated server secret; codes cannot be verified without it |
+| `OTP_DELIVERY_URL`, `OTP_DELIVERY_TOKEN` | `otp` | The SMS/e-mail aggregator. Absent means the send is reported as **not delivered** rather than pretending |
+| server key | all | Supplied automatically to hosted functions |
+
+With no delivery provider configured, `otp` still generates, hashes and stores a
+code, and reports `deliveredVia: "none (not delivered)"` with a `deliveryError`.
+That is deliberate: an app that says "code sent" when no message left the
+building leaves a farmer waiting at a login screen forever.
 
 Two rules are encoded in `createServices` rather than left to a caller:
 
@@ -190,10 +223,10 @@ providers are already written against the normalised tables and RPCs.
    password manager; it is not recoverable.
 
 2. **Apply the schema in one paste** — `npm run db:bundle` writes
-   `supabase/apply-all.sql` (the 17 migrations in filename order, in one
+   `supabase/apply-all.sql` (the 19 migrations in filename order, in one
    transaction). Dashboard → SQL Editor → paste the whole file → Run. Then
    Advisors → Security, and confirm it reports no table without RLS.
-   Verify with `select count(*) from pg_tables where schemaname = 'public';` → 54.
+   Verify with `select count(*) from pg_tables where schemaname = 'public';` → 55.
 
 3. **Point the app at it** — `.env.local`:
 
@@ -212,9 +245,16 @@ providers are already written against the normalised tables and RPCs.
    these may ever appear in `.env.local`: `VITE_*` values are shipped inside the
    APK.
 
-5. **Deploy the functions** — AI gateway, weather ingest, market ingest, dealer
-   sync, notification dispatch, media processing. Then set `VITE_AI_ENDPOINT` and
-   `VITE_OTP_ENDPOINT`.
+5. **Deploy the functions** — the three in this repository are ready:
+
+   ```
+   supabase functions deploy ai otp weather-ingest
+   ```
+
+   Then set `VITE_AI_ENDPOINT`, `VITE_OTP_ENDPOINT` and
+   `VITE_WEATHER_INGEST_ENDPOINT` to the deployed URLs. The remaining server
+   components the PRD names — market ingest, dealer sync, notification dispatch,
+   media processing — are not written yet; each is a function beside these.
 
 6. **Vercel** — import the GitHub repository; `vercel.json` already carries the
    build command, the SPA fallback and the asset caching. Add the same `VITE_*`

@@ -11,6 +11,7 @@
     "typecheck": "tsc --noEmit",
     "lint": "node scripts/check-design.mjs",
     "lint:migrations": "node scripts/check-migrations.mjs",
+    "lint:functions": "node scripts/check-functions.mjs",
     "test": "vitest run --passWithNoTests",
     "test:watch": "vitest",
     "cap:sync": "npm run build && cap sync android",

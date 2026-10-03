@@ -50,6 +50,8 @@ export type ServiceConfig = {
   aiEndpoint: { url: string | null; configured: boolean };
   otpEndpoint: { url: string | null; configured: boolean };
   dealerEndpoint: { url: string | null; configured: boolean };
+  /** The ingestion function. Server-side work the app triggers, never reads. */
+  weatherIngestEndpoint: { url: string | null; configured: boolean };
   analytics: { key: string | null; host: string; configured: boolean };
   /** The source the registry will actually use, already resolved. */
   weather: { provider: Exclude<WeatherSource, 'auto'> };
@@ -71,6 +73,7 @@ function build(): ServiceConfig {
   const aiEndpoint = read('VITE_AI_ENDPOINT');
   const otpEndpoint = read('VITE_OTP_ENDPOINT');
   const dealerEndpoint = read('VITE_DEALER_ENDPOINT');
+  const weatherIngestEndpoint = read('VITE_WEATHER_INGEST_ENDPOINT');
   const analyticsKey = read('VITE_POSTHOG_KEY');
   const requestedWeather = read('VITE_WEATHER_PROVIDER');
   const backendLive = Boolean(supabaseUrl && supabaseAnonKey);
@@ -96,6 +99,10 @@ function build(): ServiceConfig {
     aiEndpoint: { url: aiEndpoint, configured: Boolean(aiEndpoint) },
     otpEndpoint: { url: otpEndpoint, configured: Boolean(otpEndpoint) },
     dealerEndpoint: { url: dealerEndpoint, configured: Boolean(dealerEndpoint) },
+    weatherIngestEndpoint: {
+      url: weatherIngestEndpoint,
+      configured: Boolean(weatherIngestEndpoint),
+    },
     analytics: {
       key: analyticsKey,
       host: read('VITE_POSTHOG_HOST') ?? 'https://eu.i.posthog.com',
@@ -124,6 +131,9 @@ export function configurationReport(): Array<{ service: string; mode: 'remote' |
     { service: 'ai', mode: remote(serviceConfig.aiEndpoint.configured) },
     { service: 'otp', mode: remote(serviceConfig.otpEndpoint.configured) },
     { service: 'dealer', mode: remote(serviceConfig.dealerEndpoint.configured) },
+    // The ingestion function is remote work the app triggers, not a source it
+    // reads, so it is reported separately from `weather`.
+    { service: 'weather-ingest', mode: remote(serviceConfig.weatherIngestEndpoint.configured) },
     { service: 'analytics', mode: remote(serviceConfig.analytics.configured) },
   ];
 }

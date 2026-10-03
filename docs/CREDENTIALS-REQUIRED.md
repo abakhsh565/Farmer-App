@@ -9,7 +9,7 @@ from the PRD and are already implemented.
 
 ## How to read this
 
-- **Blocks the backend** means the 17 migrations in `supabase/migrations/` cannot
+- **Blocks the backend** means the 19 migrations in `supabase/migrations/` cannot
   be applied, so the app runs on its local development providers and the device's
   own storage instead of the real services.
 - **Blocks one integration** means the surrounding architecture, schema, adapter
@@ -19,48 +19,84 @@ from the PRD and are already implemented.
 
 ---
 
+## 0. Status after this round
+
+### Connected and verified
+
+| Service | What was done | Evidence |
+| --- | --- | --- |
+| **Supabase project** | Configured and verified | `swmbmtvwgksicfnfsehg`. Host resolves; publishable key authenticates (`auth/v1/settings` → 200, `storage/v1/bucket` → 200, and a missing table answers 404 rather than 401). Project is **empty** — no tables, no buckets, no functions — so the schema has a clean slate. |
+| **GitHub** | Repository created and pushed | `github.com/abakhsh565/Farmer-App` (private). The URL supplied was `abakhsh56/Farmer-App`, which does not exist — the account is `abakhsh565`. The remote was corrected and `main` pushed. The `gh` CLI was already authenticated on this machine, so no token was needed. |
+| **Weather (Open-Meteo)** | Live and verified | Keyless. The client reads it directly, and `weather-ingest` stores the same numbers in `weather_readings`. Verified against the real service: Wazirabad 30.9 °C, feels 36.5, 66 % humidity, observed `2026-10-03T12:15:00Z`. |
+| **Key hygiene** | Checked, not assumed | The built bundle and the APK both contain the project URL and the publishable key, and contain the secret key **zero** times. The one `sb_secret_` hit is the Supabase client library's own key-format check. |
+| **Edge Functions** | Written, not deployed | `supabase/functions/{ai,otp,weather-ingest}` with `_shared/`. `npm run lint:functions` verifies the routes the client calls are the routes the functions handle, and that no secret is inlined into a source file. |
+
+### What is left on the Supabase side
+
+Three things, and only the first blocks the backend.
+
+**1. Apply the schema — needs one of these from you.**
+
+The 19 migrations are bundled into `supabase/apply-all.sql` (5,825 lines, one
+transaction). Applying it needs a credential I do not have and cannot obtain
+from here:
+
+- **The database password** (Dashboard → Project Settings → Database → Reset database password), or
+- **An `sbp_…` personal access token** (Dashboard → Account → Access Tokens), or
+- **You paste the file yourself**: Dashboard → SQL Editor → paste all of `supabase/apply-all.sql` → Run. This needs no credential sharing at all and takes about a minute.
+
+The secret key you sent is a *PostgREST* key. It is not a database credential and
+cannot execute DDL — which is why the schema is still unapplied.
+
+**2. Deploy the three functions.** They need a CLI login or a paste into the
+dashboard's function editor. `supabase functions deploy ai otp weather-ingest`.
+
+**3. Set the function secrets.** `OPENAI_API_KEY` (rotated — see below),
+`OTP_HASH_SECRET` (any long random string), and `OTP_DELIVERY_URL` +
+`OTP_DELIVERY_TOKEN` once an SMS provider exists.
+
+Two settings worth knowing, both currently off and neither blocking:
+`auth.external.phone` is `false` (our `otp` function does not depend on it — it
+implements phone verification itself), and there are **no storage buckets**, so
+media upload has nowhere to go until one is created.
+
+**The OpenAI key was pasted into chat, and a key that has been in a transcript
+should be treated as compromised.** Rotate it and set the new one only as the
+function secret — never in chat, never in `.env.local`.
+
+---
+
 ## 1. The table
 
 | Service | Why needed | Exact credential / access | Where it will be used | Required for |
 | --- | --- | --- | --- | --- |
-| **Supabase project** (dedicated to the farmer app) | The whole backend — schema, RLS, RPCs, storage, jobs — has nowhere to live | Project ref, `Project URL`, `anon` (publishable) key, `service_role` key, and the database password | `.env.local` → `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`; service role only in Edge Functions and CI, never in the app bundle | **Blocks the backend.** Applying migrations, real auth, real persistence |
+| **Supabase: apply the schema** (see §0) | The project is configured and verified, but has no tables — the 19 migrations have nowhere to land without a DDL-capable credential | One of: the database password, an `sbp_…` personal access token, or a paste of `supabase/apply-all.sql` into the SQL Editor | Nothing client-side — the remote providers already read the schema that this creates | **Blocks the backend.** Real auth, real persistence, real market and dealer data |
 | **WeatherAPI.com** | Live weather instead of a fixture; the PRD names it as the initial MVP candidate | API key (free tier is enough to start) | `weather_readings` ingestion adapter, run on a schedule; read by UI and AI through the same normalised service | Weather in UI and in AI advice |
 | **AMIS Punjab market data** | Real mandi rates. The PRD forbids inventing an AMIS key, so this needs the real thing | Feed endpoint and/or registered credentials, or your written approval of a named alternative source | `market_observations` ingestion adapter → the internal `market_rates()` API | Market rates |
-| **SMS / OTP provider** | The sign-in *machine* is built: request a code, enter it, verify, with expiry, a resend cooldown, an attempt lockout and a distinct sentence for each failure — all driven through the real `OtpProvider` contract and covered by tests. What is missing is the sender, so in development the code is printed on the sheet and labelled as a development build. Without a provider there is no proof of possession of the number | Provide name, e.g. Twilio or a Pakistani aggregator: account SID, auth token, sender/mask ID, plus a template approved for Urdu | The verification Edge Function that sends and checks the code; the client already calls it through `VITE_OTP_ENDPOINT` | Real authentication, and the "verified identity" precondition for expert verification |
+| **SMS / OTP provider** | The sign-in *machine* is built and the `otp` function is written: codes are generated from a CSPRNG, stored as HMACs (never plaintext), and limited to 5 sends an hour and 3 attempts a code. What is missing is the sender | Name, e.g. Twilio or a Pakistani aggregator: account SID, auth token, sender/mask ID, and a template approved for Urdu. Set as `OTP_DELIVERY_URL` + `OTP_DELIVERY_TOKEN` on the `otp` function, plus a generated `OTP_HASH_SECRET` | The `otp` Edge Function. **With no provider configured it reports `deliveredVia: "none (not delivered)"` and a `deliveryError`, rather than claiming a code was sent** | Real authentication, and the "verified identity" precondition for expert verification |
 | **Firebase Cloud Messaging** | Push delivery. The PRD's notification requirement is not satisfied by an in-app list | `google-services.json` for Android, plus a service account JSON for server-side sends | `notification_events` dispatch Edge Function; `google-services.json` into `android/app/` | Real notifications |
-| **AI / LLM provider** (OpenAI or your choice) | The agricultural assistant and the scan diagnosis. Agricultural-only, knowledge-grounded | API key, plus the model name you want to standardise on | Scan and chat Edge Functions; prompts restricted to published `agri_knowledge_entries`; also embeddings for `agri_knowledge_index` | AI chat, scan diagnosis |
+| **AI / LLM provider** (OpenAI or your choice) | The agricultural assistant and the scan diagnosis. Agricultural-only, knowledge-grounded | **A rotated** API key set as the `OPENAI_API_KEY` secret on the deployed `ai` function, plus the model name to standardise on (`OPENAI_MODEL`, default `gpt-4o-mini`) | The `ai` Edge Function, which is written and ready. Prompts are restricted to published `agri_knowledge_entries`; the product a treatment names is read from `canonical_products`, never from the model | AI chat, scan diagnosis |
 | **PostHog** | Analytics and instrumentation are a PRD deliverable and are not built | Project API key and host (self-hosted or cloud) | Client events and the ingestion/sync observability hooks | Analytics, product measurement |
 | **Dealer business system access** (your Agri Shop POS) | The PRD makes the dealer system the source of truth for products, stock, availability and dealer status, with the farmer app as a read-facing projection | Read-only database connection string or a REST endpoint plus a token for the POS project | The dealer sync job that populates `dealer_profiles`, `dealer_products` and writes `dealer_sync_runs` | Real dealer search, real stock and price |
 | **Maps / geocoding provider** (optional but recommended) | Turning a device location into a readable area name; today `location_label` is seeded | Google Maps API key, or an alternative geocoder | Location labelling on profile and dealer search | Location onboarding, area labels |
 | **Android release signing** | A debug APK installs but cannot be published or upgraded in place | Keystore file, key alias, keystore and key passwords | `android/app/build.gradle` `signingConfigs.release` | Play Store release, upgradeable installs |
 
----
+---## 2. The decisions, now answered
 
-## 2. Two decisions I need from you
-
-These are not credentials, but I will not guess them.
-
-**a. Which Supabase project should hold the farmer backend?**
-
-I inspected both existing projects read-only and stopped there, because both hold
-real data:
+**a. Which Supabase project holds the farmer backend?** Answered: a dedicated
+project, `swmbmtvwgksicfnfsehg`, now configured and verified. Both other projects
+hold real data and stay read-only to this app:
 
 | Project | What it actually is | Rows seen |
 | --- | --- | --- |
 | `gkswcfljxlutkfdvvqng` — "Agrishop APp" | The **live shop-owner POS**: sales, sale items, customers, payments, notifications | 52 sales, 57 sale items, 6 customers, 20 payments, 51 notifications |
 | `bpybjrjenwccowvtrevu` — "Agri-shop-App-QA" | The **engineering memory database**: incidents, agent tasks, 64 engineering lessons, 1200 impact analyses | 1200 impact analyses, 64 memories, 5 incidents |
 
-Neither is a farmer-app backend. Per the PRD the POS *is* the dealer source of
-truth, so it stays read-only to this app. My recommendation is a **third,
-dedicated project** for the farmer schema, which keeps the POS untouched and lets
-the dealer sync be a genuine cross-system read.
-
 **b. Is the live POS the right dealer source, or should the sync read QA first?**
-
-Pointing the projection at production data from day one means a farmer can phone a
-shop about stock that is real. Pointing it at QA means the shop cannot be
-embarrassed by a sync bug. My recommendation is QA first, then production once the
-sync has run clean for a week.
+Still open, and it is a business decision rather than a credential. Pointing the
+projection at production data means a farmer can phone a shop about stock that is
+real; pointing it at QA means the shop cannot be embarrassed by a sync bug. My
+recommendation is QA first, then production once the sync has run clean for a week.
 
 ---
 
@@ -68,17 +104,20 @@ sync has run clean for a week.
 
 No redesign, no restart. In order:
 
-1. `supabase db push` the 17 migrations to the chosen project; confirm the
-   security advisors report no table without RLS. No client change is needed for
-   this step — the schema is what the remote providers already read.
+1. Apply the 19 migrations — either `supabase db push`, or paste the bundled
+   `supabase/apply-all.sql` into the dashboard's SQL editor. Confirm the security
+   advisors report no table without RLS. No client change is needed for this
+   step — the schema is what the remote providers already read.
 2. Set `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` and rebuild. That single
    flag switches persistence, weather, market and dealers from the development
    providers to the real backend together, deliberately: they are all reads of the
    same normalised data, and having one remote and another local would let the app
    contradict itself about the same fact. Nothing in a screen or a store changes —
    they are already on the repository boundary.
-3. Deploy the Edge Functions: AI gateway, weather ingest, market ingest, dealer
-   sync, notification dispatch, media processing.
+3. Deploy the three functions that are written — `ai`, `otp`, `weather-ingest` —
+   and set the `OPENAI_API_KEY` and `OTP_HASH_SECRET` secrets on them. The other
+   server components the PRD names (market ingest, dealer sync, notification
+   dispatch, media processing) are not written yet.
 4. Run the RLS test pass — one farmer attempting to read another farmer's credit
    request, one guest attempting to write, one dealer attempting to accept a visit
    they were not asked for. Each must fail.

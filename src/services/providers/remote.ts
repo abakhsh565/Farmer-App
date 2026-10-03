@@ -58,6 +58,9 @@ import type { MessageKey } from '../../i18n/catalog';
 type SupabaseLike = {
   from: (table: string) => unknown;
   rpc: (fn: string, args?: Record<string, unknown>) => Promise<{ data: unknown; error: { message: string } | null }>;
+  auth: {
+    getSession: () => Promise<{ data: { session: { access_token: string } | null } }>;
+  };
 };
 
 let cachedClient: SupabaseLike | null = null;
@@ -85,6 +88,25 @@ async function supabase(): Promise<SupabaseLike | null> {
     return cachedClient;
   } catch {
     clientFailed = true;
+    return null;
+  }
+}
+
+/**
+ * The signed-in farmer's access token, or null.
+ *
+ * Read from the Supabase client's own session rather than from a store of our
+ * own, so there is exactly one copy of the token and one place that refreshes it.
+ * A guest is a legitimate answer here: the AI gateway answers guests, and an
+ * expired token in the moment before refresh simply arrives as one.
+ */
+async function currentAccessToken(): Promise<string | null> {
+  const client = cachedClient;
+  if (!client) return null;
+  try {
+    const { data } = await client.auth.getSession();
+    return data.session?.access_token ?? null;
+  } catch {
     return null;
   }
 }
@@ -505,12 +527,18 @@ export class RemoteAiProvider implements AiProvider {
 
   constructor(private readonly endpoint = serviceConfig.aiEndpoint.url) {}
 
+  /**
+   * The path is appended to the function URL, not to the project URL: the
+   * function is one Edge Function with internal routes (`/ask`, `/diagnose`),
+   * and Supabase passes the trailing segment through. A caller that posted to
+   * the bare function URL would reach the router with an empty route.
+   */
   private async post<T>(path: string, body: unknown): Promise<T> {
     if (!this.endpoint) throw new Error('AI endpoint is not configured.');
 
-    const response = await fetch(`${this.endpoint}${path}`, {
+    const response = await fetch(`${this.endpoint.replace(/\/+$/, '')}${path}`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...(await this.authHeaders()) },
       body: JSON.stringify(body),
     });
 
@@ -519,6 +547,19 @@ export class RemoteAiProvider implements AiProvider {
     }
 
     return (await response.json()) as T;
+  }
+
+  /**
+   * The farmer's own token, when there is one.
+   *
+   * The gateway accepts guests, so this is not authorisation — it is how a
+   * signed-in question is attributed to the party that asked it. A body field
+   * claiming an identity would be trusted by nobody, which is why the identity
+   * travels in the header the server can verify.
+   */
+  private async authHeaders(): Promise<Record<string, string>> {
+    const token = await currentAccessToken();
+    return token ? { Authorization: `Bearer ${token}` } : {};
   }
 
   async ask(question: string, context: AiContext): Promise<AiAnswer> {
@@ -549,13 +590,21 @@ export class RemoteOtpProvider implements OtpProvider {
   private async post<T>(path: string, body: unknown): Promise<T> {
     if (!this.endpoint) throw new Error('OTP endpoint is not configured.');
 
-    const response = await fetch(`${this.endpoint}${path}`, {
+    const response = await fetch(`${this.endpoint.replace(/\/+$/, '')}${path}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
 
-    if (!response.ok) throw new Error(`OTP request failed (${response.status}).`);
+    if (!response.ok) {
+      /*
+       * A rate limit is not a failure — it is the server telling the farmer to
+       * wait. The message is passed through rather than replaced by a status
+       * code, because "wait 40 seconds" is actionable and "429" is not.
+       */
+      const detail = await response.json().catch(() => null) as { error?: string } | null;
+      throw new Error(detail?.error ?? `OTP request failed (${response.status}).`);
+    }
     return (await response.json()) as T;
   }
 

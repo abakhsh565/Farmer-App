@@ -33,6 +33,12 @@ jobs:
       - name: Migration chain
         run: npm run lint:migrations
 
+      # The Edge Functions cannot run here (no Deno, no project), so the check is
+      # static: routes must match the client's calls, and no secret may be
+      # inlined into a source file.
+      - name: Edge Function contracts
+        run: npm run lint:functions
+
       - name: Tests
         run: npm test
 
