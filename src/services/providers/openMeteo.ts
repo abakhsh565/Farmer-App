@@ -128,7 +128,18 @@ export class OpenMeteoWeatherProvider implements WeatherProvider {
   readonly name = 'Open-Meteo';
 
   constructor(
-    private readonly fetchImpl: typeof fetch = fetch,
+    /*
+     * A wrapper, not `fetch` itself.
+     *
+     * `this.fetchImpl(url)` hands fetch a receiver that is not the global object,
+     * and every Chromium-based browser brand-checks that receiver:
+     * "Failed to execute 'fetch' on 'Window': Illegal invocation". Node and jsdom
+     * do not enforce it, so a suite that injects fetch never sees the bug — the
+     * app did, in every browser, on every call. The wrapper always calls fetch as
+     * a plain function, and resolves it at call time so a test can swap the
+     * global afterwards.
+     */
+    private readonly fetchImpl: typeof fetch = (input, init) => fetch(input, init),
     private readonly endpoint: string = ENDPOINT,
     private readonly now: () => number = Date.now,
   ) {}

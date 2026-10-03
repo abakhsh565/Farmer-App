@@ -21,14 +21,17 @@ from the PRD and are already implemented.
 
 ## 0. Status after this round
 
-### Connected and verified
+> **2026-10-04 — all external connections were removed at the owner's request.**
+> The table below is kept as a record of what was verified before withdrawal.
+> Nothing here is currently connected except the weather service. No project ref,
+> URL, key or token is recorded in this repository any more.
 
 | Service | What was done | Evidence |
 | --- | --- | --- |
-| **Supabase project** | Configured and verified | `swmbmtvwgksicfnfsehg`. Host resolves; publishable key authenticates (`auth/v1/settings` → 200, `storage/v1/bucket` → 200, and a missing table answers 404 rather than 401). Project is **empty** — no tables, no buckets, no functions — so the schema has a clean slate. |
-| **GitHub** | Repository created and pushed | `github.com/abakhsh565/Farmer-App` (private). The URL supplied was `abakhsh56/Farmer-App`, which does not exist — the account is `abakhsh565`. The remote was corrected and `main` pushed. The `gh` CLI was already authenticated on this machine, so no token was needed. |
+| **Supabase project** | Configured and verified, then **disconnected on 2026-10-04** | The dedicated Farmer App project (ref no longer recorded here) resolved, and its publishable key authenticated (`auth/v1/settings` → 200, `storage/v1/bucket` → 200, and a missing table answered 404 rather than 401). The project is **empty** — no tables, no buckets, no functions — and remains untouched in the owner's dashboard. Every Supabase value was deleted from `.env.local`; no credential of any kind remains on this machine. |
+| **GitHub** | Repository created and pushed, then **disconnected on 2026-10-04** | The private repository exists under the owner's GitHub account. At the owner's request the CLI token was logged out of this machine and the local `origin` remote removed. The repository itself can be deleted from GitHub settings if unwanted. |
 | **Weather (Open-Meteo)** | Live and verified | Keyless. The client reads it directly, and `weather-ingest` stores the same numbers in `weather_readings`. Verified against the real service: Wazirabad 30.9 °C, feels 36.5, 66 % humidity, observed `2026-10-03T12:15:00Z`. |
-| **Key hygiene** | Checked, not assumed | The built bundle and the APK both contain the project URL and the publishable key, and contain the secret key **zero** times. The one `sb_secret_` hit is the Supabase client library's own key-format check. |
+| **Key hygiene** | Checked, not assumed | No key *value* ever entered git history — only key-format prefixes appear in prose, as linter patterns. On 2026-10-04 every Supabase value was removed, the bundle and Android assets were regenerated, and the APK was rebuilt with **no backend configured**: it contains no project URL and no key. |
 | **Edge Functions** | Written, not deployed | `supabase/functions/{ai,otp,weather-ingest}` with `_shared/`. `npm run lint:functions` verifies the routes the client calls are the routes the functions handle, and that no secret is inlined into a source file. |
 
 ### What is left on the Supabase side
@@ -59,7 +62,7 @@ execute `select count(*) from pg_tables where schemaname = 'public';`.
 - **55** → it landed somewhere else; send that project's ref and I will point the
   app at it instead.
 - **0 or an error** → it did not land. Run the file again in
-  `swmbmtvwgksicfnfsehg`'s SQL editor and send me the first error, if any.
+  the project's SQL editor and send me the first error, if any.
 
 Applying it needs a credential I do not have and cannot obtain from here. Two
 were tried and both failed for the same reason — a PostgREST key is not a
@@ -121,14 +124,16 @@ function secret — never in chat, never in `.env.local`.
 
 ---## 2. The decisions, now answered
 
-**a. Which Supabase project holds the farmer backend?** Answered: a dedicated
-project, `swmbmtvwgksicfnfsehg`, now configured and verified. Both other projects
-hold real data and stay read-only to this app:
-
-| Project | What it actually is | Rows seen |
-| --- | --- | --- |
-| `gkswcfljxlutkfdvvqng` — "Agrishop APp" | The **live shop-owner POS**: sales, sale items, customers, payments, notifications | 52 sales, 57 sale items, 6 customers, 20 payments, 51 notifications |
-| `bpybjrjenwccowvtrevu` — "Agri-shop-App-QA" | The **engineering memory database**: incidents, agent tasks, 64 engineering lessons, 1200 impact analyses | 1200 impact analyses, 64 memories, 5 incidents |
+**a. Which Supabase project holds the farmer backend?** Answered, then
+**withdrawn by the owner on 2026-10-04.** A dedicated project was configured for
+the app and stood empty (no tables, no buckets, no functions — a clean slate for
+the schema). The owner then removed every connection: the values were deleted from
+`.env.local`, the bundle and APK were rebuilt without a backend, and the project
+ref is no longer recorded in this repository. It remains untouched and empty in
+the owner's dashboard, where it can be deleted if unwanted. Other Supabase
+projects belonging to a different account exist in this machine's history; they
+hold another system's live data, they were never written to by this app's work,
+and their identifiers have been removed from this repository.
 
 **b. Is the live POS the right dealer source, or should the sync read QA first?**
 Still open, and it is a business decision rather than a credential. Pointing the

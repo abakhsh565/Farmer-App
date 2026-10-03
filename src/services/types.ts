@@ -94,6 +94,19 @@ export function isWeatherUsable(reading: Sourced<WeatherNow>): boolean {
   return reading.status !== 'failing' && reading.error === undefined && reading.freshness === 'fresh';
 }
 
+/**
+ * The other half of the same decision: there is a reading, but it is too old to
+ * spray on.
+ *
+ * Separate from `isWeatherUsable` because the screen must say "out of date" for
+ * this and "not available" for a failed call. Both pause the advice; they must
+ * not share a sentence, and a failed call also returns a reading (with no
+ * numbers in it), so truthiness cannot tell them apart — only freshness can.
+ */
+export function isWeatherStale(reading: Sourced<WeatherNow>): boolean {
+  return reading.freshness === 'stale';
+}
+
 /* -------------------------------------------------------------------------- */
 /* Market                                                                     */
 /* -------------------------------------------------------------------------- */

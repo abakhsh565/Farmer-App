@@ -5,7 +5,7 @@ import {
   DevelopmentWeatherProvider,
 } from './providers/develop';
 import { OpenMeteoWeatherProvider } from './providers/openMeteo';
-import { isWeatherUsable, type GeoPoint } from './types';
+import { isWeatherStale, isWeatherUsable, type GeoPoint } from './types';
 
 /**
  * The live weather provider, tested where it can be.
@@ -106,6 +106,52 @@ describe('Open-Meteo provider', () => {
     for (const field of ['temperature_2m', 'wind_speed_10m', 'weather_code']) {
       expect(url.searchParams.get('current')).toContain(field);
     }
+  });
+
+  it('calls the platform fetch as a plain function, the way a browser requires', async () => {
+    const original = globalThis.fetch;
+    const called: string[] = [];
+    /*
+     * Chromium brand-checks fetch's receiver and throws "Illegal invocation" when
+     * it is not the global object. Node and jsdom do not, which is exactly why
+     * `this.fetchImpl(url)` shipped: every test passed, every browser failed.
+     * This stub enforces the browser's rule, so the bug cannot come back.
+     */
+    globalThis.fetch = function brandChecked(this: unknown, url: RequestInfo | URL) {
+      if (this !== undefined && this !== globalThis) {
+        throw new TypeError("Failed to execute 'fetch' on 'Window': Illegal invocation");
+      }
+      called.push(String(url));
+      return Promise.resolve({ ok: true, status: 200, json: async () => LIVE_PAYLOAD });
+    } as unknown as typeof fetch;
+
+    try {
+      // No injected fetch: this is the provider as the app constructs it.
+      const provider = new OpenMeteoWeatherProvider(undefined, undefined, () => AT_1200Z);
+      const reading = await provider.current(PROFILE);
+
+      expect(reading.status).toBe('live');
+      expect(reading.data.tempC).toBe(30.9);
+      expect(isWeatherUsable(reading)).toBe(true);
+      expect(called).toHaveLength(1);
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  it('separates "too old" from "answered nothing", because the screen says them differently', async () => {
+    const failed = await providerReturning({}, false, 503).provider.current(PROFILE);
+    expect(failed.freshness).toBe('unavailable');
+    // Not "out of date": there is no reading to be old. The copy test for the
+    // screen rests on this distinction.
+    expect(isWeatherStale(failed)).toBe(false);
+    expect(isWeatherUsable(failed)).toBe(false);
+
+    const stale = await providerReturning({
+      current: { ...LIVE_PAYLOAD.current, time: '2026-10-03T06:00' },
+    }).provider.current(PROFILE);
+    expect(isWeatherStale(stale)).toBe(true);
+    expect(isWeatherUsable(stale)).toBe(false);
   });
 
   it('treats a reading older than the usable window as stale, so advice pauses', async () => {

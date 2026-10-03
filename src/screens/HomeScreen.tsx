@@ -26,7 +26,7 @@ import {
 import { initialsOf } from '@/lib/initials';
 import { DEALER_DISPLAY, closingHour, tagLabel } from '@/data/dealers';
 import { useDealerSearch, useMarketRates, useWeather } from '@/services/hooks';
-import { isRateQuotable, isWeatherUsable, type MarketRate } from '@/services/types';
+import { isRateQuotable, isWeatherStale, isWeatherUsable, type MarketRate } from '@/services/types';
 
 /**
  * The three commodities the strip shows, in the order the farmer reads them.
@@ -78,6 +78,13 @@ export function HomeScreen({
   const weather = useWeather();
   const reading = weather.sourced;
   const weatherUsable = reading !== null && isWeatherUsable(reading);
+  /*
+   * Advice pauses for two reasons and they must not read the same: a reading too
+   * old to spray on ("out of date") is not a service that answered nothing
+   * ("not available"). A failed call also returns a reading, with no numbers in
+   * it, so only freshness separates the two.
+   */
+  const readingStale = reading !== null && isWeatherStale(reading);
 
   const rates = useMarketRates();
   const rateFor = (commodity: string): MarketRate | undefined =>
@@ -198,10 +205,10 @@ export function HomeScreen({
             {/* Two different failures, said differently: a reading that is too old
                 to spray on is not the same as a service that answered nothing. */}
             <p className="text-subheading">
-              {reading ? t('weather.stale.title') : t('weather.unavailable.title')}
+              {readingStale ? t('weather.stale.title') : t('weather.unavailable.title')}
             </p>
             <p className="mt-1 text-body-sm leading-relaxed text-white/75">
-              {reading
+              {readingStale && reading
                 ? t('weather.stale', {
                     age: formatRelativeTime(reading.observedAt, Date.now(), t),
                   })

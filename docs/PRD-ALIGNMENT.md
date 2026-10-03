@@ -74,16 +74,16 @@ that needs a CLI login or a paste into the dashboard.
 and no running container runtime in this environment, so they are checked
 statically by `scripts/check-migrations.mjs` (quoting balance, reference ordering,
 duplicate definitions, RLS coverage) and are labelled BUILT, not VERIFIED. The
-target project `swmbmtvwgksicfnfsehg` is verified reachable and **empty** — no
-tables — so the schema has a clean slate; applying it needs a DDL-capable
-credential (see [CREDENTIALS-REQUIRED.md](./CREDENTIALS-REQUIRED.md)).
+dedicated target project (ref no longer recorded here) was verified reachable and
+**empty** — no tables — so the schema has a clean slate; applying it needs a
+DDL-capable credential (see [CREDENTIALS-REQUIRED.md](./CREDENTIALS-REQUIRED.md)).
 
-**The APK is a debug build wired to the real project.** It carries the project URL
-and the publishable key — verified present in the packaged assets, and verified to
-contain the secret key zero times — but the project has no schema yet, so the
-remote providers will report failure until the migrations land. Weather is live
-regardless, because Open-Meteo needs no backend. See
-[ANDROID-BUILD.md](./ANDROID-BUILD.md).
+**2026-10-04: the backend connection was withdrawn.** Every Supabase value was
+removed from `.env.local`, and the APK was rebuilt with **no backend configured**
+— no project URL, no key. Weather is the only external call it makes, and it
+stays live because Open-Meteo is keyless. See
+[ANDROID-BUILD.md](./ANDROID-BUILD.md) and the
+[dependency registry](./DEPENDENCY-REGISTRY.md).
 
 ---
 
