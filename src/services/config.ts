@@ -28,6 +28,22 @@
  * server, not by the app.
  */
 
+/**
+ * Where the weather numbers come from.
+ *
+ * · `supabase` — the normalised `weather_readings` table, filled by the ingest
+ *   function. The destination, because the UI and the assistant then read the
+ *   same stored reading.
+ * · `open-meteo` — the vendor directly, from the client. Keyless, so live weather
+ *   works before any account exists; chosen explicitly rather than guessed.
+ * · `development` — the fixture, which is what the tests run against.
+ *
+ * `auto` (the default) means "the normalised table if there is a backend,
+ * otherwise the fixture": an unconfigured build must never silently start making
+ * network calls.
+ */
+export type WeatherSource = 'auto' | 'development' | 'open-meteo' | 'supabase';
+
 export type ServiceConfig = {
   supabase: { url: string | null; anonKey: string | null; configured: boolean };
   /** Our Edge Functions. Each may be unconfigured independently. */
@@ -35,6 +51,8 @@ export type ServiceConfig = {
   otpEndpoint: { url: string | null; configured: boolean };
   dealerEndpoint: { url: string | null; configured: boolean };
   analytics: { key: string | null; host: string; configured: boolean };
+  /** The source the registry will actually use, already resolved. */
+  weather: { provider: Exclude<WeatherSource, 'auto'> };
 };
 
 function read(key: string): string | null {
@@ -54,6 +72,8 @@ function build(): ServiceConfig {
   const otpEndpoint = read('VITE_OTP_ENDPOINT');
   const dealerEndpoint = read('VITE_DEALER_ENDPOINT');
   const analyticsKey = read('VITE_POSTHOG_KEY');
+  const requestedWeather = read('VITE_WEATHER_PROVIDER');
+  const backendLive = Boolean(supabaseUrl && supabaseAnonKey);
 
   return {
     supabase: {
@@ -61,7 +81,17 @@ function build(): ServiceConfig {
       anonKey: supabaseAnonKey,
       // Both halves are required. A URL without a key would produce a confusing
       // 401 rather than a clear switch to development mode.
-      configured: Boolean(supabaseUrl && supabaseAnonKey),
+      configured: backendLive,
+    },
+    weather: {
+      provider:
+        requestedWeather === 'open-meteo' ||
+        requestedWeather === 'development' ||
+        requestedWeather === 'supabase'
+          ? requestedWeather
+          : backendLive
+            ? 'supabase'
+            : 'development',
     },
     aiEndpoint: { url: aiEndpoint, configured: Boolean(aiEndpoint) },
     otpEndpoint: { url: otpEndpoint, configured: Boolean(otpEndpoint) },
@@ -87,7 +117,9 @@ export function configurationReport(): Array<{ service: string; mode: 'remote' |
   const remote = (on: boolean): 'remote' | 'development' => (on ? 'remote' : 'development');
   return [
     { service: 'persistence', mode: remote(serviceConfig.supabase.configured) },
-    { service: 'weather', mode: remote(serviceConfig.supabase.configured) },
+    // Weather is reported from its own resolved choice, not from the database
+    // flag: a build reading the live vendor with no backend is still live.
+    { service: 'weather', mode: remote(serviceConfig.weather.provider !== 'development') },
     { service: 'market', mode: remote(serviceConfig.supabase.configured) },
     { service: 'ai', mode: remote(serviceConfig.aiEndpoint.configured) },
     { service: 'otp', mode: remote(serviceConfig.otpEndpoint.configured) },

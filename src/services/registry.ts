@@ -11,12 +11,18 @@
  * requirement, stated in the brief as: swapping the provider must not require
  * redesigning the feature.
  *
- * Two rules encoded here rather than left to callers:
+ * Rules encoded here rather than left to callers:
  *
- *  · Persistence, weather and market are chosen together by the Supabase flag.
- *    They are all reads of the same normalised backend, so having one remote and
- *    another local would mean the app could contradict itself about the same
+ *  · Persistence, market and the `auto` weather choice follow the Supabase flag
+ *    together. They are reads of the same normalised backend, so having one
+ *    remote and another local would let the app contradict itself about the same
  *    fact.
+ *
+ *  · Weather may be pointed at Open-Meteo instead, explicitly, through
+ *    `VITE_WEATHER_PROVIDER`. That provider needs no credential, so it is how
+ *    live weather arrives before the backend exists — and because the choice is
+ *    named rather than guessed, an unconfigured build still makes no network
+ *    calls at all.
  *
  *  · AI and OTP are chosen independently, because they are separate server
  *    endpoints that can be deployed at different times without pretending the
@@ -34,6 +40,7 @@ import {
   DevelopmentWeatherProvider,
   LocalRepository,
 } from './providers/develop';
+import { OpenMeteoWeatherProvider } from './providers/openMeteo';
 import {
   RemoteAiProvider,
   RemoteAnalyticsProvider,
@@ -71,9 +78,18 @@ export function createServices(config: ServiceConfig = serviceConfig): Services 
   const backendLive = config.supabase.configured;
 
   const repository: Repository = backendLive ? new SupabaseRepository() : new LocalRepository();
-  const weather: WeatherProvider = backendLive
-    ? new SupabaseWeatherProvider()
-    : new DevelopmentWeatherProvider();
+  /*
+   * Three ways to get a reading, and the choice is configuration, not code that
+   * branches later. The normalised table is preferred when there is a backend;
+   * the vendor directly is the keyless path; the fixture is what the tests and an
+   * unconfigured build use.
+   */
+  const weather: WeatherProvider =
+    config.weather.provider === 'supabase'
+      ? new SupabaseWeatherProvider()
+      : config.weather.provider === 'open-meteo'
+        ? new OpenMeteoWeatherProvider()
+        : new DevelopmentWeatherProvider();
   const market: MarketProvider = backendLive
     ? new SupabaseMarketProvider()
     : new DevelopmentMarketProvider();

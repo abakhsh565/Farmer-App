@@ -32,5 +32,17 @@ export default defineConfig({
     pool: 'threads',
     poolOptions: { threads: { maxThreads: 4, minThreads: 1 } },
     testTimeout: 15_000,
+    /*
+     * The environment the suites run in, pinned rather than inherited.
+     *
+     * Vite loads `.env.local` in every mode, including this one — so a working
+     * copy that has live weather switched on would have every screen test making
+     * a network call and asserting on a delivery the fixture never produces. The
+     * weather source is configuration, and a test's configuration is not the
+     * developer's: it is this, and it is the same on every machine.
+     */
+    env: {
+      VITE_WEATHER_PROVIDER: 'development',
+    },
   },
 });

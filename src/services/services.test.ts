@@ -450,6 +450,8 @@ describe('registry selection', () => {
     otpEndpoint: { url: null, configured: false },
     dealerEndpoint: { url: null, configured: false },
     analytics: { key: null, host: 'https://example.invalid', configured: false },
+    // `auto` with no backend resolves to the fixture, which is what this build is.
+    weather: { provider: 'development' },
   };
 
   const configured: ServiceConfig = {
@@ -458,6 +460,8 @@ describe('registry selection', () => {
     otpEndpoint: { url: 'https://example.supabase.co/functions/v1/otp', configured: true },
     dealerEndpoint: { url: 'https://example.supabase.co/functions/v1/dealer', configured: true },
     analytics: { key: 'phc_test', host: 'https://example.invalid', configured: false },
+    // `auto` with a backend resolves to the normalised table.
+    weather: { provider: 'supabase' },
   };
 
   it('runs everything in development mode with nothing configured', () => {
