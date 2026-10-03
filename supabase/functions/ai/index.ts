@@ -34,7 +34,7 @@ import {
   routeOf,
 } from '../_shared/server.ts';
 import { retrieveKnowledge, type KnowledgeHit } from '../_shared/knowledge.ts';
-import { complete, modelConfigured, modelName, parseJsonObject } from '../_shared/model.ts';
+import { complete, modelConfigured, parseJsonObject, providerStatus } from '../_shared/model.ts';
 
 const FUNCTION = 'ai';
 
@@ -418,11 +418,12 @@ Deno.serve(async (req) => {
 
   try {
     if (route === 'health') {
-      return json({
-        ok: true,
-        model: modelConfigured() ? modelName() : null,
-        modelConfigured: modelConfigured(),
-      });
+      /*
+       * Booleans and names only. This endpoint answers "is the key working?"
+       * without ever echoing the key — a health check that prints a prefix of a
+       * secret is a health check that leaks it.
+       */
+      return json({ ok: true, ...providerStatus() });
     }
 
     if (req.method !== 'POST') return fail('Use POST.', 405);

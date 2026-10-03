@@ -201,23 +201,101 @@ for (const [fn, routes] of serverRoutes) {
  * Names that must come from the server's environment. A literal beside one of
  * these names is the bug this check exists for.
  */
-const SERVER_SECRETS = ['OPENAI_API_KEY', 'OTP_HASH_SECRET', 'OTP_DELIVERY_TOKEN', 'SUPABASE_SECRET_KEYS'];
+const SERVER_SECRETS = [
+  'OPENAI_API_KEY',
+  'GEMINI_API_KEY',
+  'GOOGLE_API_KEY',
+  'GOOGLE_GENERATIVE_AI_API_KEY',
+  'OTP_HASH_SECRET',
+  'OTP_DELIVERY_TOKEN',
+  'SUPABASE_SECRET_KEYS',
+  'AMIS_FEED_URL',
+  'AMIS_FEED_TOKEN',
+  'MARKET_FEED_URL',
+  'MARKET_FEED_TOKEN',
+];
 
 for (const [file, text] of code) {
+  /*
+   * Every secret name must be read from the environment, either directly
+   * (`Deno.env.get('NAME')`) or through a local helper that itself calls
+   * `Deno.env.get`. The helper form matters because a module that supports two
+   * vendors naturally looks up several key names in one function — and a rule
+   * that forbids that would be a rule people route around, which is worse than
+   * no rule. So a mention is accepted if it sits inside a `Deno.env.get(...)`
+   * call *or* inside a function whose body contains one.
+   */
+  const helperBodies = [];
+  // Both declaration forms: `function name(...)` and `const name = (...) =>`.
+  // An arrow helper is the natural way to write a multi-name lookup, and
+  // missing it would flag exactly the code this rule is meant to permit.
+  const helperRe = /(?:function\s+([A-Za-z_$][\w$]*)\s*\([^)]*\)|(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>)[^{;]*\{/g;
+  for (const m of text.matchAll(helperRe)) {
+    const name = m[1] ?? m[2];
+    if (!name) continue;
+    const start = m.index;
+    // Body ends at the matching brace, counted so nested blocks do not fool it.
+    let depth = 0;
+    let index = start;
+    for (; index < text.length; index += 1) {
+      if (text[index] === '{') depth += 1;
+      else if (text[index] === '}') {
+        depth -= 1;
+        if (depth === 0) break;
+      }
+    }
+    helperBodies.push({ name, body: text.slice(start, index + 1) });
+  }
+
+  /*
+   * Transitive, because the natural shape is two hops: `openAiKey()` returns
+   * `env('OPENAI_API_KEY')`, and the secret name appears in the outer function,
+   * not in the one that calls `Deno.env`. A single-hop rule flags that code, and
+   * the fix a developer would reach for is to inline the lookup — which is the
+   * opposite of what this check wants.
+   */
+  const envReadingHelpers = new Set();
+  for (let pass = 0; pass < helperBodies.length; pass += 1) {
+    let grew = false;
+    for (const h of helperBodies) {
+      if (envReadingHelpers.has(h.name)) continue;
+      const readsDirectly = /Deno\.env\.(get|has)\(/.test(h.body);
+      const callsHelper = [...envReadingHelpers].some((name) =>
+        new RegExp(`\\b${name}\\s*\\(`).test(h.body),
+      );
+      if (readsDirectly || callsHelper) {
+        envReadingHelpers.add(h.name);
+        grew = true;
+      }
+    }
+    if (!grew) break;
+  }
+
   for (const name of SERVER_SECRETS) {
-    // Every mention must be inside a Deno.env.get / Deno.env.has call.
     const mentions = [...text.matchAll(new RegExp(`['"\`]${name}['"\`]`, 'g'))];
     for (const mention of mentions) {
-      const before = text.slice(Math.max(0, mention.index - 40), mention.index);
-      if (!/Deno\.env\.(get|has)\(\s*$/.test(before)) {
-        errors.push(`${file}: ${name} appears outside Deno.env.get() — it may be inlined`);
-      }
+      const before = text.slice(Math.max(0, mention.index - 60), mention.index);
+      if (/Deno\.env\.(get|has)\(\s*$/.test(before)) continue;
+
+      // Otherwise: is this mention inside a function that reads the environment?
+      const enclosing = helperBodies.find(
+        (h) =>
+          mention.index > text.indexOf(h.body) &&
+          mention.index < text.indexOf(h.body) + h.body.length,
+      );
+      if (enclosing && envReadingHelpers.has(enclosing.name)) continue;
+
+      errors.push(`${file}: ${name} appears outside Deno.env.get() — it may be inlined`);
     }
   }
 
   // A key-looking literal. None of these belong in a repository, server or not.
   if (/sk-[A-Za-z0-9_-]{20,}/.test(text)) {
     errors.push(`${file}: looks like an OpenAI key literal`);
+  }
+  // Google keys always begin AIza and are 39 characters.
+  if (/AIza[0-9A-Za-z_-]{30,}/.test(text)) {
+    errors.push(`${file}: looks like a Google/Gemini API key literal`);
   }
   if (/sb_secret_[A-Za-z0-9_-]{10,}/.test(text)) {
     errors.push(`${file}: looks like a Supabase secret key literal`);

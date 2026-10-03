@@ -35,11 +35,43 @@ from the PRD and are already implemented.
 
 Three things, and only the first blocks the backend.
 
-**1. Apply the schema — needs one of these from you.**
+**1. Apply the schema — the migrations are not in the project.**
 
-The 19 migrations are bundled into `supabase/apply-all.sql` (5,825 lines, one
-transaction). Applying it needs a credential I do not have and cannot obtain
-from here:
+Measured against the live database, not assumed. Every probe returns 404:
+
+| Probe | Result |
+| --- | --- |
+| `GET /rest/v1/parties?select=id` | 404 |
+| `GET /rest/v1/farmer_profiles`, `crop_catalog`, `canonical_products`, `weather_readings`, `otp_challenges`, `dealer_profiles`, `client_documents` | 404, all of them |
+| PostgREST OpenAPI at `/rest/v1/` | **1 path** — i.e. no tables exposed at all |
+| `GET /functions/v1/{ai,otp,weather-ingest}/health` | 404 — no function deployed |
+| `GET /storage/v1/bucket` | `[]` — no buckets |
+
+So the SQL was either run against a **different project** (a different account's
+dashboard, or one of the other two projects) or the run failed and was rolled
+back. The bundle is a single transaction by design, so a failure anywhere rolls
+back every statement and leaves no partial schema — which is exactly what an
+empty database looks like.
+
+**To find out in one step:** open the SQL editor of the project you ran it in and
+execute `select count(*) from pg_tables where schemaname = 'public';`.
+
+- **55** → it landed somewhere else; send that project's ref and I will point the
+  app at it instead.
+- **0 or an error** → it did not land. Run the file again in
+  `swmbmtvwgksicfnfsehg`'s SQL editor and send me the first error, if any.
+
+Applying it needs a credential I do not have and cannot obtain from here. Two
+were tried and both failed for the same reason — a PostgREST key is not a
+database credential:
+
+```
+db push --db-url postgresql://postgres:<secret key>@db.<ref>.supabase.co:5432
+  → hostname resolving error (db.<ref>.supabase.co does not resolve)
+
+db push --db-url postgresql://postgres.<ref>:<secret key>@aws-0-ap-northeast-1.pooler.supabase.com:5432
+  → FATAL: tenant/user postgres.<ref> not found (SQLSTATE XX000)
+```
 
 - **The database password** (Dashboard → Project Settings → Database → Reset database password), or
 - **An `sbp_…` personal access token** (Dashboard → Account → Access Tokens), or
@@ -51,9 +83,15 @@ cannot execute DDL — which is why the schema is still unapplied.
 **2. Deploy the three functions.** They need a CLI login or a paste into the
 dashboard's function editor. `supabase functions deploy ai otp weather-ingest`.
 
-**3. Set the function secrets.** `OPENAI_API_KEY` (rotated — see below),
-`OTP_HASH_SECRET` (any long random string), and `OTP_DELIVERY_URL` +
-`OTP_DELIVERY_TOKEN` once an SMS provider exists.
+**3. Set the function secrets.** `OPENAI_API_KEY` (rotated — see below) or
+`GEMINI_API_KEY`, `OTP_HASH_SECRET` (any long random string), and
+`OTP_DELIVERY_URL` + `OTP_DELIVERY_TOKEN` once an SMS provider exists. For live
+mandi rates, `AMIS_FEED_URL` (+ `AMIS_FEED_TOKEN`) or `MARKET_FEED_URL`.
+
+The AI gateway supports **both** OpenAI and Gemini. `AI_PROVIDER` chooses one
+(`openai` or `gemini`); with it unset, whichever key is present wins, OpenAI
+first. `GET /functions/v1/ai/health` reports which providers are configured and
+which one is active — booleans and names only, never the key.
 
 Two settings worth knowing, both currently off and neither blocking:
 `auth.external.phone` is `false` (our `otp` function does not depend on it — it
