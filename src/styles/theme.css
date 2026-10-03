@@ -1,0 +1,359 @@
+/* =============================================================================
+   Theme — the two things carried over from the previous codebase: its colour
+   palette and its typefaces. Everything else (components, screens, tokens, i18n,
+   gates, docs) lives in /archive and is imported nowhere.
+
+   How this file is organised:
+
+     1 · palette      raw values, verbatim from the old primitives. Nothing
+                      references these directly; they are the paint.
+     2 · contract     shadcn's semantic variable names (--background, --primary,
+                      --muted, --border …) filled from the palette. This layer is
+                      the reason registry components land already on-brand: every
+                      component from every registry reads these names.
+     3 · base         element defaults.
+
+   Add a component with:  npx shadcn@latest add button
+                      or:  npx shadcn@latest add @kibo-ui/ticker
+   Components land in src/components/ui/ and src/components/kibo-ui/.
+   ========================================================================== */
+
+@import 'tailwindcss';
+@import 'tw-animate-css';
+
+/* `dark:` follows a class on <html>, the shadcn convention. */
+@custom-variant dark (&:is(.dark *));
+
+/* -----------------------------------------------------------------------------
+   1 · PALETTE — raw values. Utilities are generated from these names, so
+   `bg-clay-500`, `text-ink-600`, `border-cream-300` all work in markup.
+   -------------------------------------------------------------------------- */
+@theme {
+  /* Brand: clay / terracotta */
+  --color-clay-50: #fbf0ea;
+  --color-clay-100: #f7e2d7;
+  --color-clay-200: #f0c8b4;
+  --color-clay-300: #e8ac8e;
+  --color-clay-400: #e08b6b;
+  --color-clay-500: #d97757;
+  --color-clay-600: #c96442;
+  --color-clay-700: #ac5034;
+  --color-clay-800: #8a3f29;
+
+  /* Warm neutrals: cream — surfaces */
+  --color-cream-50: #fdfcf9;
+  --color-cream-100: #faf9f5;
+  --color-cream-150: #f7f6f0;
+  --color-cream-200: #f3f1e9;
+  --color-cream-300: #edebe1;
+  --color-cream-400: #e5e2d6;
+  --color-cream-500: #d8d4c5;
+  --color-cream-600: #c4bfad;
+
+  /* Warm neutrals: ink — text and solid fills.
+     ink-550 is the caption step: on the cream canvas ink-500 (4.25:1) fails AA,
+     ink-550 measures 5.2:1 and keeps three distinct text steps instead of two. */
+  --color-ink-50: #f6f5f1;
+  --color-ink-100: #edebe4;
+  --color-ink-200: #dedbd1;
+  --color-ink-300: #b9b6aa;
+  --color-ink-400: #97948a;
+  --color-ink-500: #7a776d;
+  --color-ink-550: #6c6960;
+  --color-ink-600: #5e5c54;
+  --color-ink-700: #46443e;
+  --color-ink-800: #2e2d28;
+  --color-ink-900: #1b1a16;
+  --color-ink-950: #121110;
+
+  /* System: blue */
+  --color-blue-50: #eff4fe;
+  --color-blue-100: #e1ebfd;
+  --color-blue-200: #c4d8fa;
+  --color-blue-400: #5b90f5;
+  --color-blue-500: #2f6fed;
+  --color-blue-600: #1f57cc;
+  --color-blue-700: #1a46a3;
+
+  /* System: green */
+  --color-green-50: #edf6ef;
+  --color-green-100: #dceeda;
+  --color-green-400: #4fae74;
+  --color-green-500: #3e9a63;
+  --color-green-600: #2f7d4f;
+  --color-green-700: #236139;
+
+  /* System: red */
+  --color-red-50: #fbeeec;
+  --color-red-100: #f7deda;
+  --color-red-500: #d9533b;
+  --color-red-600: #c7442e;
+  --color-red-700: #a33524;
+
+  /* System: amber */
+  --color-amber-50: #fbf3e4;
+  --color-amber-100: #f7ead3;
+  --color-amber-500: #c98a2b;
+  --color-amber-600: #a96f1d;
+  --color-amber-700: #855514;
+
+  /* System: violet */
+  --color-violet-50: #f3f1fc;
+  --color-violet-100: #e5e1f8;
+  --color-violet-500: #7c6be0;
+  --color-violet-600: #6350c9;
+
+  /* Typefaces — Copernicus and Styrene B are the real faces and win if they're
+     ever installed. Cormorant Garamond and Inter are self-hosted substitutes
+     (see main.tsx) so the app ships the right voice on a device that has
+     neither — and works with no network. */
+  --font-serif: 'Copernicus', 'Tiempos Headline', 'Cormorant Garamond', 'Playfair Display',
+    Georgia, 'Times New Roman', serif;
+  --font-sans: 'Styrene B', 'Styrene A', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI',
+    Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --font-mono: 'JetBrains Mono', 'SF Mono', ui-monospace, Menlo, Consolas, monospace;
+  /* Noto Naskh rather than Nastaliq: Nastaliq is the more beautiful script, but
+     its diagonal stacking and deep descenders collapse at 11–14px UI sizes. */
+  --font-urdu: 'Noto Naskh Arabic', 'Noto Nastaliq Urdu', 'Segoe UI', Tahoma, sans-serif;
+
+  /* --- Type scale: named intents ---------------------------------------------
+     The rule this exists to satisfy: a heading is a *token*, not a pixel value.
+     Each entry bundles size + leading + tracking (+ weight), which is how
+     Tailwind's own scale works — `text-title` is one class that sets all four.
+     Changing the single line below changes every title in the product.
+
+     No screen may set a font size with a raw value. `npm run lint:design` fails
+     the build if a `text-[13px]`-style size reappears.
+
+     The sizes are the application design's. It states sixteen values between 10.5
+     and 40px, several half a pixel apart (14.5, 13.5, 12.5, 11.5, 10.5); those
+     collapse into the ten below, because a grid of nearly-identical sizes is how a
+     scale stops being one. Everything within half a pixel is rounded to the
+     nearest step, and the *roles* are what the tokens are named for. */
+  --text-display: 2.5rem; /* 40px — the one number a screen is built around */
+  --text-display--line-height: 1;
+  --text-display--letter-spacing: -0.02em;
+
+  --text-figure: 1.75rem; /* 28px — money */
+  --text-figure--line-height: 1.1;
+  --text-figure--letter-spacing: -0.02em;
+
+  --text-lead: 1.3125rem; /* 21px — the sentence a card is making */
+  --text-lead--line-height: 1.3;
+  --text-lead--font-weight: 500;
+
+  --text-title: 1.25rem; /* 20px — screen title */
+  --text-title--line-height: 1.2;
+  --text-title--font-weight: 600;
+
+  --text-heading: 1.125rem; /* 18px — a name, a strong label */
+  --text-heading--line-height: 1.2;
+  --text-heading--font-weight: 600;
+
+  --text-subheading: 1rem; /* 16px — greeting, list titles, figures */
+  --text-subheading--line-height: 1.3;
+  --text-subheading--font-weight: 500;
+
+  --text-body: 0.875rem; /* 14px — body copy, row labels, inputs */
+  --text-body--line-height: 1.5;
+
+  --text-body-sm: 0.8125rem; /* 13px — supporting lines */
+  --text-body-sm--line-height: 1.5;
+
+  --text-label: 0.75rem; /* 12px — meta lines, small values */
+  --text-label--line-height: 1.4;
+
+  --text-caption: 0.6875rem; /* 11px — the smallest voice */
+  --text-caption--line-height: 1.4;
+
+  --text-overline: 0.6875rem; /* 11px — uppercase section labels */
+  --text-overline--line-height: 1.4;
+  --text-overline--letter-spacing: 0.08em;
+  --text-overline--font-weight: 500;
+}
+
+/* -----------------------------------------------------------------------------
+   2 · CONTRACT — registry variables filled from the palette. Every value here
+   was contrast-checked on the cream canvas (secondary 6.36:1, tertiary 5.21:1,
+   accent 5.04:1 — all AA at 15px).
+
+   `--primary` is the brand slot. Point it at a different colour and every
+   component from every registry follows at once.
+   -------------------------------------------------------------------------- */
+:root {
+  --background: var(--color-cream-100);
+  --foreground: var(--color-ink-950);
+
+  --card: #ffffff;
+  --card-foreground: var(--color-ink-950);
+  --popover: #ffffff;
+  --popover-foreground: var(--color-ink-950);
+
+  --primary: var(--color-ink-950);
+  --primary-foreground: var(--color-cream-50);
+
+  --secondary: var(--color-cream-200);
+  --secondary-foreground: var(--color-ink-900);
+
+  --muted: var(--color-cream-150);
+  --muted-foreground: var(--color-ink-600);
+
+  /* `accent` is the hover surface in shadcn's vocabulary, not the brand colour. */
+  --accent: var(--color-cream-200);
+  --accent-foreground: var(--color-ink-900);
+
+  --destructive: var(--color-red-600);
+  --destructive-foreground: #ffffff;
+
+  --border: var(--color-ink-200);
+  --input: var(--color-ink-200);
+  --ring: var(--color-clay-500);
+
+  /* Brand accent, for text that sits on the canvas rather than on a solid.
+     clay-700 rather than clay-500: clay-500 on cream measures 3.1:1, which
+     fails AA for the 12–13px links that use this. */
+  --brand: var(--color-clay-700);
+  --brand-foreground: #ffffff;
+  --brand-soft: var(--color-clay-100);
+
+  /* The one high-contrast block on a screen — the weather hero. Dark on the cream
+     canvas; *elevated* once the canvas itself is dark, because a surface cannot
+     contrast with a canvas it matches. */
+  --surface-inverted: var(--color-ink-950);
+
+  --chart-1: var(--color-clay-500);
+  --chart-2: var(--color-green-500);
+  --chart-3: var(--color-amber-500);
+  --chart-4: var(--color-blue-500);
+  --chart-5: var(--color-violet-500);
+
+  /* The design's corner scale runs 14px (avatars) through 16 (pills), 20 (cards)
+     and 24 (the weather block and the scan call to action). Bumping the base to
+     20px makes the shadcn ladder land on it: sm 16, md 18, lg 20, xl 24. */
+  --radius: 1.25rem;
+}
+
+.dark {
+  --background: var(--color-ink-950);
+  --foreground: var(--color-cream-50);
+
+  --card: var(--color-ink-900);
+  --card-foreground: var(--color-cream-50);
+  --popover: var(--color-ink-900);
+  --popover-foreground: var(--color-cream-50);
+
+  --primary: var(--color-cream-50);
+  --primary-foreground: var(--color-ink-950);
+
+  --secondary: var(--color-ink-800);
+  --secondary-foreground: var(--color-cream-100);
+
+  --muted: var(--color-ink-800);
+  --muted-foreground: var(--color-ink-300);
+
+  --accent: var(--color-ink-800);
+  --accent-foreground: var(--color-cream-100);
+
+  --destructive: var(--color-red-500);
+  --destructive-foreground: var(--color-ink-950);
+
+  --border: rgb(255 255 255 / 0.1);
+  --input: rgb(255 255 255 / 0.14);
+  --ring: var(--color-clay-400);
+
+  --brand: var(--color-clay-300);
+  --brand-foreground: var(--color-ink-950);
+  --brand-soft: var(--color-ink-800);
+  --surface-inverted: var(--color-ink-800);
+
+  --chart-1: var(--color-clay-400);
+  --chart-2: var(--color-green-500);
+  --chart-3: var(--color-amber-500);
+  --chart-4: var(--color-blue-400);
+  --chart-5: var(--color-violet-500);
+}
+
+/* Bridge the contract into Tailwind, so `bg-background`, `text-muted-foreground`,
+   `border-border` and `rounded-lg` are all valid utilities. */
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-brand: var(--brand);
+  --color-brand-foreground: var(--brand-foreground);
+  --color-brand-soft: var(--brand-soft);
+  --color-surface-inverted: var(--surface-inverted);
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+/* -----------------------------------------------------------------------------
+   3 · BASE
+   -------------------------------------------------------------------------- */
+@layer base {
+  *,
+  ::before,
+  ::after {
+    border-color: var(--border);
+  }
+
+  body {
+    background-color: var(--background);
+    color: var(--foreground);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* Urdu gets its own face and more room: Naskh needs more leading than Latin at
+     the same size, and the nukta marks close up otherwise.
+
+     The family *tokens* are repointed rather than setting `font-family` here.
+     A base-layer rule loses to a utility from a later layer, so `font-family`
+     would be quietly beaten by every `font-serif` heading — which is exactly what
+     happened, and left half the Urdu text in an OS font. Redefining the tokens
+     means the family utilities keep working and resolve to the Urdu face instead.
+     `--font-mono` is deliberately left alone: it carries digits, which are
+     language-neutral. */
+  :lang(ur),
+  :lang(ar) {
+    --font-sans: var(--font-urdu);
+    --font-serif: var(--font-urdu);
+    line-height: 1.85;
+  }
+
+  /* Direction is a system property, not a per-screen fix. Every component in the
+     app uses logical utilities (ps/pe, ms/me, start/end, text-start/end) so
+     mirroring happens by flipping this one attribute. */
+  [dir='rtl'] .ltr-only,
+  [dir='ltr'] .rtl-only {
+    display: none;
+  }
+
+  ::selection {
+    background-color: var(--color-clay-200);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+}

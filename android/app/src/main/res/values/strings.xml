@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Farmer</string>
+    <string name="title_activity_main">Farmer</string>
+    <string name="package_name">pk.agrishop.farmer</string>
+    <string name="custom_url_scheme">pk.agrishop.farmer</string>
+</resources>

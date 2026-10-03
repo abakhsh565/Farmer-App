@@ -1,0 +1,44 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# The previous app and its design system. Kept on disk, deliberately out of
+# version control and out of the build — nothing in src/ imports from here.
+archive/
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json
+.idea/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Local secrets — the shadcn.io MCP token lives here
+.env.shadcnio
+.env*.local
+
+# Android / Capacitor build output
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/app/src/main/assets/public/
+android/app/src/main/assets/capacitor.config.json
+
+# Local environment (never commit provider keys)
+.env
+.env.local
+
+# Build artefacts: the APK is rebuilt by `npm run apk`, and a 5 MB binary in
+# version control is a binary that goes stale in a clone.
+artifacts/
+
+# Editor / agent scratch state
+.freebuff/
