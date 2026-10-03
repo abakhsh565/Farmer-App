@@ -1,8 +1,9 @@
 # Dependency Registry — Farmer App
 
-> **State as of 2026-10-04: every external connection has been removed at the owner's request.**
-> The only live external service is the **weather API (Open-Meteo — keyless)**.
-> No project reference, URL, key or token is recorded anywhere in this repository, by design.
+> **State as of 2026-10-04 (second phase): connections restored at the owner's request — see §6.**
+> Supabase (project **Farmer-App**), GitHub and Vercel are connected. The weather API
+> (Open-Meteo — keyless) remains live. §1 records the earlier full disconnection, kept for history.
+> No key value is recorded anywhere in this repository, by design.
 >
 > **Status vocabulary:** `CONNECTED` · `READY` · `OWNER ACTION REQUIRED` · `MOCKED` · `BLOCKED` · `VERIFIED` · `DISCONNECTED`
 
@@ -54,5 +55,24 @@ None of them makes a network call in this state.
 
 ## 5. Owner actions outstanding
 
-- **Optional:** revoke the Supabase MCP integration (see §1, row 2). Nothing else is requested —
-  no credential, no setup, no SQL.
+- **Vercel token hygiene:** a Vercel API token was pasted into chat during setup on 2026-10-04.
+  Revoke it in Vercel → Account Settings → Tokens. The CLI session carries its own credentials;
+  the pasted token was used once, read-only, and is not stored in this repository or in the app.
+- **Optional:** revoke the old Supabase MCP integration (see §1, row 2).
+- **Optional:** delete the duplicate Vercel projects `farmer-app-for-pakisan` and
+  `farmer-app-for-pakisan-2026` if they are not wanted.
+
+## 6. Reconnection log — 2026-10-04 (second phase)
+
+Per the owner's explicit instruction, the backend, code host and hosting were reconnected on
+the same day as the disconnection. This section supersedes §1 wherever the two disagree.
+
+| System | What is connected now | Notes |
+|---|---|---|
+| **Supabase** | Project **Farmer-App** (`swmbmtvwgksicfnfsehg`, region `ap-southeast-1`), reached through the `supabase-new` connector, which is scoped to that one project. | Schema build in progress: all 19 migrations queued, 3 applied at the time of this entry; then the knowledge seed and the 4 edge functions. The agent fetches the project's publishable key from the connector; the app receives only that key, through `.env.local`, which is git-ignored. |
+| **GitHub** | Repository **`abakhsh56/Farmer-App`** (private), branch `main` pushed with full history. | Future commits are authored as the owner's GitHub identity (`Allah Bakhsh <58393098+abakhsh56@users.noreply.github.com>`) so that Vercel accepts them on the free plan. |
+| **Vercel** | Project **`farmer-app`**, production alias **https://farmer-app-one-omega.vercel.app**. The GitHub repository is connected — pushes to `main` deploy automatically. Env var `VITE_WEATHER_PROVIDER=open-meteo` is set for Production. | The first Git-triggered deployments were briefly *Blocked* because the commit author (an agent address) was not a member of the Vercel team. Fixed the free way — author commits as the owner's GitHub identity. No Pro upgrade and no collaborators required. |
+| **Weather (Open-Meteo)** | Unchanged — keyless, live in both the local preview and the deployed site. | — |
+
+Everything else (AI, OTP/SMS, push, analytics, dealer/POS, maps) remains `MOCKED` behind the
+production-compatible contracts, exactly as described in §2.
