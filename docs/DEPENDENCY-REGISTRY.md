@@ -73,6 +73,9 @@ the same day as the disconnection. This section supersedes §1 wherever the two 
 | **GitHub** | Repository **`abakhsh56/Farmer-App`** (private), branch `main` pushed with full history. | Future commits are authored as the owner's GitHub identity (`Allah Bakhsh <58393098+abakhsh56@users.noreply.github.com>`) so that Vercel accepts them on the free plan. |
 | **Vercel** | Project **`farmer-app`**, production alias **https://farmer-app-one-omega.vercel.app**. The GitHub repository is connected — pushes to `main` deploy automatically. Env var `VITE_WEATHER_PROVIDER=open-meteo` is set for Production. | The first Git-triggered deployments were briefly *Blocked* because the commit author (an agent address) was not a member of the Vercel team. Fixed the free way — author commits as the owner's GitHub identity. No Pro upgrade and no collaborators required. |
 | **Weather (Open-Meteo)** | Unchanged — keyless, live in both the local preview and the deployed site. | — |
+| **AI model gateway** | Gemini key set as a Supabase function secret (activates when the `ai` function is deployed). The `ai` function now also honours `OPENAI_BASE_URL`, so any OpenAI-compatible gateway — e.g. **OmniRoute** — can serve the app by changing one secret and setting `OPENAI_MODEL=auto`. | OmniRoute runs locally for development on `http://localhost:20128/v1` (keyless `auto` model). For deployed functions to use it, the gateway must be hosted somewhere reachable from Supabase's cloud; Gemini remains the zero-extra-parts default. |
 
-Everything else (AI, OTP/SMS, push, analytics, dealer/POS, maps) remains `MOCKED` behind the
-production-compatible contracts, exactly as described in §2.
+`OTP/SMS`, `push`, `analytics`, `dealer/POS` and `maps` remain `MOCKED` behind the
+production-compatible contracts, exactly as described in §2. The AI paths are gateway-ready:
+they switch to the real model as soon as the functions are deployed, with either Gemini or
+an OpenAI-compatible gateway behind `OPENAI_BASE_URL`.

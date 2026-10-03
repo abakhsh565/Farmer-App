@@ -11,6 +11,11 @@
  * key is actually present — OpenAI first, then Gemini. A build with neither key
  * reports that plainly instead of failing somewhere deeper.
  *
+ * The OpenAI path also honours `OPENAI_BASE_URL`, so any OpenAI-compatible
+ * gateway (OmniRoute, LiteLLM, an on-prem router) can serve the app by changing
+ * one variable and a model name. A local gateway may be keyless, so a configured
+ * base URL alone marks the provider as usable; a key is attached when one exists.
+ *
  * Keys never leave the server. They are read from the function's environment,
  * where they were placed through the dashboard's Edge Function secrets — not from
  * the client bundle, and not from the request.
@@ -53,6 +58,24 @@ export function openAiKey(): string | null {
   return env('OPENAI_API_KEY');
 }
 
+/**
+ * The OpenAI-compatible endpoint when it has been pointed away from the vendor.
+ * Null means the official OpenAI API.
+ *
+ * This is how a self-hosted gateway is used: set `OPENAI_BASE_URL` to e.g.
+ * `http://localhost:20128/v1` (OmniRoute) and `OPENAI_MODEL=auto`. No code
+ * change, no second provider implementation.
+ */
+export function openAiGateway(): string | null {
+  const base = env('OPENAI_BASE_URL');
+  return base ? base.replace(/\/+$/, '') : null;
+}
+
+/** Usable when a key exists, a gateway is configured, or both. */
+function openAiUsable(): boolean {
+  return openAiKey() !== null || openAiGateway() !== null;
+}
+
 export function geminiKey(): string | null {
   // Google issues the same key under two names depending on which console page
   // you copied it from, and both appear in the wild.
@@ -62,9 +85,9 @@ export function geminiKey(): string | null {
 /** Which vendor will be used, resolved from configuration then from what exists. */
 export function activeProvider(): ProviderName | null {
   const requested = env('AI_PROVIDER')?.toLowerCase();
-  if (requested === 'openai') return openAiKey() ? 'openai' : null;
+  if (requested === 'openai') return openAiUsable() ? 'openai' : null;
   if (requested === 'gemini') return geminiKey() ? 'gemini' : null;
-  if (openAiKey()) return 'openai';
+  if (openAiUsable()) return 'openai';
   if (geminiKey()) return 'gemini';
   return null;
 }
@@ -92,13 +115,17 @@ export function providerStatus(): {
   active: ProviderName | null;
   model: string | null;
   available: Record<ProviderName, boolean>;
+  /** True when an OpenAI-compatible gateway overrides the vendor URL. The URL
+   *  itself is not reported, and keys never are. */
+  gateway: boolean;
 } {
   const active = activeProvider();
   return {
     configured: active !== null,
     active,
     model: active ? modelName() : null,
-    available: { openai: openAiKey() !== null, gemini: geminiKey() !== null },
+    available: { openai: openAiUsable(), gemini: geminiKey() !== null },
+    gateway: openAiGateway() !== null,
   };
 }
 
@@ -111,12 +138,20 @@ async function callOpenAi(
   opts: { json?: boolean; temperature?: number; maxTokens?: number; signal: AbortSignal },
 ): Promise<ModelReply> {
   const key = openAiKey();
-  if (!key) return { ok: false, reason: 'not_configured', detail: 'OPENAI_API_KEY is not set.' };
+  const gateway = openAiGateway();
+  if (!key && !gateway) {
+    return { ok: false, reason: 'not_configured', detail: 'OPENAI_API_KEY is not set.' };
+  }
   const model = modelName();
 
-  const response = await fetch('https://api.openai.com/v1/chat/completions', {
+  const base = gateway ?? 'https://api.openai.com/v1';
+  const response = await fetch(`${base}/chat/completions`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
+    headers: {
+      'Content-Type': 'application/json',
+      // A keyless local gateway is legitimate; send the header only when a key exists.
+      ...(key ? { Authorization: `Bearer ${key}` } : {}),
+    },
     body: JSON.stringify({
       model,
       messages,
@@ -241,7 +276,7 @@ export async function complete(
     return {
       ok: false,
       reason: 'not_configured',
-      detail: 'No model provider is configured. Set OPENAI_API_KEY or GEMINI_API_KEY as a function secret.',
+      detail: 'No model provider is configured. Set OPENAI_API_KEY, GEMINI_API_KEY or OPENAI_BASE_URL as a function secret.',
     };
   }
 
