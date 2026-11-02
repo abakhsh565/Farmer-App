@@ -2,6 +2,7 @@ import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { App } from '@/App';
+import { markOnboardingComplete } from '@/onboarding/OnboardingFlow';
 
 /**
  * The dealer conversations, driven the way a farmer drives them.
@@ -16,6 +17,7 @@ import { App } from '@/App';
 
 beforeEach(() => {
   localStorage.clear();
+  markOnboardingComplete();
   document.documentElement.lang = 'en';
   document.documentElement.dir = 'ltr';
   document.documentElement.classList.remove('dark');
@@ -23,6 +25,31 @@ beforeEach(() => {
 });
 
 const READY = { timeout: 5000 };
+
+/**
+ * A phone that already carries these conversations, so the tests below are about
+ * reading, searching and continuing history rather than about where the history
+ * came from. The product starts a farmer with none.
+ */
+const withHistory = (): void => {
+  localStorage.setItem(
+    'agri-shop.chat',
+    JSON.stringify({
+      version: 1,
+      threads: {
+        'dealer.aliTraders': [
+          { id: 1, from: 'me', key: 'chat.msg1' },
+          { id: 2, from: 'dealer', key: 'chat.msg2' },
+          { id: 3, from: 'dealer', key: 'chat.preview.ali' },
+        ],
+        'dealer.greenAgro': [{ id: 1, from: 'dealer', key: 'chat.preview.greenAgro' }],
+        'dealer.wazirabadAgri': [{ id: 1, from: 'dealer', key: 'chat.preview.wazirabad' }],
+        'dealer.malikFertilizers': [{ id: 1, from: 'dealer', key: 'chat.preview.malik' }],
+      },
+      unread: { 'dealer.aliTraders': 2 },
+    }),
+  );
+};
 
 const openChat = async () => {
   await userEvent.click(screen.getByRole('button', { name: 'Chat' }));
@@ -53,6 +80,7 @@ const openAli = async () => {
 
 describe('chat', () => {
   it('reads a conversation without asking for an account, and the badge clears', async () => {
+    withHistory();
     render(<App />);
     await openChat();
 
@@ -88,6 +116,7 @@ describe('chat', () => {
   });
 
   it('keeps what was sent after the app is reopened, and carries the history into the account', async () => {
+    withHistory();
     const first = render(<App />);
     await openChat();
     await openAli();
@@ -114,6 +143,7 @@ describe('chat', () => {
   });
 
   it('searches the conversations, and says so when nothing matches', async () => {
+    withHistory();
     render(<App />);
     await openChat();
 

@@ -3,6 +3,7 @@ import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { App } from '@/App';
 import { resetPersistence } from '@/services/persistence';
+import { markOnboardingComplete } from '@/onboarding/OnboardingFlow';
 
 /**
  * Two journeys that cross several screens each, driven from the outside.
@@ -16,6 +17,7 @@ import { resetPersistence } from '@/services/persistence';
 
 beforeEach(() => {
   localStorage.clear();
+  markOnboardingComplete();
   document.documentElement.lang = 'en';
   document.documentElement.dir = 'ltr';
   document.documentElement.classList.remove('dark');
@@ -92,6 +94,53 @@ describe('the field-visit journey', () => {
     render(<App />);
     await openDealer('Ali Traders');
     expect(await screen.findByText('Field visit accepted', {}, READY)).toBeInTheDocument();
+  });
+
+  /**
+   * A refusal has to leave the door open.
+   *
+   * The copy says "You can ask again later" and the store allows it — a second
+   * request after a refusal is a new request, not an edit of the old one. But the
+   * dealer profile read the *latest* request whatever its status and hid the
+   * button whenever one existed, so a refusal locked the farmer out of that shop
+   * for good: the one answer that should be recoverable was the only permanent
+   * one.
+   *
+   * This drives the whole loop — ask, get refused, ask again — because the defect
+   * is only visible at the end of it.
+   */
+  it('lets a farmer ask again after a refusal, which the copy promises', async () => {
+    render(<App />);
+
+    await openDealer('Ali Traders');
+    await userEvent.click(
+      await screen.findByRole('button', { name: 'Request a field visit' }, READY),
+    );
+    await signIn('0300 5554443');
+
+    expect(
+      await screen.findByText('Field visit requested · waiting for an answer'),
+    ).toBeInTheDocument();
+
+    // The shop says no.
+    await userEvent.click(screen.getByRole('button', { name: 'Dealer declines' }));
+    expect(await screen.findByText('Field visit declined')).toBeInTheDocument();
+    expect(
+      screen.getByText('The dealer cannot come this week. You can ask again later.'),
+    ).toBeInTheDocument();
+
+    /* …and "later" has to actually be reachable. */
+    await userEvent.click(screen.getByRole('button', { name: 'Request a field visit' }));
+
+    expect(
+      await screen.findByText('Field visit requested · waiting for an answer'),
+    ).toBeInTheDocument();
+
+    /* Two requests, not one edited twice. The record itself is asserted in
+       `visits/store.test.ts`; what belongs here is the screen, because the defect
+       was never in the store — it agreed to the retry the whole time. It was the
+       dealer profile refusing to offer it. */
+    expect(screen.getByRole('button', { name: /Dealer accepts/ })).toBeInTheDocument();
   });
 });
 

@@ -143,6 +143,32 @@ export function outstandingOf(agreement: Agreement, request: CreditRequest): num
     - agreement.paid;
 }
 
+/**
+ * How many shops may hold the farmer's open credit at once.
+ *
+ * Asking is open — a farmer can put a request to as many shops as their area
+ * offers, which is the point of shopping around. *Owing* is not: credit is
+ * carried at four shops at a time, so a fifth shop's request is refused while
+ * four agreements are open. The cap is on credit held, not on requests made, and
+ * clearing one agreement frees the place — which is why the check is here, on
+ * committed money, and not on the request list.
+ *
+ * A shop that already holds credit is always allowed to ask again: the limit is
+ * on the number of creditors, never on the farmer's own shop.
+ */
+export const MAX_CREDIT_SHOPS = 4;
+
+/** The shops holding the farmer's open credit — one entry per shop, not per purchase. */
+export function shopsHoldingCredit(data: CreditData): MessageKey[] {
+  const shops = new Set<MessageKey>();
+  for (const agreement of data.agreements) {
+    if (agreement.closedAt !== null) continue;
+    const request = requestById(data, agreement.requestId);
+    if (request) shops.add(request.dealerKey);
+  }
+  return [...shops];
+}
+
 export function activeForOrder(data: CreditData, orderId: string): CreditRequest | undefined {
   return data.requests.find((request) => request.orderId === orderId && isActive(request.status));
 }
@@ -228,6 +254,10 @@ export function submit(
   }
   if (activeForOrder(data, proposal.orderId)) {
     return { data, result: { ok: false, error: 'credit.error.duplicate' } };
+  }
+  const holders = shopsHoldingCredit(data);
+  if (holders.length >= MAX_CREDIT_SHOPS && !holders.includes(proposal.dealerKey)) {
+    return { data, result: { ok: false, error: 'credit.error.shopLimit' } };
   }
 
   const id = `credit-${proposal.orderId}-${now}`;
@@ -543,132 +573,19 @@ export function reconcile(data: CreditData): Reconciliation[] {
   return issues;
 }
 
-const DAY = 24 * 60 * 60 * 1000;
-
 /**
- * The demo's starting position, drawn so the three things a farmer must be able
- * to find are present on first launch: something waiting on them (the counter),
- * a live agreement with a balance, and a closed record for history. The times are
- * relative to `now`, so the demo does not go stale in a drawer.
+ * A farmer starts with an empty credit book.
+ *
+ * This used to be a demo fixture — three requests and an agreement with a
+ * balance — so the ledger would have something in it on first launch. On a
+ * shared phone that meant the next person saw borrowed money that was not
+ * theirs, with a due date and a history of it, which is the worst possible thing
+ * to show someone who cannot tell it is a fixture. A credit record exists when
+ * the farmer asks for credit; the screen's empty state is the honest first
+ * launch.
  */
-export function createSeed(now: number): CreditData {
-  const counterRequest: CreditRequest = {
-    id: 'credit-order-dap-1',
-    orderId: 'order-dap-1',
-    dealerKey: 'dealer.aliTraders',
-    productKey: 'product.dap',
-    status: 'awaiting_farmer_decision',
-    terms: [
-      {
-        version: 1,
-        source: 'farmer',
-        amount: 12_000,
-        dueKey: 'credit.due.afterHarvest',
-        fee: 0,
-        feeNoteKey: null,
-      },
-      {
-        version: 2,
-        source: 'shop_owner',
-        amount: 12_400,
-        dueKey: 'credit.due.december',
-        fee: 300,
-        feeNoteKey: 'credit.fee.service',
-      },
-    ],
-    consents: [{ actor: 'farmer', termsVersion: 1, at: now - 2 * DAY }],
-    events: [],
-    counterofferUsed: true,
-    createdAt: now - 2 * DAY,
-    expiresAt: now + 5 * DAY,
-  };
-  counterRequest.events = [
-    { id: 'e1', type: 'submitted', actor: 'farmer', at: now - 2 * DAY, termsVersion: 1 },
-    { id: 'e2', type: 'review_started', actor: 'shop_owner', at: now - DAY, termsVersion: 1 },
-    { id: 'e3', type: 'counteroffered', actor: 'shop_owner', at: now - 6 * 60 * 60 * 1000, termsVersion: 2 },
-  ];
-
-  const paidRequest: CreditRequest = {
-    id: 'credit-order-urea-1',
-    orderId: 'order-urea-1',
-    dealerKey: 'dealer.aliTraders',
-    productKey: 'product.urea',
-    status: 'accepted',
-    terms: [
-      {
-        version: 1,
-        source: 'farmer',
-        amount: 14_000,
-        dueKey: 'credit.due.afterHarvest',
-        fee: 0,
-        feeNoteKey: null,
-      },
-    ],
-    consents: [
-      { actor: 'farmer', termsVersion: 1, at: now - 20 * DAY },
-      { actor: 'farmer', termsVersion: 1, at: now - 19 * DAY },
-    ],
-    events: [
-      { id: 'e4', type: 'submitted', actor: 'farmer', at: now - 20 * DAY, termsVersion: 1 },
-      { id: 'e5', type: 'accepted_directly', actor: 'shop_owner', at: now - 19 * DAY, termsVersion: 1 },
-      { id: 'e6', type: 'farmer_accepted', actor: 'farmer', at: now - 19 * DAY, termsVersion: 1 },
-      { id: 'e7', type: 'final_approved', actor: 'shop_owner', at: now - 18 * DAY, termsVersion: 1 },
-    ],
-    counterofferUsed: false,
-    createdAt: now - 20 * DAY,
-    expiresAt: null,
-  };
-
-  const rejectedRequest: CreditRequest = {
-    id: 'credit-order-seed-1',
-    orderId: 'order-seed-1',
-    dealerKey: 'dealer.greenAgro',
-    productKey: 'product.seedCotton',
-    status: 'rejected',
-    terms: [
-      {
-        version: 1,
-        source: 'farmer',
-        amount: 22_000,
-        dueKey: 'credit.due.afterHarvest',
-        fee: 0,
-        feeNoteKey: null,
-      },
-    ],
-    consents: [{ actor: 'farmer', termsVersion: 1, at: now - 40 * DAY }],
-    events: [
-      { id: 'e8', type: 'submitted', actor: 'farmer', at: now - 40 * DAY, termsVersion: 1 },
-      {
-        id: 'e9',
-        type: 'final_rejected',
-        actor: 'shop_owner',
-        at: now - 38 * DAY,
-        termsVersion: 1,
-        reasonKey: 'credit.reason.limit',
-      },
-    ],
-    counterofferUsed: false,
-    createdAt: now - 40 * DAY,
-    expiresAt: null,
-  };
-
-  return {
-    requests: [counterRequest, paidRequest, rejectedRequest],
-    agreements: [
-      {
-        requestId: paidRequest.id,
-        termsVersion: 1,
-        farmerConsentAt: now - 19 * DAY,
-        shopOwnerApprovedAt: now - 18 * DAY,
-        paid: 5_500,
-        payments: [
-          { id: 'p1', at: now - 9 * DAY, amount: 3_000, noteKey: 'credit.payment.cash' },
-          { id: 'p2', at: now - 2 * DAY, amount: 2_500, noteKey: 'credit.payment.cash' },
-        ],
-        closedAt: null,
-      },
-    ],
-  };
+export function createState(): CreditData {
+  return { requests: [], agreements: [] };
 }
 
 export function serialise(data: CreditData): string {

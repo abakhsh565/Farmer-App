@@ -42,6 +42,16 @@ export type OtpState = {
   resendAllowedAt: number | null;
   error: OtpError | null;
   /**
+   * The provider's own words, when it gave any.
+   *
+   * Kept alongside the classified error rather than replaced by it, because there
+   * are failures the app cannot classify honestly — "the SMS provider is not
+   * configured on the server" is not a network problem, and telling a farmer to
+   * check their connection when the server has no SMS provider is a lie that costs
+   * them twenty minutes. Shown as-is when present.
+   */
+  detail: string | null;
+  /**
    * Development only — populated by the development provider so a tester can
    * complete the flow on a device with no SMS. The production provider leaves it
    * undefined, and the screen must treat absence as normal.
@@ -58,12 +68,13 @@ export function initialOtpState(channel: OtpChannel = 'phone', destination = '')
     expiresAt: null,
     resendAllowedAt: null,
     error: null,
+    detail: null,
     developmentCode: null,
   };
 }
 
 export function requestStarted(state: OtpState): OtpState {
-  return { ...state, phase: 'sending', error: null };
+  return { ...state, phase: 'sending', error: null, detail: null };
 }
 
 export function codeSent(
@@ -78,6 +89,7 @@ export function codeSent(
     expiresAt: sent.expiresAt,
     resendAllowedAt: now + sent.resendAfterSeconds * 1000,
     error: null,
+    detail: null,
     developmentCode: sent.developmentCode ?? null,
   };
 }
@@ -89,8 +101,36 @@ export function codeSent(
  * a code nobody was sent: the farmer's next action is to try the send again, and
  * the screen can only offer that if it knows no code exists yet.
  */
-export function requestFailed(state: OtpState, error: OtpError = 'network'): OtpState {
-  return { ...state, phase: 'failed', error, expiresAt: null, developmentCode: null };
+export function requestFailed(
+  state: OtpState,
+  error: OtpError = 'network',
+  detail: string | null = null,
+): OtpState {
+  return { ...state, phase: 'failed', error, detail, expiresAt: null, developmentCode: null };
+}
+
+/**
+ * Classifies a provider failure from its message.
+ *
+ * Providers do not share an error vocabulary, and the SDKs are conservative about
+ * how much they will tell a client. What they *do* say is whether the farmer must
+ * wait (a rate limit), whether the code was wrong, or something else entirely —
+ * and those three lead to different next actions, so guessing "network" for all of
+ * them would throw away the only useful part of the answer.
+ */
+export function otpFailureOf(error: unknown): { error: OtpError; detail: string | null } {
+  const detail = error instanceof Error ? error.message : null;
+  const message = (detail ?? '').toLowerCase();
+
+  if (message.includes('expired')) return { error: 'expired', detail };
+  if (message.includes('too many') || message.includes('rate limit')) {
+    return { error: 'too_many_attempts', detail };
+  }
+  // Supabase's wording for a send that is inside the cooldown.
+  if (message.includes('security purposes') || message.includes('only request this after')) {
+    return { error: 'cooldown', detail };
+  }
+  return { error: 'network', detail };
 }
 
 export function verifyStarted(state: OtpState): OtpState {

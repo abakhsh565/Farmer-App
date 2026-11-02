@@ -26,6 +26,12 @@ export type Account = {
   email: string | null;
   method: 'phone' | 'email';
   verifiedAt: number;
+  /**
+   * The domain actor this session resolves to in the database, when a real
+   * backend issued the session. Null means the session exists but owns nothing
+   * yet — the app can represent that state rather than pretending otherwise.
+   */
+  partyId: string | null;
 };
 
 export type SessionState = {
@@ -94,20 +100,28 @@ export function displayNameOf(state: SessionState): string | null {
  */
 export function signIn(
   state: SessionState,
-  input: { method: 'phone' | 'email'; contact: string; name?: string },
+  input: { method: 'phone' | 'email'; contact: string; name?: string; partyId?: string | null },
   now: number,
 ): { state: SessionState; result: Result } {
   const problem = validateContact(input.method, input.contact);
   if (problem) return { state, result: { ok: false, error: problem } };
 
   const contact = input.contact.trim();
+  const partyId = input.partyId ?? null;
   const account: Account = {
-    id: `${input.method}:${contact.toLowerCase()}`,
+    /*
+     * A server-issued party id is the account. Falling back to the contact is
+     * what the demo build did when it had no server to ask; keeping that fallback
+     * means a build with no backend still has a stable account, and a real one
+     * never depends on how the phone number was typed.
+     */
+    id: partyId ?? `${input.method}:${contact.toLowerCase()}`,
     name: input.name?.trim() || defaultName(input.method, contact),
     phone: input.method === 'phone' ? contact : null,
     email: input.method === 'email' ? contact : null,
     method: input.method,
     verifiedAt: now,
+    partyId,
   };
 
   return {
@@ -138,6 +152,22 @@ export function markContextMigrated(state: SessionState): SessionState {
   return { ...state, contextMigrated: true };
 }
 
+/**
+ * Record the party id learned for an account that is already signed in.
+ *
+ * The account id *is* the party id, because that is the row key every policy in
+ * the database matches on. An account whose party id arrives late is therefore
+ * not a different account — it is the same farmer with their real key, and the
+ * document layer moves their work onto it (see the hand-over in
+ * `services/persistence.ts`). Without this the only way to correct the key would
+ * be to sign out and in again, which is exactly the moment a farmer would lose
+ * what they had written.
+ */
+export function setPartyId(state: SessionState, partyId: string): SessionState {
+  if (!state.account || state.account.partyId === partyId) return state;
+  return { ...state, account: { ...state.account, id: partyId, partyId } };
+}
+
 /** Persist the identity only — never the pending action, which belongs to a flow. */
 export function serialise(state: SessionState): string {
   return JSON.stringify({
@@ -160,7 +190,12 @@ export function hydrate(raw: string | null): SessionState | null {
     }
     return {
       ...createState(),
-      account,
+      account: {
+        ...account,
+        // A document written before the party id existed restores as "no party
+        // known", which the next session exchange fills in.
+        partyId: typeof account.partyId === 'string' ? account.partyId : null,
+      },
       contextMigrated: parsed.contextMigrated === true,
     };
   } catch {

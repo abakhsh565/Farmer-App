@@ -1,6 +1,6 @@
 import {
+  BookmarkPlus,
   Check,
-  Map,
   MessageCircle,
   Search,
   ShieldCheck,
@@ -28,6 +28,7 @@ import {
   type DealerTag,
 } from '@/data/dealers';
 import { useLocale } from '@/i18n/LocaleProvider';
+import { useLocation } from '@/location/LocationProvider';
 import type { MessageKey } from '@/i18n/catalog';
 import { formatDay, formatHour, formatMoney, formatNumber, formatRelativeTime } from '@/i18n/format';
 import { initialsOf } from '@/lib/initials';
@@ -65,26 +66,126 @@ const FILTERS: ReadonlyArray<{ id: FilterId; labelKey: MessageKey }> = [
   { id: 'seed', labelKey: 'dealers.filter.seed' },
 ];
 
-export function DealersScreen({ onOpenChat }: { onOpenChat: (dealerKey: string) => void }) {
+export function DealersScreen({
+  onOpenChat,
+  onOpenSearch,
+  onOpenLocationSearch,
+}: {
+  onOpenChat: (dealerKey: string) => void;
+  /** Opens the search page — shops and stock, one keyword. */
+  onOpenSearch: () => void;
+  /** Opens the page where the farmer finds their area by name. */
+  onOpenLocationSearch: () => void;
+}) {
   const { t, locale } = useLocale();
   const [filter, setFilter] = useState<FilterId>('all');
-  const [radius, setRadius] = useState(10);
   /** null means the profile location; anything else is a search that stays temporary. */
   const [areaId, setAreaId] = useState<AreaId | null>(null);
-  const [term, setTerm] = useState('');
   const [profileId, setProfileId] = useState<string | null>(null);
 
+  /*
+   * Where the search is about lives above the screen, in the location store, and
+   * not in local state. Two reasons, both about the rule: a point the farmer chose
+   * has to be the same point the weather, the assistant and the next screen read —
+   * and a temporary area must not be something this screen can quietly keep as a
+   * local variable that then looks like the farmer's location.
+   */
+  const location = useLocation();
+
   const searchedArea = areaId ?? PROFILE_AREA;
+  /*
+   * The origin a search passes.
+   *
+   * A temporary area always supplies one. When there is a saved location and no
+   * temporary area, none is passed at all and the *server* falls back to the
+   * signed-in farmer's saved location — so the two can never disagree. When there
+   * is no saved location yet (a guest, or a new account), the point in play is
+   * passed explicitly, because a guest searching is allowed and an account without
+   * a location still needs a first screen that answers.
+   */
+  const searchOrigin =
+    location.searchOrigin ??
+    (location.hasSaved
+      ? undefined
+      : { lat: location.activePoint.lat, lon: location.activePoint.lon });
+
   /*
    * The tags go to the service rather than being filtered here: which shop carries
    * fertilizer is the dealer system's answer, not this screen's opinion.
    */
+  /* No free text here any more: the list is browsed by radius and tag, and any
+     word the farmer types goes to the search page, where it can answer about
+     stock as well as about shops. */
   const search = useDealerSearch({
-    radiusKm: radius,
-    origin: areaId ? areaPoint(areaId) : undefined,
-    query: term.trim().length > 0 ? term.trim() : undefined,
+    radiusKm: location.radiusKm,
+    origin: searchOrigin,
     tags: filter === 'all' || filter === 'open' ? undefined : [filter],
   });
+
+  /**
+   * Choosing a place to look is temporary by construction — it writes to the
+   * session's search area and nothing else. Keeping it on the account is a
+   * separate act with its own control, below.
+   */
+  const applyArea = (next: AreaId | null) => {
+    setAreaId(next);
+    if (next === null) {
+      location.clearTemporary();
+      return;
+    }
+    const point = areaPoint(next);
+    location.setTemporary({
+      label: t(areaNameKey(next)),
+      lat: point.lat,
+      lon: point.lon,
+      source: 'search',
+    });
+  };
+
+  /**
+   * The explicit save.
+   *
+   * Gated on identity, which is the PRD's rule rather than a convenience: reading
+   * is free, and keeping something is the accountable act. The point survives the
+   * gate because the pending action *is* the save — a farmer who picks a place,
+   * taps Save and is asked to sign in does not have to pick it again.
+   */
+  const saveLocation = () => {
+    const point = location.temporary;
+    if (!point) return;
+
+    /*
+     * No identity gate. Choosing where you are is not said *to* anyone — see
+     * LocationProvider — so it is written to the account when there is one and to
+     * the phone when there is not, and neither path needs the farmer to sign up
+     * first.
+     */
+    void (async () => {
+      try {
+        await location.save({
+          label: point.label,
+          lat: point.lat,
+          lon: point.lon,
+          source: point.source,
+          radiusKm: location.radiusKm,
+        });
+        /*
+         * The temporary area is released once it is the saved location: keeping
+         * it would leave the app reporting "temporary" about the very place it now
+         * owns, and the two labels would contradict each other.
+         */
+        location.clearTemporary();
+        setAreaId(null);
+        toast.success(t('location.savedToast'));
+      } catch (failure) {
+        toast.error(
+          t('location.saveFailed', {
+            reason: failure instanceof Error ? failure.message : '',
+          }),
+        );
+      }
+    })();
+  };
 
   const rows =
     filter === 'open'
@@ -102,44 +203,87 @@ export function DealersScreen({ onOpenChat }: { onOpenChat: (dealerKey: string) 
       <header className="flex items-center justify-between gap-3">
         <h1 className="text-title">{t('dealers.title')}</h1>
         <div className="flex shrink-0 items-center gap-2">
-          <button
-            type="button"
-            aria-label={t('dealers.mapAria')}
-            className="grid size-10 place-items-center rounded-full bg-muted"
-          >
-            <Map className="size-5" aria-hidden />
-          </button>
+          {/*
+            One control, not two. The map button is gone: a farmer who can name
+            their area needs a field to type it in, not a basemap to pan — and
+            where they are is a filter on this list, so it is reached from the
+            filter rather than from a second button beside it.
+          */}
           <SearchSettingsSheet
-            radius={radius}
+            radius={location.radiusKm}
             areaId={areaId}
-            onChangeRadius={setRadius}
-            onChangeArea={setAreaId}
+            onChangeRadius={location.setRadiusKm}
+            onChangeArea={applyArea}
+            onOpenLocationSearch={onOpenLocationSearch}
           />
         </div>
       </header>
 
-      {/* Which area is being searched, and whether it is the profile's or a
-          temporary one — a radius that silently moved the results would be the
-          exact behaviour the rule forbids. */}
-      <p className="mt-2 text-label text-muted-foreground">
-        {t('dealer.search.near', { place: t(areaNameKey(searchedArea)) })}
-        {areaId ? ` · ${t('dealer.search.temp', { place: t('farmer.village') })}` : ''}
-      </p>
+      {/*
+        The farmer's location, and the only control that may change what the
+        account says. A temporary area is labelled as temporary in the same
+        breath as the saved place it is *not* replacing, because the forbidden
+        behaviour is a search that quietly becomes the profile.
+      */}
+      <section
+        aria-label={t('location.current')}
+        className="mt-3 flex items-start justify-between gap-3 rounded-lg border border-border bg-card p-3"
+      >
+        <div className="min-w-0">
+          <p className="text-label text-muted-foreground">{t('location.current')}</p>
+          <p className="truncate text-body font-medium">
+            {location.placeLabel || t('location.none')}
+          </p>
+          <p className="mt-0.5 text-caption text-muted-foreground">
+            {location.isTemporary
+              ? t('location.temporaryHint', {
+                  place: location.placeLabel,
+                  saved: location.saved?.label ?? t('location.none'),
+                })
+            : location.hasSaved
+              ? t(location.savedOnDevice ? 'location.savedHintDevice' : 'location.savedHint')
+              : t('location.defaultHint')}
+          </p>
+        </div>
 
-      <div className="relative mt-3">
-        <Search
-          className="pointer-events-none absolute start-3.5 top-1/2 size-4.5 -translate-y-1/2 text-muted-foreground"
-          aria-hidden
-        />
-        <input
-          type="search"
-          value={term}
-          onChange={(event) => setTerm(event.target.value)}
-          placeholder={t('dealers.search')}
-          aria-label={t('dealers.search')}
-          className="h-12 w-full rounded-md bg-muted ps-11 pe-3.5 text-body placeholder:text-muted-foreground"
-        />
-      </div>
+        <div className="flex shrink-0 flex-col items-end gap-1">
+          {location.isTemporary ? (
+            <Button
+              size="sm"
+              className="h-9 rounded-full"
+              disabled={location.saving}
+              onClick={saveLocation}
+            >
+              <BookmarkPlus className="size-4" aria-hidden />
+              {location.saving ? t('location.saving') : t('location.save')}
+            </Button>
+          ) : null}
+          {location.isTemporary && location.hasSaved ? (
+            <button
+              type="button"
+              onClick={location.clearTemporary}
+              className="rounded-full py-1 text-caption text-muted-foreground"
+            >
+              {t('location.useSaved')}
+            </button>
+          ) : null}
+        </div>
+      </section>
+
+      {/*
+        Opens the search page rather than filtering this list in place. Filtering
+        here could only ever match a shop's *name*, so a farmer who searched
+        "urea" got an empty list and reasonably concluded that nobody stocked it —
+        the product half of the question had nowhere to be answered.
+      */}
+      <button
+        type="button"
+        onClick={onOpenSearch}
+        className="mt-3 flex h-12 w-full items-center gap-2.5 rounded-md bg-muted px-3.5 text-start text-body text-muted-foreground"
+      >
+        <Search className="size-4 shrink-0" aria-hidden />
+        {t('dealers.search')}
+      </button>
 
       <ul className="mt-3 flex gap-2 overflow-x-auto pb-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
         {FILTERS.map(({ id, labelKey }) => {
@@ -178,22 +322,22 @@ export function DealersScreen({ onOpenChat }: { onOpenChat: (dealerKey: string) 
       {search.status === 'ready' ? (
         <>
           <SectionLabel className="mt-3.5">
-            {t('dealer.search.count', { count: rows.length, km: radius })}
+            {t('dealer.search.count', { count: rows.length, km: location.radiusKm })}
           </SectionLabel>
 
           {rows.length === 0 ? (
             <EmptyState
               title={t('dealers.empty.title')}
               body={t('dealers.empty.body', {
-                km: radius,
-                place: t(areaNameKey(searchedArea)),
+                km: location.radiusKm,
+                place: location.placeLabel || t(areaNameKey(searchedArea)),
               })}
               action={
-                radius < MAX_RADIUS_KM ? (
+                location.radiusKm < MAX_RADIUS_KM ? (
                   <Button
                     variant="outline"
                     className="h-11 rounded-full"
-                    onClick={() => setRadius(MAX_RADIUS_KM)}
+                    onClick={() => location.setRadiusKm(MAX_RADIUS_KM)}
                   >
                     {t('dealer.search.max', { km: MAX_RADIUS_KM })}
                   </Button>
@@ -330,13 +474,19 @@ function SearchSettingsSheet({
   areaId,
   onChangeRadius,
   onChangeArea,
+  onOpenLocationSearch,
 }: {
   radius: number;
   areaId: AreaId | null;
   onChangeRadius: (next: number) => void;
   onChangeArea: (next: AreaId | null) => void;
+  onOpenLocationSearch: () => void;
 }) {
   const { t } = useLocale();
+  /* Read from the location store rather than a constant: "my profile location"
+     has to name the place the account actually holds, or it names a place the
+     farmer never chose. */
+  const location = useLocation();
   return (
     <Sheet>
       <SheetTrigger asChild>
@@ -353,6 +503,34 @@ function SearchSettingsSheet({
           <SheetTitle>{t('dealer.search.settings')}</SheetTitle>
         </SheetHeader>
         <div className="flex flex-col gap-4 p-4 pt-0">
+          {/*
+            Where the farmer is, first — it is the filter that changes every
+            other number in this sheet, and the one they came here to set.
+            Tapping it opens a page to type the name of the place; the place
+            they tap there is saved straight away and this sheet is gone by the
+            time they are back, because the whole screen returns with the list.
+          */}
+          <section>
+            <SectionLabel>{t('location.current')}</SectionLabel>
+            {/*
+              The label names the action and the row shows the current value —
+              a button whose only name was the place already set would read as a
+              statement rather than as something that opens a search.
+            */}
+            <button
+              type="button"
+              aria-label={t('location.title')}
+              onClick={onOpenLocationSearch}
+              className="mt-2 flex h-11 w-full items-center gap-2.5 rounded-md bg-muted px-3.5 text-start text-body"
+            >
+              <Search className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+              <span className="truncate">{location.placeLabel || t('location.none')}</span>
+            </button>
+            <p className="mt-2 text-caption text-muted-foreground">
+              {t('location.searchBarHint')}
+            </p>
+          </section>
+
           <section>
             <SectionLabel>{t('dealer.search.radius')}</SectionLabel>
             <ul className="mt-2 flex flex-wrap gap-2">
@@ -392,7 +570,8 @@ function SearchSettingsSheet({
                   }`}
                 >
                   <Sprout className="size-4 shrink-0" aria-hidden />
-                  {t('dealer.search.profile')} · {t('farmer.village')}
+                  {t('dealer.search.profile')}
+                  {location.saved ? ` · ${location.saved.label}` : ` · ${t('location.none')}`}
                 </button>
               </li>
               {AREAS.map((entry) => {
@@ -415,7 +594,9 @@ function SearchSettingsSheet({
             </ul>
             {areaId ? (
               <p className="mt-2 text-body-sm text-muted-foreground">
-                {t('dealer.search.temp', { place: t('farmer.village') })}
+                {t('dealer.search.temp', {
+                  place: location.saved?.label ?? t('location.none'),
+                })}
               </p>
             ) : null}
           </section>
@@ -453,6 +634,19 @@ function DealerProfile({
   if (dealer.distanceKm <= 2) reasons.push('dealer.reason.distance');
 
   const visit = visits.forDealer(dealer.id);
+  /*
+   * Whether the button comes back is the whole difference between a refusal and a
+   * dead end. The store treats a refusal as final but re-askable — asking again
+   * is a *new* request, not an edit of the old one — so the control has to come
+   * back with it. Reading the latest request regardless of status and hiding the
+   * button whenever one existed made a refusal permanent: the farmer saw "you can
+   * ask again later" and had no way to act on it, and no later was ever offered.
+   *
+   * So the button is offered unless there is still something to wait for. An
+   * accepted visit needs no second request; a refusal is over and may be
+   * repeated.
+   */
+  const canAsk = visit === undefined || visit.status === 'rejected';
 
   const askForVisit = () =>
     requestIdentity(() => {
@@ -605,6 +799,15 @@ function DealerProfile({
             ) : null}
             {visit.status === 'rejected' ? (
               <p className="mt-1.5 text-body-sm text-muted-foreground">{t('visit.rejected.body')}</p>
+            ) : null}
+            {canAsk ? (
+              <Button
+                variant="outline"
+                className="mt-2.5 h-11 w-full rounded-full"
+                onClick={askForVisit}
+              >
+                {t('dealer.profile.visit')}
+              </Button>
             ) : null}
           </div>
         ) : (

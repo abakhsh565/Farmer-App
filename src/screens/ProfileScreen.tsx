@@ -1,31 +1,31 @@
+import { useState } from 'react';
 import {
   Bell,
+  Check,
   ChevronLeft,
   ChevronRight,
   Cloud,
   CreditCard,
   HelpCircle,
   Languages,
+  Layers,
   LogIn,
-  LogOut,
   MapPin,
   Pencil,
-  Ruler,
-  ShieldCheck,
   Sprout,
   Store,
   SunMoon,
-  Trash2,
-  UserRound,
   type LucideIcon,
 } from 'lucide-react';
 import { toast } from 'sonner';
-import { Button } from '@/components/ui/button';
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
+import { useCredit } from '@/credit/CreditProvider';
+import { useInsights } from '@/insights/InsightProvider';
+import { useLocation } from '@/location/LocationProvider';
+import { CROP_CHOICES } from '@/onboarding/OnboardingFlow';
 import { useSession } from '@/session/SessionProvider';
 import {
   Sheet,
-  SheetClose,
   SheetContent,
   SheetHeader,
   SheetTitle,
@@ -33,14 +33,11 @@ import {
 } from '@/components/ui/sheet';
 import { useLocale } from '@/i18n/LocaleProvider';
 import type { Locale } from '@/i18n/catalog';
-import { formatDay, formatMoney } from '@/i18n/format';
+import { formatMoney } from '@/i18n/format';
 import { initialsOf } from '@/lib/initials';
 import { configurationReport } from '@/services/config';
 import { useSyncHealth } from '@/services/persistence';
 import { useTheme, type Theme } from '@/theme/ThemeProvider';
-
-/** The same figure the home card shows, since it is the same debt. */
-const CREDIT_DUE = 3_330;
 
 /**
  * Profile — who the farmer is, their farm at a glance, and everything that is
@@ -54,13 +51,72 @@ const CREDIT_DUE = 3_330;
 export function ProfileScreen({
   onBack,
   onOpenDealers,
+  onOpenLocationSearch,
 }: {
   onBack: () => void;
   onOpenDealers: () => void;
+  onOpenLocationSearch: () => void;
 }) {
   const { t, locale, setLocale } = useLocale();
   const { theme, setTheme } = useTheme();
-  const { account, isGuest, signOut, prompt } = useSession();
+  const { account, signOut, prompt } = useSession();
+  const credit = useCredit();
+  const insights = useInsights();
+  const location = useLocation();
+
+  /*
+   * No account yet. Everything the screen shows about a farmer is then something
+   * they can still set: the crop and the area are theirs either way — they live
+   * on the phone and are handed to the account when one is made — so the strip is
+   * a control rather than a caption. What is not theirs yet is an account's own
+   * record, and those rows ask for the account instead of showing a number that
+   * would be somebody's.
+   */
+  const guest = account === null;
+  const [setting, setSetting] = useState<'crops' | 'location' | null>(null);
+
+  /*
+   * These three used to be catalog strings — "Cotton", "8 acres", "Wazirabad" —
+   * shown as the farmer's own farm on every install. That is the same defect as
+   * the hard-coded name this screen already fixed: a figure that belongs to
+   * nobody reads as the previous farmer's, and there is no way to correct it
+   * because nothing in the app collects an acreage.
+   *
+   * So each is now read from the store that actually holds it, and says plainly
+   * that it is unknown when that store has nothing. The strip is still three
+   * figures; they are just true ones.
+   */
+  const mainCrop = insights.primary;
+  const village = location.saved?.label ?? location.placeLabel;
+
+  /*
+   * What each of the three figures says, which depends on who is reading.
+   *
+   * Signed in, they are the account's own record and say so when they are
+   * unknown. Before that, an answer the farmer never gave is left *empty* rather
+   * than filled with a stand-in: a strip that reads "No crops yet" next to a
+   * cotton icon reads as a fact about them, and the empty slot is the control
+   * that fills it. A point without a name still gets the honest one — the app
+   * knows where the phone is, it just has no village to call it.
+   */
+  const cropStat = mainCrop ? t(mainCrop.nameKey) : guest ? '' : t('farmer.noCrops');
+  const countStat =
+    guest && insights.crops.length === 0
+      ? ''
+      : t('farmer.cropCount', { count: insights.crops.length });
+  const placeStat =
+    village || (!guest || location.hasSaved || location.isTemporary ? t('location.current') : '');
+
+  /*
+   * The figure is read from the farmer's own credit book. It used to be a
+   * constant copied from the home card, which happened to agree with the demo
+   * fixture it came from — and would have kept saying 3,330 after the farmer
+   * paid it off, or shown someone else's debt on a phone that changed hands.
+   */
+  const outstanding = credit.data.agreements.reduce(
+    (sum, agreement) => (agreement.closedAt === null ? sum + credit.outstandingOf(agreement) : sum),
+    0,
+  );
 
   return (
     <div className="flex flex-col px-4 pt-4 pb-6">
@@ -77,35 +133,123 @@ export function ProfileScreen({
         <ChevronLeft className="size-5 rtl:rotate-180" aria-hidden />
       </button>
 
-      <div className="mt-2 flex items-center gap-3.5">
-        <span className="grid size-15 shrink-0 place-items-center rounded-full bg-brand text-title font-medium text-brand-foreground">
-          {initialsOf(t('farmer.name'))}
-        </span>
-        <span className="min-w-0">
-          <span className="block truncate text-heading">{t('farmer.name')}</span>
-          <span className="mt-0.5 block truncate text-label text-muted-foreground">
-            {t('farmer.phone')}
+      {/*
+        The farmer's own name and contact, or the way in.
+
+        A guest has no name to show, so the whole row *is* the sign-in control —
+        avatar, label and all — rather than a name with a separate button beside
+        it. That keeps the account out of Profile as its own section (which it no
+        longer is) while leaving one obvious place to sign in.
+
+        Never a fixture: a hard-coded name and number here read as the previous
+        farmer still being signed in, which is the one thing this screen must not do.
+        */}
+      {account ? (
+        <div className="mt-2 flex items-center gap-3.5">
+          <span className="grid size-15 shrink-0 place-items-center rounded-full bg-brand text-title font-medium text-brand-foreground">
+            {initialsOf(account.name)}
           </span>
-        </span>
+          <span className="min-w-0 flex-1">
+            <span className="block truncate text-heading">{account.name}</span>
+            <span className="mt-0.5 block truncate text-label text-muted-foreground">
+              {account.phone ?? account.email ?? ''}
+            </span>
+          </span>
+          <button
+            type="button"
+            onClick={() => {
+              signOut();
+              toast.success(t('profile.account.signedOut'));
+            }}
+            className="shrink-0 rounded-full border border-border px-3.5 py-2 text-label text-muted-foreground"
+          >
+            {t('profile.logout')}
+          </button>
+        </div>
+      ) : (
+        <button
+          type="button"
+          onClick={() => prompt('profile.account.createReason')}
+          className="mt-2 flex w-full items-center gap-3.5 text-start"
+        >
+          <span className="grid size-15 shrink-0 place-items-center rounded-full bg-brand-soft text-title font-medium text-brand">
+            {initialsOf(t('farmer.guestName'))}
+          </span>
+          <span className="min-w-0 flex-1">
+            <span className="block truncate text-heading">{t('farmer.guestName')}</span>
+            <span className="mt-0.5 block truncate text-label text-muted-foreground">
+              {t('farmer.guestContact')}
+            </span>
+          </span>
+          {/* `rtl:rotate-180` because the icon is a direction, not a decoration:
+              a door with an arrow going in. In an Urdu screen the way in is to
+              the left, and an arrow still pointing right points at nothing. */}
+          <LogIn className="size-5 shrink-0 text-brand rtl:rotate-180" aria-hidden />
+        </button>
+      )}
+
+      {/*
+        The farmer's own three facts, and — before there is an account — the way
+        to set them. What onboarding collected is what shows here, because it is
+        read from the stores that hold it rather than from a fixture.
+      */}
+      <div className="mt-3.5 flex justify-around rounded-lg bg-surface-inverted p-3.5 text-center">
+        <Stat
+          icon={Sprout}
+          label={cropStat}
+          action={guest ? t('profile.crops') : undefined}
+          onClick={guest ? () => setSetting('crops') : undefined}
+        />
+        <Divider />
+        <Stat
+          icon={Layers}
+          label={countStat}
+          action={guest ? t('profile.crops') : undefined}
+          onClick={guest ? () => setSetting('crops') : undefined}
+        />
+        <Divider />
+        <Stat
+          icon={MapPin}
+          label={placeStat}
+          action={guest ? t('location.title') : undefined}
+          onClick={guest ? () => setSetting('location') : undefined}
+        />
       </div>
 
-      <dl className="mt-3.5 flex justify-around rounded-lg bg-surface-inverted p-3.5 text-center">
-        <Stat icon={Sprout} label={t('crop.cotton')} />
-        <Divider />
-        <Stat icon={Ruler} label={t('farmer.acres')} />
-        <Divider />
-        <Stat icon={MapPin} label={t('farmer.village')} />
-      </dl>
-
       <div className="mt-4 overflow-hidden rounded-md border border-border bg-card">
+        {/*
+          Three rows that belong to an account, and therefore ask for one.
+        
+          Before sign-in they carry no value at all — the credit figure, the
+          dealer list and the farm record are the account's, and showing the
+          phone's local copy here would read as a debt or a shop list the farmer
+          never entered. Tapping one opens the sign-in sheet with the reason
+          rather than a dead row, which is the rule every other gated action in
+          the app already follows.
+        */}
         <Row
           icon={CreditCard}
           label={t('profile.credit')}
-          value={formatMoney(CREDIT_DUE, locale, t)}
-          valueTone="text-amber-600 dark:text-amber-100"
+          value={
+            guest
+              ? undefined
+              : outstanding > 0
+                ? formatMoney(outstanding, locale, t)
+                : t('credit.home.none')
+          }
+          valueTone={outstanding > 0 ? 'text-amber-600 dark:text-amber-100' : 'text-muted-foreground'}
+          onClick={guest ? () => prompt('session.why.credit') : undefined}
         />
-        <Row icon={Store} label={t('profile.dealers')} onClick={onOpenDealers} />
-        <Row icon={Pencil} label={t('profile.farmDetails')} />
+        <Row
+          icon={Store}
+          label={t('profile.dealers')}
+          onClick={guest ? () => prompt('session.why.dealers') : onOpenDealers}
+        />
+        <Row
+          icon={Pencil}
+          label={t('profile.farmDetails')}
+          onClick={guest ? () => prompt('session.why.farmDetails') : undefined}
+        />
         <ChoiceRow
           icon={Languages}
           label={t('profile.language')}
@@ -146,58 +290,16 @@ export function ProfileScreen({
        */}
       <DataSection />
 
-      {/* Who you are, kept separate from what you grow. A guest sees only the way
-          in; signing out and deleting the account are authenticated-only, which
-          is the rule the module is built around. */}
-      <p className="mt-5 text-overline text-muted-foreground uppercase">
-        {t('profile.account.title')}
-      </p>
-      <div className="mt-2 overflow-hidden rounded-md border border-border bg-card">
-        {isGuest ? (
-          <>
-            <div className={ROW_DIVIDED}>
-              <UserRound className="size-5 shrink-0 text-brand" aria-hidden />
-              <span className="flex-1 text-body text-muted-foreground">
-                {t('profile.account.guest')}
-              </span>
-            </div>
-            <Row
-              icon={LogIn}
-              label={t('profile.account.create')}
-              onClick={() => prompt('profile.account.createReason')}
-              last
-            />
-          </>
-        ) : (
-          <>
-            <div className={ROW_DIVIDED}>
-              <ShieldCheck className="size-5 shrink-0 text-brand" aria-hidden />
-              <span className="min-w-0 flex-1">
-                <span className="block text-body">
-                  {t('profile.account.signedIn', { name: account?.name ?? '' })}
-                </span>
-                <span className="mt-0.5 block text-label text-muted-foreground">
-                  {t('profile.account.contact', {
-                    contact: account?.phone ?? account?.email ?? '',
-                    date: formatDay(new Date(account?.verifiedAt ?? Date.now()), locale),
-                  })}
-                </span>
-              </span>
-            </div>
-            <DeleteAccount />
-            <Row
-              icon={LogOut}
-              label={t('profile.logout')}
-              destructive
-              onClick={() => {
-                signOut();
-                toast.success(t('profile.account.signedOut'));
-              }}
-              last
-            />
-          </>
-        )}
-      </div>
+      {/* Opened by the strip above; nothing else on this screen reaches them. */}
+      <CropsSheet open={setting === 'crops'} onOpenChange={(open) => setSetting(open ? 'crops' : null)} />
+      <LocationSheet
+        open={setting === 'location'}
+        onOpenChange={(open) => setSetting(open ? 'location' : null)}
+        onSearch={() => {
+          setSetting(null);
+          onOpenLocationSearch();
+        }}
+      />
     </div>
   );
 }
@@ -213,8 +315,20 @@ export function ProfileScreen({
  */
 function DataSection() {
   const { t } = useLocale();
+  const { account } = useSession();
   const health = useSyncHealth();
   const services = configurationReport();
+
+  /* Signed in, but with no party id — so there is no row on the server to write
+   * to, and the farmer's documents are on this phone and nowhere else.
+   *
+   * "Everything is saved" would be a claim about the account, and the account
+   * cannot receive anything until it has a party. The state is temporary and
+   * self-healing (the session provider asks for the party id again on every
+   * launch), which is what the copy says instead of reporting a sync that is not
+   * happening.
+   */
+  const deviceOnly = account !== null && account.partyId === null;
 
   return (
     <>
@@ -233,12 +347,15 @@ function DataSection() {
                 ? t('profile.data.pending', { count: health.pending })
                 : health.failing
                   ? t('profile.data.failing')
-                  : t('profile.data.saved')}
+                  : deviceOnly
+                    ? t('profile.data.deviceOnly')
+                    : t('profile.data.saved')}
             </span>
             {/* The backend's own words when there are any, and the promise that
                 nothing was lost when there are not. */}
             <span className="mt-0.5 block text-label leading-relaxed text-muted-foreground">
-              {health.message ?? t('profile.data.savedBody')}
+              {health.message ??
+                (deviceOnly ? t('profile.data.deviceOnlyBody') : t('profile.data.savedBody'))}
             </span>
           </span>
           {health.failing ? (
@@ -270,68 +387,185 @@ function DataSection() {
   );
 }
 
+function Stat({
+  icon: Icon,
+  label,
+  action,
+  onClick,
+}: {
+  icon: LucideIcon;
+  label: string;
+  /** What tapping this figure does, used as its name when it has no words. */
+  action?: string;
+  onClick?: () => void;
+}) {
+  const inner = (
+    <>
+      <Icon className="mx-auto size-4.5 text-brand" aria-hidden />
+      <span className="mt-1 block text-label text-cream-50">{label}</span>
+    </>
+  );
+
+  /*
+   * A figure that can be changed is a button, and it carries the action in its
+   * name as well as the value — an empty slot has nothing to announce otherwise,
+   * which is exactly the state a farmer who skipped the question at install time
+   * is looking at.
+   */
+  return onClick ? (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-label={label ? `${action}: ${label}` : action}
+      className="flex-1"
+    >
+      {inner}
+    </button>
+  ) : (
+    <div className="flex-1">{inner}</div>
+  );
+}
+
 /**
- * Deleting the account, in two steps and with the retention rule stated.
+ * Choosing the farmer's main crop, or changing it.
  *
- * It closes the account and removes the farmer's own details; it does not touch
- * credit agreements or dealer records, because those are not the farmer's alone
- * to delete. The copy says that before the button is pressed, not after.
+ * The same four crops the install flow offers, from the same list, so the two
+ * screens cannot disagree about what is on offer. Tapping one is the whole
+ * decision: it makes that crop the main one and adds it when the farmer skipped
+ * the question at install time — which is why the write is `chooseCrop` rather
+ * than an add followed by a set.
  */
-function DeleteAccount() {
+function CropsSheet({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
   const { t } = useLocale();
-  const { signOut } = useSession();
+  const insights = useInsights();
+  const current = insights.primary;
 
   return (
-    <Sheet>
-      <SheetTrigger asChild>
-        <button type="button" className={ROW_DIVIDED}>
-          <Trash2 className="size-5 shrink-0 text-destructive" aria-hidden />
-          <span className="flex-1 text-start text-body text-destructive">
-            {t('profile.account.delete')}
-          </span>
-          <ChevronRight className="size-4 shrink-0 text-ink-300 rtl:rotate-180" aria-hidden />
-        </button>
-      </SheetTrigger>
+    <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent side="bottom" className="mx-auto w-full max-w-[430px]">
         <SheetHeader>
-          <SheetTitle>{t('profile.account.delete')}</SheetTitle>
+          <SheetTitle>{t('profile.crops')}</SheetTitle>
         </SheetHeader>
         <div className="flex flex-col gap-3 p-4 pt-0">
-          <p className="text-body-sm leading-relaxed text-muted-foreground">
-            {t('profile.account.deleteBody')}
-          </p>
-          <p className="rounded-md bg-muted px-3.5 py-3 text-body-sm text-muted-foreground">
-            {t('profile.account.keep')}
-          </p>
-          <SheetClose asChild>
-            <Button
-              variant="destructive"
-              className="h-12 rounded-full"
-              onClick={() => {
-                signOut();
-                toast.success(t('profile.account.deleted'));
-              }}
-            >
-              {t('profile.account.deleteConfirm')}
-            </Button>
-          </SheetClose>
-          <SheetClose asChild>
-            <Button variant="outline" className="h-11 rounded-full">
-              {t('common.cancel')}
-            </Button>
-          </SheetClose>
+          <p className="text-body-sm text-muted-foreground">{t('profile.cropsHint')}</p>
+          <ul className="flex flex-col gap-2">
+            {CROP_CHOICES.map((choice) => {
+              const active = current?.nameKey === choice.key;
+              return (
+                <li key={choice.key}>
+                  <button
+                    type="button"
+                    aria-pressed={active}
+                    onClick={() => {
+                      insights.chooseCrop({ nameKey: choice.key, stageKey: choice.stage });
+                      onOpenChange(false);
+                    }}
+                    className={[
+                      'flex w-full items-center justify-between rounded-md border px-3.5 py-3 text-start',
+                      active ? 'border-brand bg-brand-soft' : 'border-border bg-card',
+                    ].join(' ')}
+                  >
+                    <span className="text-body">{t(choice.key)}</span>
+                    {active ? <Check className="size-4 shrink-0 text-brand" aria-hidden /> : null}
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
         </div>
       </SheetContent>
     </Sheet>
   );
 }
 
-function Stat({ icon: Icon, label }: { icon: LucideIcon; label: string }) {
+/**
+ * Setting or changing where the farmer is, before there is an account.
+ *
+ * No gate here, deliberately. A location is not said to anyone — nothing is
+ * published by writing it down — so a guest's choice is kept on the phone and
+ * handed to the account when one is made. Detecting writes it straight away;
+ * searching hands over to the same screen the dealer filter uses, which saves on
+ * the tap.
+ */
+function LocationSheet({
+  open,
+  onOpenChange,
+  onSearch,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onSearch: () => void;
+}) {
+  const { t } = useLocale();
+  const location = useLocation();
+  const [locating, setLocating] = useState(false);
+  const [failed, setFailed] = useState(false);
+
+  const detect = () => {
+    if (!('geolocation' in navigator)) {
+      setFailed(true);
+      return;
+    }
+    setLocating(true);
+    setFailed(false);
+    navigator.geolocation.getCurrentPosition(
+      (position) => {
+        void location
+          .save({
+            label: '',
+            lat: position.coords.latitude,
+            lon: position.coords.longitude,
+            source: 'gps',
+            radiusKm: location.radiusKm,
+          })
+          .then(() => onOpenChange(false))
+          .catch(() => setFailed(true))
+          .finally(() => setLocating(false));
+      },
+      () => {
+        setLocating(false);
+        setFailed(true);
+      },
+      { enableHighAccuracy: false, timeout: 8000, maximumAge: 5 * 60 * 1000 },
+    );
+  };
+
   return (
-    <div className="flex-1">
-      <Icon className="mx-auto size-4.5 text-brand" aria-hidden />
-      <dd className="mt-1 text-label text-cream-50">{label}</dd>
-    </div>
+    <Sheet open={open} onOpenChange={onOpenChange}>
+      <SheetContent side="bottom" className="mx-auto w-full max-w-[430px]">
+        <SheetHeader>
+          <SheetTitle>{t('location.title')}</SheetTitle>
+        </SheetHeader>
+        <div className="flex flex-col gap-3 p-4 pt-0">
+          <p className="text-body-sm text-muted-foreground">{t('profile.locationHint')}</p>
+
+          {/* A refused permission and an unavailable location are one sentence:
+              the farmer's next move is the same either way — search for it. */}
+          {failed ? (
+            <p className="text-body-sm text-red-700 dark:text-red-100">
+              {t('location.detectFailed')}
+            </p>
+          ) : null}
+
+          <button
+            type="button"
+            onClick={detect}
+            disabled={locating}
+            className="flex h-12 items-center justify-center gap-2 rounded-full bg-primary text-body text-primary-foreground disabled:opacity-60"
+          >
+            <MapPin className="size-4" aria-hidden />
+            {locating ? t('location.saving') : t('location.current')}
+          </button>
+          <button
+            type="button"
+            onClick={onSearch}
+            className="flex h-12 items-center justify-center rounded-full border border-border bg-card text-body"
+          >
+            {t('location.searchBarHint')}
+          </button>
+        </div>
+      </SheetContent>
+    </Sheet>
   );
 }
 

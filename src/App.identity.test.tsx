@@ -5,6 +5,7 @@ import { App } from '@/App';
 import { createServices, type Services } from '@/services/registry';
 import { SESSION_STORAGE_KEY } from '@/session/SessionProvider';
 import type { OtpProvider, OtpRequest, OtpVerifyResult } from '@/services/types';
+import { markOnboardingComplete } from '@/onboarding/OnboardingFlow';
 
 /**
  * Identity-on-action, driven the way a farmer hits it.
@@ -34,6 +35,7 @@ const POST1 =
 
 beforeEach(() => {
   localStorage.clear();
+  markOnboardingComplete();
   document.documentElement.lang = 'en';
   document.documentElement.dir = 'ltr';
   document.documentElement.classList.remove('dark');
@@ -286,8 +288,11 @@ describe('the identity gate', () => {
   it('sends a dealer message only after the sign-in it asked for', async () => {
     render(<App />);
 
-    await userEvent.click(screen.getByRole('button', { name: 'Chat' }));
-    await userEvent.click(await screen.findByRole('button', { name: /Ali Traders/ }, READY));
+    /* There are no conversations yet: this one starts from the shop's row on
+       Home, and the gate is what turns the first message into an account. */
+    await userEvent.click(
+      await screen.findByRole('button', { name: 'Chat with Ali Traders' }, READY),
+    );
 
     await userEvent.type(screen.getByPlaceholderText('Type a message'), 'Do you have urea?');
     await userEvent.click(screen.getByRole('button', { name: 'Send message' }));

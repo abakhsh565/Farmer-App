@@ -3,7 +3,7 @@ import { toast } from 'sonner';
 import { useLocale } from '@/i18n/LocaleProvider';
 import type { MessageKey } from '@/i18n/catalog';
 import { deviceOwnerId, usePersistentDocument, type SyncStatus } from '@/services/persistence';
-import { IdentitySheet } from './IdentitySheet';
+import { CredentialSheet } from './CredentialSheet';
 import {
   cancelRequest,
   createState,
@@ -32,6 +32,10 @@ import {
  * must survive the round trip, and serialising a function to storage would both
  * break that and persist an action across launches, which is not what a farmer
  * agreed to by signing in.
+ *
+ * The sheet itself is one component for every entry point — a gated post, a
+ * dealer message, or the Login button on Profile — so there is one flow to get
+ * right rather than one per button.
  */
 
 export type SessionValue = {
@@ -39,7 +43,12 @@ export type SessionValue = {
   isGuest: boolean;
   /** Runs now and returns true; opens the sheet and returns false otherwise. */
   requestIdentity: (action: () => void, reason: MessageKey) => boolean;
-  signIn: (input: { method: 'phone' | 'email'; contact: string; name?: string }) => Result;
+  signIn: (input: {
+    method: 'phone' | 'email';
+    contact: string;
+    name?: string;
+    partyId?: string | null;
+  }) => Result;
   signOut: () => void;
   /** Opens the sheet with no action behind it — the Profile entry point. */
   prompt: (reason: MessageKey) => void;
@@ -134,13 +143,13 @@ export function SessionProvider({ children }: { children: ReactNode }) {
         setState((current) => cancelRequest(current));
       },
     }),
-    [state, t, runPending, document.status],
+    [state, t, runPending, document.status, setState],
   );
 
   return (
     <SessionContext.Provider value={value}>
       {children}
-      <IdentitySheet />
+      <CredentialSheet />
     </SessionContext.Provider>
   );
 }

@@ -15,6 +15,23 @@ export default defineConfig({
     strictPort: false,
     host: '127.0.0.1',
   },
+  /*
+   * MapLibre parses tiles in a web worker, and it ships that worker as a module.
+   * Vite's default worker format is an IIFE, which cannot load an ES module
+   * worker — the map comes up grey with a "Worker failed to load" error and no
+   * console clue about why. Building workers as ES modules fixes it.
+   */
+  worker: {
+    format: 'es',
+  },
+  /*
+   * onnxruntime's wasm build is imported at runtime, after a press, so Vite only
+   * discovers it then — and a dependency it has not pre-bundled is a module the
+   * page cannot fetch. Naming it here bundles it up front.
+   */
+  optimizeDeps: {
+    exclude: ['onnxruntime-web/wasm'],
+  },
   test: {
     globals: true,
     environment: 'jsdom',
@@ -56,7 +73,19 @@ export default defineConfig({
       VITE_OTP_ENDPOINT: '',
       VITE_WEATHER_INGEST_ENDPOINT: '',
       VITE_DEALER_ENDPOINT: '',
+      // Both spellings are neutralised for tests. The new name is what the app
+      // asks for first; the old one is still read as a fallback, so a
+      // deployment configured before the rename keeps working.
+      VITE_ANALYTICS_KEY: '',
       VITE_POSTHOG_KEY: '',
+      /*
+       * Pinned empty for the same reason as every other value here, and more so:
+       * this one holds demo credentials. Left unset, a developer's own `.env.local`
+       * would silently decide whether the suite exercised the demo sign-in path —
+       * and the suites that assert the ordinary providers would be running against
+       * a different app than the one on disk.
+       */
+      VITE_DEMO_FARMERS: '',
     },
   },
 });

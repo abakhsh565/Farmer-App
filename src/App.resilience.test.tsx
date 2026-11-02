@@ -6,6 +6,7 @@ import { createServices } from '@/services/registry';
 import { resetPersistence } from '@/services/persistence';
 import { FlakyRepository, UnreachableRepository } from '@/services/testing';
 import { SESSION_STORAGE_KEY } from '@/session/SessionProvider';
+import { markOnboardingComplete } from '@/onboarding/OnboardingFlow';
 
 /**
  * The app against a backend that refuses writes, and one that cannot be reached
@@ -25,7 +26,43 @@ import { SESSION_STORAGE_KEY } from '@/session/SessionProvider';
 
 const POST = 'Sawan ka pani ruk gya hai — kya main abhi sinchai karun?';
 
+/**
+ * The party id a real sign-in produces.
+ *
+ * The account id *is* the party id, because that is the row key the server stores
+ * a document under. A fixture that signs in with the contact string instead is
+ * not modelling a signed-in farmer at all — that state has its own test below,
+ * and its own behaviour.
+ */
+const PARTY_ID = 'b0da419c-7763-44e1-886a-5e711ce9c113';
+
 const signedIn = () =>
+  localStorage.setItem(
+    SESSION_STORAGE_KEY,
+    JSON.stringify({
+      account: {
+        id: PARTY_ID,
+        name: 'Bilal Ahmed',
+        phone: '0300 3333333',
+        email: null,
+        method: 'phone',
+        verifiedAt: Date.now(),
+        partyId: PARTY_ID,
+      },
+      contextMigrated: true,
+    }),
+  );
+
+/**
+ * A session that signed in before the database handed back a party id.
+ *
+ * The account and the token are real; the *row key* is not. `client_document_put`
+ * takes a uuid, so a write addressed to `phone:03003333333` is refused by
+ * PostgreSQL itself (`22P02 invalid input syntax for type uuid`) — a permanent
+ * failure, not a bad connection. The app must therefore not attempt it, and must
+ * not tell the farmer their work is on its way to an account it cannot reach yet.
+ */
+const signedInWithoutPartyId = () =>
   localStorage.setItem(
     SESSION_STORAGE_KEY,
     JSON.stringify({
@@ -36,6 +73,7 @@ const signedIn = () =>
         email: null,
         method: 'phone',
         verifiedAt: Date.now(),
+        partyId: null,
       },
       contextMigrated: true,
     }),
@@ -43,6 +81,7 @@ const signedIn = () =>
 
 beforeEach(() => {
   localStorage.clear();
+  markOnboardingComplete();
   signedIn();
   document.documentElement.lang = 'en';
   document.documentElement.dir = 'ltr';
@@ -107,6 +146,33 @@ describe('a backend that refuses the write', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Back' }));
     await openCommunity();
     expect(screen.getByText(POST)).toBeInTheDocument();
+  });
+});
+
+describe('a session with no party id yet', () => {
+  it('keeps the work on the phone and never queues a write that cannot succeed', async () => {
+    const base = createServices();
+    /* Zero failures: if the app attempts the write at all, the attempt is counted
+       and this test fails. The assertion is about restraint, not about retrying. */
+    const repository = new FlakyRepository(base.repository, 0);
+    signedInWithoutPartyId();
+    render(<App services={{ ...base, repository }} />);
+
+    await openCommunity();
+    await publish(POST);
+
+    // On the phone immediately, as always: the farmer keeps working.
+    expect(await screen.findByText(POST)).toBeInTheDocument();
+
+    // Not sent anywhere, because there is nowhere to send it: no party id, no row.
+    expect(repository.attempts).toBe(0);
+
+    /* And the app says which of the two true things is happening. "Everything is
+       saved" is not it — that would be a claim about the account, and the account
+       cannot be written to yet. */
+    await openDataSection();
+    expect(screen.getByText('Saved on this phone')).toBeInTheDocument();
+    expect(screen.queryByText('Everything is saved')).not.toBeInTheDocument();
   });
 });
 

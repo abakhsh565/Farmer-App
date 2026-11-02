@@ -66,7 +66,67 @@ export type InsightData = {
   notifications: InsightNotification[];
 };
 
-const DAY = 24 * 60 * 60 * 1000;
+/** A crop the farmer has actually added, and the moment advice was raised. */
+export type AddCropInput = {
+  nameKey: MessageKey;
+  stageKey: MessageKey;
+  /** Only the farmer can confirm a stage; timing may only suggest one. */
+  stageConfirmed?: boolean;
+  plantedAt?: number;
+};
+
+/**
+ * Adding a crop, the one way a crop list ever grows.
+ *
+ * The farmer's own choice, so the id is derived from the crop and the planting
+ * moment rather than a counter — the same crop added twice on two phones is one
+ * crop, and an advice set keyed by id stays attached to it.
+ */
+export function addCrop(data: InsightData, input: AddCropInput, now: number): InsightData {
+  const id = `crop-${input.nameKey.replace(/[^a-z0-9]+/gi, '-')}-${input.plantedAt ?? now}`;
+  if (data.crops.some((crop) => crop.id === id)) return data;
+  /* The first crop a farmer adds is their main crop without being asked. */
+  const crop: CropInstance = {
+    id,
+    nameKey: input.nameKey,
+    stageKey: input.stageKey,
+    stageConfirmed: input.stageConfirmed === true,
+    plantedAt: input.plantedAt ?? now,
+    primary: data.crops.length === 0,
+  };
+  return { ...data, crops: [...data.crops, crop] };
+}
+
+/**
+ * "This is my crop" as one write, whether or not it is already on the list.
+ *
+ * `addCrop` derives the id from the planting moment, so a crop the farmer told
+ * us about during onboarding has a different id from one they pick again today —
+ * which would leave two Cottons in the strip. So the name is matched first, and
+ * a crop already on the list is simply promoted. Doing this from a screen as
+ * add-then-make-primary is not possible: the id `addCrop` invents is not known
+ * until the document has been written.
+ */
+export function chooseCrop(data: InsightData, input: AddCropInput, now: number): InsightData {
+  const existing = data.crops.find((crop) => crop.nameKey === input.nameKey);
+  if (existing) return makePrimary(data, existing.id);
+
+  const withCrop = addCrop(data, input, now);
+  const added = withCrop.crops.find((crop) => crop.nameKey === input.nameKey);
+  return added ? makePrimary(withCrop, added.id) : withCrop;
+}
+
+export function removeCrop(data: InsightData, cropId: string): InsightData {
+  const remaining = data.crops.filter((crop) => crop.id !== cropId);
+  if (remaining.length === data.crops.length) return data;
+  /* Removing the main crop hands the role to whatever is left, so the app is
+     never left pointing at a crop that is gone. */
+  const stillHasPrimary = remaining.some((crop) => crop.primary);
+  return {
+    ...data,
+    crops: stillHasPrimary ? remaining : remaining.map((crop, index) => ({ ...crop, primary: index === 0 })),
+  };
+}
 
 export function stageIsEstimate(crop: CropInstance): boolean {
   return !crop.stageConfirmed;
@@ -195,80 +255,21 @@ export function hydrate(raw: string | null): InsightData | null {
   }
 }
 
-/** The demo position: two crops running in parallel, each with its own advice. */
-export function createSeed(now: number): InsightData {
-  const cotton: CropInstance = {
-    id: 'crop-cotton',
-    nameKey: 'crop.cotton',
-    stageKey: 'crop.stage.bollFormation',
-    /* Nobody has told the app the stage — the planting date suggests it. */
-    stageConfirmed: false,
-    plantedAt: now - 118 * DAY,
-    primary: true,
-  };
-  const wheat: CropInstance = {
-    id: 'crop-wheat',
-    nameKey: 'crop.wheat',
-    stageKey: 'crop.stage.sowing',
-    stageConfirmed: true,
-    plantedAt: now - 6 * DAY,
-    primary: false,
-  };
-
-  const insights: Insight[] = [
-    {
-      id: 'insight-cotton-pest',
-      cropId: cotton.id,
-      kind: 'pest',
-      priority: 'high',
-      titleKey: 'insight.pest.title',
-      bodyKey: 'insight.pest.body',
-      actionKey: 'insight.pest.action',
-      sourceKey: 'source.punjabAgri',
-      knowledgeVersion: 'kb-2026.41',
-      confidence: 82,
-      createdAt: now - 2 * 60 * 60 * 1000,
-      validUntil: now + 3 * DAY,
-      status: 'active',
-    },
-    {
-      id: 'insight-wheat-sowing',
-      cropId: wheat.id,
-      kind: 'activity',
-      priority: 'normal',
-      titleKey: 'insight.wheat.title',
-      bodyKey: 'insight.wheat.body',
-      actionKey: 'insight.wheat.action',
-      sourceKey: 'source.punjabAgri',
-      knowledgeVersion: 'kb-2026.41',
-      confidence: 90,
-      createdAt: now - 5 * 60 * 60 * 1000,
-      validUntil: now + 5 * DAY,
-      status: 'active',
-    },
-    {
-      id: 'insight-cotton-water',
-      cropId: cotton.id,
-      kind: 'weather',
-      priority: 'normal',
-      titleKey: 'insight.irrigation.title',
-      bodyKey: 'insight.irrigation.body',
-      actionKey: 'insight.irrigation.action',
-      sourceKey: 'source.weather',
-      knowledgeVersion: 'kb-2026.41',
-      confidence: 74,
-      createdAt: now - 9 * 60 * 60 * 1000,
-      validUntil: now + 2 * DAY,
-      status: 'active',
-    },
-  ];
-
-  return {
-    crops: [cotton, wheat],
-    insights,
-    notifications: [
-      { id: 'notif-1', insightId: 'insight-cotton-pest', at: now - 2 * 60 * 60 * 1000, read: false },
-      { id: 'notif-2', insightId: 'insight-wheat-sowing', at: now - 5 * 60 * 60 * 1000, read: false },
-    ],
-  };
+/**
+ * The first run: a farmer who has not told this app what they grow.
+ *
+ * It used to seed two crops and three pieces of advice about them, so every
+ * install opened on a pink bollworm alert for cotton the farmer had never
+ * planted. The advice was internally consistent and completely invented, which
+ * is the worst combination available: it looked like the product working, so
+ * nobody would think to check whether it belonged to them. On a phone that
+ * changes hands it was simply the previous farmer's field, read as yours.
+ *
+ * So the seed is empty, and the recommendation surfaces say nothing rather than
+ * something untrue: `InsightCard` renders no card without a primary crop, and
+ * the crop strip needs two crops before it draws. What appears on Home is what
+ * the farmer actually has.
+ */
+export function createSeed(_now: number): InsightData {
+  return { crops: [], insights: [], notifications: [] };
 }

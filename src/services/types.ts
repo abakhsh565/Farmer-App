@@ -273,7 +273,29 @@ export interface OtpProvider {
   readonly status: ProviderStatus;
   request(channel: OtpChannel, destination: string): Promise<OtpRequest>;
   verify(channel: OtpChannel, destination: string, code: string): Promise<OtpVerifyResult>;
+  /**
+   * Who the verified session belongs to.
+   *
+   * Optional because only a provider that establishes a real, server-recognised
+   * session can answer it. The development provider has no identity to report, and
+   * saying so by omitting the method is truer than returning a fabricated one.
+   */
+  identity?: () => Promise<Identity | null>;
 }
+
+/**
+ * The actor behind a verified session.
+ *
+ * `partyId` is the domain actor the database resolves for this session
+ * (`current_party_id()`), which is the id every row-level policy matches on. It is
+ * null while a session exists but no party does — a state the app must be able to
+ * represent rather than paper over, because it means the account owns nothing yet.
+ */
+export type Identity = {
+  partyId: string | null;
+  authUserId: string | null;
+  displayName: string | null;
+};
 
 /* -------------------------------------------------------------------------- */
 /* Dealers                                                                    */
@@ -286,6 +308,39 @@ export type DealerSearchQuery = {
   /** Free text over name and tags. */
   query?: string;
   tags?: readonly string[];
+};
+
+/**
+ * Asking for a product rather than a shop.
+ *
+ * Kept apart from `DealerSearchQuery` because the answer has a different shape: a
+ * product is only ever found *in* a shop, so every hit carries the listing and the
+ * shop that holds it. "Which shops are near me" and "who has urea near me" are
+ * different questions, and a shop list cannot answer the second.
+ */
+export type ProductSearchQuery = {
+  /** Explicit origin for a temporary search area. Absent means the profile. */
+  origin?: GeoPoint;
+  radiusKm: number;
+  /** Free text over the product's name, brand and category. */
+  query?: string;
+};
+
+/**
+ * One product, at one shop.
+ *
+ * The row is a *listing* rather than a catalogue entry, on purpose: the same
+ * product at two shops is two rows, each with the price that shop is asking. A
+ * single price for a product would have to come from somewhere, and every
+ * somewhere is either a different shop or an average of shops that are not
+ * interchangeable.
+ */
+export type ProductHit = {
+  product: DealerProduct;
+  /** The shop that lists it — needed to ask them about it. */
+  dealerId: string;
+  dealerName: string;
+  distanceKm: number;
 };
 
 export type DealerSummary = {
@@ -383,6 +438,15 @@ export interface DealerProvider {
   products(dealerId: string): Promise<Sourced<DealerProduct[]>>;
   /** Where one canonical product can be bought right now, nearest first. */
   stockists(query: StockistQuery): Promise<Sourced<DealerStockist[]>>;
+  /**
+   * Products by name, across the shops in range, nearest shop first.
+   *
+   * The same question as `stockists` asked the other way round: that one starts
+   * from a canonical product the app already chose, this one starts from whatever
+   * the farmer typed. A search box cannot name a slug in advance, which is why
+   * this is a capability of its own rather than a flag on the other.
+   */
+  searchProducts(query: ProductSearchQuery): Promise<Sourced<ProductHit[]>>;
 }
 
 /* -------------------------------------------------------------------------- */

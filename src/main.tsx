@@ -15,12 +15,18 @@ import '@fontsource/noto-naskh-arabic/arabic-400.css';
 
 import '@/styles/theme.css';
 import { App } from '@/App';
+import { initAnalytics } from '@/services/analytics';
 
 const container = document.getElementById('root');
 
 if (!container) {
   throw new Error('#root container was not found in index.html');
 }
+
+// Started before the first render so a screen viewed during mount is recorded,
+// and called unconditionally because it no-ops when no key is configured: an
+// unconfigured build makes no network call at all.
+initAnalytics();
 
 createRoot(container).render(
   <StrictMode>

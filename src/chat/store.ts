@@ -17,7 +17,7 @@
  *    is one conversation in either language.
  */
 
-import { SEED_THREADS, THREAD_META, type ChatMessage, type Threads } from '@/data/chat';
+import { THREAD_META, type ChatMessage, type Threads } from '@/data/chat';
 
 export type ChatState = {
   threads: Threads;
@@ -25,16 +25,18 @@ export type ChatState = {
   unread: Record<string, number>;
 };
 
-/** A copy of the seed, so a thread the farmer replies to never mutates the fixture. */
+/**
+ * A farmer starts with no conversations.
+ *
+ * This used to start from demo threads, with unread badges, so the chat screen
+ * would not open empty — and that was wrong in the way that matters most on a
+ * shared phone: after the previous farmer signed out, the next person saw a
+ * dealer conversation they had never had and could not tell it was a fixture.
+ * A conversation is private correspondence; it exists when the farmer writes to
+ * a dealer, and not before. The empty state is the honest first launch.
+ */
 export function createState(): ChatState {
-  return {
-    threads: Object.fromEntries(
-      Object.entries(SEED_THREADS).map(([dealerId, messages]) => [dealerId, [...messages]]),
-    ),
-    unread: Object.fromEntries(
-      Object.entries(THREAD_META).map(([dealerId, meta]) => [dealerId, meta.unread ?? 0]),
-    ),
-  };
+  return { threads: {}, unread: {} };
 }
 
 export function messagesIn(state: ChatState, dealerId: string): ChatMessage[] {
@@ -49,13 +51,23 @@ export function lastMessage(messages: readonly ChatMessage[]): ChatMessage | und
  * The list's order: the conversations the app knows about, in the order the design
  * puts them, then anything else the farmer has started.
  *
+ * A conversation is a row only once it has messages. An empty array under a
+ * dealer's id is not a conversation — it is where somebody once looked — and
+ * listing it would tell the next person on this phone which shop the previous
+ * one browsed to, as well as showing a row that opens onto nothing.
+ *
  * Deliberately not sorted by recency. A row is a person the farmer talks to, and a
  * list that reorders itself while they are reaching for a row is how they end up
  * opening the wrong one.
  */
 export function threadKeys(state: ChatState): string[] {
-  const known = Object.keys(THREAD_META).filter((dealerId) => dealerId in state.threads);
-  const rest = Object.keys(state.threads).filter((dealerId) => !(dealerId in THREAD_META));
+  const spoken = (dealerId: string) => messagesIn(state, dealerId).length > 0;
+  const known = Object.keys(THREAD_META).filter(
+    (dealerId) => dealerId in state.threads && spoken(dealerId),
+  );
+  const rest = Object.keys(state.threads).filter(
+    (dealerId) => !(dealerId in THREAD_META) && spoken(dealerId),
+  );
   return [...known, ...rest];
 }
 
@@ -69,19 +81,18 @@ export function unreadTotal(state: ChatState): number {
 }
 
 /**
- * Open a conversation: it comes into existence if the farmer has never written to
- * this dealer, and whatever was waiting has now been read.
+ * Open a conversation: whatever was waiting has now been read.
  *
- * A thread with no history starts *empty*. It used to be seeded with another
- * dealer's messages, which put words in a shop's mouth the first time a farmer
- * wrote to them.
+ * Opening does not create the thread. A conversation comes into existence when a
+ * message is sent, which is the only thing that makes one; a shop the farmer
+ * merely looked at is not a conversation and must not become a row on this
+ * phone. The thread view still renders — against an empty list — so a farmer who
+ * opens a shop to write to them gets the composer, which is where they are
+ * going.
  */
 export function openThread(state: ChatState, dealerId: string): ChatState {
-  const threads = state.threads[dealerId]
-    ? state.threads
-    : { ...state.threads, [dealerId]: [] as ChatMessage[] };
   const read = unreadFor(state, dealerId) === 0 ? state.unread : { ...state.unread, [dealerId]: 0 };
-  return threads === state.threads && read === state.unread ? state : { ...state, threads, unread: read };
+  return read === state.unread ? state : { ...state, unread: read };
 }
 
 /** Mark a thread read without opening it — used when a message is sent to it. */

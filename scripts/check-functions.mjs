@@ -213,6 +213,7 @@ const SERVER_SECRETS = [
   'AMIS_FEED_TOKEN',
   'MARKET_FEED_URL',
   'MARKET_FEED_TOKEN',
+  'WEATHERAPI_KEY',
 ];
 
 for (const [file, text] of code) {

@@ -6,6 +6,7 @@ import { mirrorKey, ownerFor } from '@/services/persistence';
 import { createServices } from '@/services/registry';
 import { DelayedRepository } from '@/services/testing';
 import { SESSION_STORAGE_KEY } from '@/session/SessionProvider';
+import { markOnboardingComplete } from '@/onboarding/OnboardingFlow';
 
 /**
  * The community feed, driven the way a farmer drives it.
@@ -48,6 +49,7 @@ const signedIn = () =>
 
 beforeEach(() => {
   localStorage.clear();
+  markOnboardingComplete();
   signedIn();
   document.documentElement.lang = 'en';
   document.documentElement.dir = 'ltr';
@@ -98,7 +100,8 @@ describe('community feed', () => {
     // On the watering question she answered sixth, so the card says so instead.
     expect(screen.getByText('Expert answered')).toBeInTheDocument();
 
-    // The farmer's own post carries its likes.
+    // A neighbour's post carries its likes — no seeded post is labelled as the
+    // farmer's own.
     expect(screen.getByRole('button', { name: '24 likes' })).toBeInTheDocument();
 
     // Three neighbours, and the farmer's own ring to add to.
@@ -406,11 +409,35 @@ describe('community moderation', () => {
     render(<App />);
     await openCommunity();
 
-    await choose(cardFor(POST3), 'Delete');
+    /* The farmer's own post has to exist first: nothing in the seed pretends to
+       be theirs, so deleting starts from what they actually wrote. */
+    await userEvent.click(screen.getByRole('button', { name: 'Write a post' }));
+    await userEvent.type(
+      await screen.findByPlaceholderText('What do you want to ask nearby farmers?'),
+      'Meri apni post hataani hai',
+    );
+    await userEvent.click(screen.getByRole('button', { name: 'Post' }));
+    await screen.findByText('Meri apni post hataani hai');
+
+    /* And it has to have been answered: that is the case removal is careful
+       about — the replies are other people's words and the row stays so they can
+       still be read. */
+    await userEvent.click(
+      screen.getByRole('button', { name: /Meri apni post hataani hai/ }),
+    );
+    await userEvent.type(screen.getByPlaceholderText('Write a reply'), 'Ye jawab rehna chahiye');
+    await userEvent.click(screen.getByRole('button', { name: 'Reply' }));
+    await screen.findByText('Ye jawab rehna chahiye');
+    await userEvent.click(screen.getByRole('button', { name: 'Back' }));
+
+    await choose(cardFor('Meri apni post hataani hai'), 'Delete');
     expect(screen.getByText(/Replies from other farmers stay visible/)).toBeInTheDocument();
     await userEvent.click(screen.getByRole('button', { name: 'Delete' }));
 
     expect(await screen.findByText('This post was removed')).toBeInTheDocument();
+    // The answers survive the tombstone, and the row still opens them.
+    await userEvent.click(screen.getByText('This post was removed'));
+    expect(await screen.findByText('Ye jawab rehna chahiye')).toBeInTheDocument();
   });
 
   it('deletes the farmer’s own reply from a thread', async () => {

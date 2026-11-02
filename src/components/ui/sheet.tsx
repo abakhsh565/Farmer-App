@@ -63,7 +63,15 @@ function SheetContent({
       <SheetPrimitive.Content
         data-slot="sheet-content"
         className={cn(
-          "fixed z-50 flex flex-col gap-4 bg-background shadow-lg transition ease-in-out data-[state=closed]:animate-out data-[state=closed]:duration-300 data-[state=open]:animate-in data-[state=open]:duration-500",
+          /*
+           * The sheet sits on the same cream canvas as the page behind it, so an
+           * `bg-background` sheet reads as part of the page rather than as a
+           * surface lifted over it. `bg-card` (white) plus a deeper shadow is
+           * what separates the two at a glance. In dark the shadow carries
+           * almost nothing, so the sheet lifts by tone instead — `ink-800`
+           * against the `ink-950` canvas.
+           */
+          "fixed z-50 flex flex-col gap-4 bg-card shadow-2xl dark:bg-ink-800 transition ease-in-out data-[state=closed]:animate-out data-[state=closed]:duration-300 data-[state=open]:animate-in data-[state=open]:duration-500",
           side === "right" &&
             "inset-y-0 right-0 h-full w-3/4 border-l data-[state=closed]:slide-out-to-right data-[state=open]:slide-in-from-right sm:max-w-sm",
           side === "left" &&
@@ -77,8 +85,16 @@ function SheetContent({
         {...props}
       >
         {children}
+        {/*
+         * The cross is placed with `end-4`, not `right-4`: against the end of the
+         * sheet's inline axis, so it is the top-right in English and the top-left
+         * in Urdu — where the titles it sits beside are right-aligned. Pinned to
+         * `right-4` it landed *on* the Urdu heading, which is the bug this
+         * replaces: every bottom sheet put its cross through the first word of
+         * its own title.
+         */}
         {showCloseButton && (
-          <SheetPrimitive.Close className="absolute top-4 right-4 rounded-xs opacity-70 ring-offset-background transition-opacity hover:opacity-100 focus:ring-2 focus:ring-ring focus:ring-offset-2 focus:outline-hidden disabled:pointer-events-none data-[state=open]:bg-secondary">
+          <SheetPrimitive.Close className="absolute top-4 end-4 rounded-xs opacity-70 ring-offset-background transition-opacity hover:opacity-100 focus:ring-2 focus:ring-ring focus:ring-offset-2 focus:outline-hidden disabled:pointer-events-none data-[state=open]:bg-secondary">
             <XIcon className="size-4" />
             <span className="sr-only">{t("common.close")}</span>
           </SheetPrimitive.Close>

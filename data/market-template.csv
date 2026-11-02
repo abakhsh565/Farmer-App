@@ -1,0 +1,5 @@
+commodity_code,market_name,observed_on,min_price,max_price,modal_price,district,unit,arrivals_tonnes,source_ref,source_url
+"Example — replace with a real published rate","Layyah","2026-10-14",8600,8900,8750,"Layyah","40kg",320,"replace with the document's own number","https://amis.pk/"
+wheat,Layyah,2026-10-14,3900,4050,3975,Layyah,40kg,110,,
+cotton,Dera Ghazi Khan,2026-10-14,8700,9100,8900,Dera Ghazi Khan,40kg,,,
+"A row may report only a modal price; leave the others empty rather than writing 0",Rajanpur,2026-10-14,,,2450,Rajanpur,40kg,,,

@@ -1,21 +1,63 @@
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it } from 'vitest';
 import { App } from '@/App';
-import { ChatProvider } from '@/chat/ChatProvider';
-import { LocaleProvider } from '@/i18n/LocaleProvider';
-import { createServices, ServicesProvider } from '@/services/registry';
-import { SessionProvider } from '@/session/SessionProvider';
-import { ChatScreen } from '@/screens/ChatScreen';
-import type { Collection, Repository } from '@/services/types';
+import { SESSION_STORAGE_KEY } from '@/session/SessionProvider';
+import { markOnboardingComplete } from '@/onboarding/OnboardingFlow';
 
 /** Long enough for a service read to land on a loaded machine. */
 const READY = { timeout: 4000 };
+
+/**
+ * A phone that already has conversations — the state the chat list is drawn
+ * from. The product starts a farmer with none, so tests that are about
+ * *reading* a conversation provide one rather than relying on a fixture the app
+ * itself would never create.
+ */
+const CHAT_HISTORY = {
+  version: 1,
+  threads: {
+    'dealer.aliTraders': [
+      { id: 1, from: 'me', key: 'chat.msg1' },
+      { id: 2, from: 'dealer', key: 'chat.msg2' },
+      { id: 3, from: 'dealer', key: 'chat.preview.ali' },
+    ],
+    'dealer.greenAgro': [{ id: 1, from: 'dealer', key: 'chat.preview.greenAgro' }],
+    'dealer.wazirabadAgri': [{ id: 1, from: 'dealer', key: 'chat.preview.wazirabad' }],
+    'dealer.malikFertilizers': [{ id: 1, from: 'dealer', key: 'chat.preview.malik' }],
+  },
+  unread: { 'dealer.aliTraders': 2 },
+};
+
+const withChatHistory = (owner = ''): void => {
+  localStorage.setItem(`agri-shop.chat${owner ? `.${owner}` : ''}`, JSON.stringify(CHAT_HISTORY));
+};
+
+/** A returning farmer's phone: the session document that says who is signed in. */
+const ACCOUNT_ID = 'phone:03003333333';
+const withSignedInFarmer = (): void => {
+  localStorage.setItem(
+    SESSION_STORAGE_KEY,
+    JSON.stringify({
+      account: {
+        id: ACCOUNT_ID,
+        name: 'Bilal Ahmed',
+        phone: '0300 3333333',
+        email: null,
+        method: 'phone',
+        verifiedAt: Date.now(),
+        partyId: null,
+      },
+      contextMigrated: true,
+    }),
+  );
+};
 
 beforeEach(() => {
   // Locale and theme are persisted, so a test that switches either must not leak
   // into the next one.
   localStorage.clear();
+  markOnboardingComplete();
   document.documentElement.lang = 'en';
   document.documentElement.dir = 'ltr';
   document.documentElement.classList.remove('dark');
@@ -25,8 +67,15 @@ describe('App', () => {
   it('opens on Home and switches to Dealers', async () => {
     render(<App />);
 
-    expect(screen.getByText('Assalam o Alaikum, Bilal')).toBeInTheDocument();
-    expect(screen.getByText('Mandi rates · Wazirabad')).toBeInTheDocument();
+    // With no account yet the greeting names the guest, not a fixture farmer.
+    expect(screen.getByText('Assalam o Alaikum, Guest')).toBeInTheDocument();
+    // Home no longer carries a mandi rates strip: every tile it could draw came
+    // from the labelled non-authoritative `research_feed`, so the section showed
+    // prices the app was at the same time telling the farmer not to trust. The
+    // rate service still exists and is tested on its own; the surface is gone
+    // (docs/UX-DECISIONS.md, "Mandi rates — the strip is gone").
+    expect(screen.queryByText('Mandi rates')).toBeNull();
+    expect(screen.queryByText('Rs. per 40 kg')).toBeNull();
 
     await userEvent.click(screen.getByRole('button', { name: 'Dealers' }));
 
@@ -60,11 +109,18 @@ describe('App', () => {
     );
 
     // The avatar is the profile entry — named for what it opens, showing the
-    // farmer's initials — and the bell is the only other control. Language and
-    // appearance moved to the profile screen, so the header is about the day
+    // farmer's initials. The place line is a control too: it opens the
+    // change-area sheet, so it is named for the screen it opens and the place it
+    // currently holds. Language and appearance moved to the profile screen, so
+    // the bell is the last thing in the header and the header is about the day
     // rather than about settings.
-    expect(controls).toEqual(['Profile and settings', 'Notifications']);
-    expect(header).toHaveTextContent('BA');
+    expect(controls).toEqual([
+      'Profile and settings',
+      'Your location: Not set',
+      'Notifications',
+    ]);
+    // The avatar carries the guest's initials until there is a farmer to name.
+    expect(header).toHaveTextContent('Gf');
   });
 
   /**
@@ -81,7 +137,11 @@ describe('App', () => {
     );
 
     expect(screen.getByPlaceholderText('Type a message')).toBeInTheDocument();
-    expect(screen.getByText('Assalam o Alaikum. Do you have Roundup in stock?')).toBeInTheDocument();
+    // A shop the farmer has never written to gets an empty conversation, not
+    // somebody else's words.
+    expect(
+      screen.getByText('No messages yet — say salam and ask what you need.'),
+    ).toBeInTheDocument();
   });
 
   it('sends the home dealer section to the Dealers screen', async () => {
@@ -92,17 +152,21 @@ describe('App', () => {
     expect(screen.getByRole('heading', { name: 'Dealers' })).toBeInTheDocument();
   });
 
-  it('gives the weather card its spray advice in both languages at once', async () => {
+  it('gives the weather card its spray advice in the app’s own language', async () => {
     render(<App />);
 
     /* The advice appears only once a usable reading has arrived: advice without a
        reading behind it is the state this screen exists to avoid. */
     expect(await screen.findByText('Best time to spray: 6 to 9 AM', {}, READY)).toBeInTheDocument();
-    // The same advice in the other script, so a farmer who reads one gets it
-    // without switching the app.
-    expect(screen.getByText('چھڑکاؤ کا بہترین وقت: صبح 6 سے 9 بجے')).toBeInTheDocument();
-    // …and the figure carries the provider it came from and how old it is.
-    expect(screen.getByText(/Source: Development weather/)).toBeInTheDocument();
+    /* And in one language only. The card used to print the same sentence in the
+       other script underneath; the absence is asserted rather than assumed, so
+       the change cannot silently come back. */
+    expect(screen.queryByText('چھڑکاؤ کا بہترین وقت: صبح 6 سے 9 بجے')).not.toBeInTheDocument();
+    // …and the figure carries how old it is, with a way to ask for a newer
+    // reading. The provider credit that used to be printed here was removed by
+    // request; the age and the refresh control are what replaced it.
+    expect(screen.getByText(/^updated /)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Refresh' })).toBeInTheDocument();
   });
 
   it('shows the dealers the service returns, with their distance and what they carry', async () => {
@@ -136,10 +200,20 @@ describe('profile', () => {
 
     await openProfile();
 
-    expect(screen.getByText('Bilal Ahmed')).toBeInTheDocument();
-    expect(screen.getByText('0300 3333333')).toBeInTheDocument();
-    // The farm at a glance, and the menu the design specifies.
-    expect(screen.getByText('8 acres')).toBeInTheDocument();
+    // No account: the profile says so instead of showing a name and a number
+    // that belong to nobody — or, after logging out, to the previous farmer.
+    expect(screen.getByText('Guest farmer')).toBeInTheDocument();
+    expect(screen.getByText('Not signed in')).toBeInTheDocument();
+    /*
+     * The farm at a glance, read from the farmer's own stores. On a clean install
+     * the farmer has told this app nothing, so the strip says so: no crops, none
+     * counted, and no village saved. It used to assert "8 acres" — a fixture
+     * rendered as this farmer's land, on a phone where nothing had ever asked
+     * them for an acreage and nothing could correct it.
+     */
+    expect(screen.getByText('No crops yet')).toBeInTheDocument();
+    expect(screen.getByText('0 crops')).toBeInTheDocument();
+    expect(screen.queryByText('8 acres')).not.toBeInTheDocument();
     expect(screen.getByText('My Dealers')).toBeInTheDocument();
     expect(screen.getByText('Farm Details')).toBeInTheDocument();
     expect(screen.getByText('Help & Support')).toBeInTheDocument();
@@ -203,6 +277,7 @@ describe('profile', () => {
 
 describe('chat', () => {
   it('lists the conversations with their dealer and last message', async () => {
+    withChatHistory();
     render(<App />);
 
     await userEvent.click(screen.getByRole('button', { name: 'Chat' }));
@@ -216,6 +291,7 @@ describe('chat', () => {
   });
 
   it('clears the unread badge once the conversation is read', async () => {
+    withChatHistory();
     render(<App />);
 
     await userEvent.click(screen.getByRole('button', { name: 'Chat' }));
@@ -229,6 +305,7 @@ describe('chat', () => {
   });
 
   it('opens a dealer thread from the Dealers screen', async () => {
+    withChatHistory();
     render(<App />);
 
     await userEvent.click(screen.getByRole('button', { name: 'Dealers' }));
@@ -239,6 +316,8 @@ describe('chat', () => {
   });
 
   it('sends a message into the open thread', async () => {
+    withSignedInFarmer();
+    withChatHistory(ACCOUNT_ID);
     render(<App />);
 
     await userEvent.click(screen.getByRole('button', { name: 'Chat' }));
@@ -251,6 +330,7 @@ describe('chat', () => {
   });
 
   it('keeps the conversation history when the language changes', async () => {
+    withChatHistory();
     render(<App />);
 
     const header = screen.getByRole('banner');
@@ -330,45 +410,19 @@ describe('scan', () => {
   });
 });
 
-/**
- * A phone that has used the app long enough to have written a chat document, and
- * has since removed every conversation.
- *
- * The empty state cannot be reached with the seed still in place — which is the
- * point: conversations exist from the first launch, and "no conversations yet" is
- * a state the farmer gets to by emptying the list, not by installing the app.
- */
-class EmptyChatRepository implements Repository {
-  readonly name = 'Empty chat document';
-  readonly isRemote = true;
-
-  /* The repository hands back the document itself; the document layer decides how
-     to read its own bytes. */
-  async read<T>(collection: Collection): Promise<T | null> {
-    if (collection !== 'chat') return null;
-    return { version: 1, threads: {}, unread: {} } as T;
-  }
-
-  async write(): Promise<void> {}
-  async remove(): Promise<void> {}
-}
-
 describe('ChatScreen', () => {
+  /**
+   * The empty state is the first launch now, not a state a farmer reaches by
+   * emptying the list: a conversation is private correspondence, and nobody
+   * starts with one.
+   */
   it('shows the empty state when there are no conversations', async () => {
-    const base = createServices();
-    render(
-      <LocaleProvider>
-        <ServicesProvider services={{ ...base, repository: new EmptyChatRepository() }}>
-          <SessionProvider>
-            <ChatProvider>
-              <ChatScreen onBrowseDealers={vi.fn()} />
-            </ChatProvider>
-          </SessionProvider>
-        </ServicesProvider>
-      </LocaleProvider>,
-    );
+    render(<App />);
+
+    await userEvent.click(screen.getByRole('button', { name: 'Chat' }));
 
     expect(await screen.findByText('No conversations yet')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Dealers' })).toBeInTheDocument();
+    // The nav tab and the empty state's own action both offer the Dealers screen.
+    expect(screen.getAllByRole('button', { name: 'Dealers' })).toHaveLength(2);
   });
 });

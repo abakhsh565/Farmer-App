@@ -30,7 +30,7 @@
  */
 
 import { createContext, createElement, useContext, useEffect, useMemo, type ReactNode } from 'react';
-import { configurationReport, serviceConfig, type ServiceConfig } from './config';
+import { configurationReport, resolveProviders, serviceConfig, type ServiceConfig } from './config';
 import {
   DevelopmentAiProvider,
   DevelopmentAnalyticsProvider,
@@ -41,6 +41,9 @@ import {
   LocalRepository,
 } from './providers/develop';
 import { OpenMeteoWeatherProvider } from './providers/openMeteo';
+import { SupabaseOtpProvider } from './providers/supabaseAuth';
+import { DemoOtpProvider } from './providers/demoAuth';
+import { demoAuth, type DemoAuthConfig } from './demoAuth';
 import {
   RemoteAiProvider,
   RemoteAnalyticsProvider,
@@ -74,8 +77,22 @@ export type Services = {
   anyRemote: boolean;
 };
 
-export function createServices(config: ServiceConfig = serviceConfig): Services {
+export function createServices(
+  config: ServiceConfig = serviceConfig,
+  /**
+   * The development demo identities, or null for the ordinary providers.
+   *
+   * Defaulted rather than required because it is null in every production build:
+   * `demoAuth()` is gated on `import.meta.env.DEV`, so a shipped bundle resolves
+   * it to null without any caller having to remember. Injectable so a test can
+   * drive the demo path without a developer's environment. */
+  demo: DemoAuthConfig | null = demoAuth(),
+): Services {
   const backendLive = config.supabase.configured;
+  /* Verification and shops are resolved in one place, shared with the diagnostics
+     panel — see `resolveProviders`, which exists precisely so the two cannot
+     disagree about which provider is running. */
+  const resolved = resolveProviders(config, demo !== null);
 
   const repository: Repository = backendLive ? new SupabaseRepository() : new LocalRepository();
   /*
@@ -93,15 +110,21 @@ export function createServices(config: ServiceConfig = serviceConfig): Services 
   const market: MarketProvider = backendLive
     ? new SupabaseMarketProvider()
     : new DevelopmentMarketProvider();
-  const dealer: DealerProvider = backendLive
-    ? new SupabaseDealerProvider()
-    : new DevelopmentDealerProvider();
+  const dealer: DealerProvider =
+    resolved.dealer === 'supabase'
+      ? new SupabaseDealerProvider()
+      : new DevelopmentDealerProvider();
   const ai: AiProvider = config.aiEndpoint.configured
     ? new RemoteAiProvider()
     : new DevelopmentAiProvider();
-  const otp: OtpProvider = config.otpEndpoint.configured
-    ? new RemoteOtpProvider()
-    : new DevelopmentOtpProvider();
+  const otp: OtpProvider =
+    resolved.otp === 'demo'
+      ? new DemoOtpProvider(demo as DemoAuthConfig)
+      : resolved.otp === 'supabase'
+        ? new SupabaseOtpProvider()
+        : resolved.otp === 'gateway'
+          ? new RemoteOtpProvider()
+          : new DevelopmentOtpProvider();
   const analytics: AnalyticsProvider = config.analytics.configured
     ? new RemoteAnalyticsProvider()
     : new DevelopmentAnalyticsProvider();
@@ -181,7 +204,9 @@ export function useServicesOrDefault(): Services {
  * cannot claim a provider is connected when it is not.
  */
 export function serviceSummary(services: Services): string {
-  return configurationReport()
+  /* Asked of the providers it was actually given, so the summary describes the
+     running app rather than a second guess at which one defaulted in. */
+  return configurationReport(services.config, services.otp instanceof DemoOtpProvider)
     .map(({ service, mode }) => `${service}: ${mode}`)
     .join(' · ')
     .concat(services.anyRemote ? '' : ' (no backend configured)');

@@ -13,6 +13,7 @@ import {
   hasExpired,
   initialOtpState,
   otpErrorKey,
+  otpFailureOf,
   requestFailed,
   requestStarted,
   resetOtpState,
@@ -107,8 +108,9 @@ export function IdentitySheet() {
             Date.now(),
           ),
         );
-      } catch {
-        setOtp((current) => requestFailed(current, 'network'));
+      } catch (failure) {
+        const { error, detail } = otpFailureOf(failure);
+        setOtp((current) => requestFailed(current, error, detail));
       }
     },
     [provider],
@@ -141,14 +143,22 @@ export function IdentitySheet() {
       const result = await provider.verify(method, contact.trim(), entered);
       if (result.ok) {
         setOtp((current) => verifySucceeded(current));
+        /*
+         * The session now exists, so the actor behind it can be asked for. This is
+         * the exchange that makes the account a real one: the party id is what the
+         * database matches every row-level policy against, and it is asked for
+         * here rather than trusted from the contact the farmer typed.
+         */
+        const identity = (await provider.identity?.()) ?? null;
         /* The account is created only now, with a verified contact. */
-        const signedIn = signIn({ method, contact, name });
+        const signedIn = signIn({ method, contact, name, partyId: identity?.partyId ?? null });
         if (!signedIn.ok) setContactError(signedIn.error);
         return;
       }
       setOtp((current) => verifyFailed(current, result.reason));
-    } catch {
-      setOtp((current) => verifyFailed(current, 'network'));
+    } catch (failure) {
+      const { error, detail } = otpFailureOf(failure);
+      setOtp((current) => requestFailed(current, error, detail));
     }
   };
 
@@ -224,6 +234,18 @@ export function IdentitySheet() {
                 </p>
               ) : null}
 
+              {/*
+                The provider's own words, kept alongside the app's sentence rather
+                than replacing it. The classified line is what the farmer acts on;
+                the detail is what tells them (or us) that the failure was a
+                missing SMS provider rather than their connection.
+              */}
+              {otp.detail ? (
+                <p className="rounded-md bg-muted px-3 py-2.5 text-caption text-muted-foreground">
+                  {otp.detail}
+                </p>
+              ) : null}
+
               {errorKey ? (
                 <p
                   id="session-code-error"
@@ -256,7 +278,8 @@ export function IdentitySheet() {
                   onClick={backToContact}
                   className="flex items-center gap-1.5 rounded-full py-2 text-body-sm text-muted-foreground"
                 >
-                  <ArrowLeft className="size-4" aria-hidden />
+                  {/* Going back is a direction: left in English, right in Urdu. */}
+                  <ArrowLeft className="size-4 rtl:rotate-180" aria-hidden />
                   {t('otp.change')}
                 </button>
                 {/* The resend is the primary control once the code has expired or
@@ -339,6 +362,12 @@ export function IdentitySheet() {
                 </p>
               ) : null}
 
+              {otp.detail ? (
+                <p className="rounded-md bg-muted px-3 py-2.5 text-caption text-muted-foreground">
+                  {otp.detail}
+                </p>
+              ) : null}
+
               <Button className="h-12 rounded-full" onClick={submitContact} disabled={busy}>
                 {otp.phase === 'sending' ? t('otp.title') : t('session.continue')}
               </Button>
@@ -350,8 +379,14 @@ export function IdentitySheet() {
                 {t('session.notNow')}
               </button>
 
+              {/*
+                Which sentence is true is decided by the provider, not by the build
+                label. A provider that can establish a real session sends a real
+                code, and telling that farmer the account is phone-only would be a
+                lie about where their saved location is kept.
+              */}
               <p className="text-caption leading-relaxed text-muted-foreground">
-                {t('session.demoNote')}
+                {provider.identity ? t('session.liveNote') : t('session.demoNote')}
               </p>
             </>
           )}

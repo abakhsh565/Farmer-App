@@ -8,7 +8,7 @@ import {
   LocalRepository,
 } from './providers/develop';
 import { createServices } from './registry';
-import type { ServiceConfig } from './config';
+import { configurationReport, resolveProviders, type ServiceConfig } from './config';
 import { AI_CONFIDENCE_THRESHOLD, isRateQuotable, isWeatherUsable, rateRange } from './types';
 import {
   canResend,
@@ -486,14 +486,73 @@ describe('registry selection', () => {
     expect(services.anyRemote).toBe(true);
   });
 
-  it('does not switch AI or OTP on the presence of a database alone', () => {
+  it('switches verification with the backend, because a session is what RLS matches on', () => {
     const services = createServices({
       ...unconfigured,
       supabase: { url: 'https://example.supabase.co', anonKey: 'anon', configured: true },
     });
-    // Separate server endpoints can be deployed at different times, and claiming
-    // otherwise would mean pretending a feature works before it does.
+    /*
+     * Supabase Auth lives in the same project as the database, so a configured
+     * backend does imply a usable verifier — and it is the only one of the two
+     * that issues a session. Leaving this on the development provider used to
+     * look like caution; in practice it produced a signed-in farmer with an empty
+     * `auth.uid()` and therefore no readable rows, so "wait for the endpoint" was
+     * really "ship an app where an account owns nothing".
+     */
+    expect(services.otp.name).toBe('Supabase Auth');
+    expect(typeof services.otp.identity).toBe('function');
+
+    /*
+     * The assistant is still a separate deployment. Nothing about a database
+     * makes a gateway exist, so claiming one would be pretending a feature works
+     * before it does.
+     */
     expect(services.ai.name).toContain('Development');
-    expect(services.otp.name).toContain('Development');
+  });
+
+  /*
+   * The diagnostics panel and the registry make the same decision, so they are
+   * tested against the same function.
+   *
+   * They used to decide separately. The registry preferred a configured backend
+   * while the panel read the raw endpoint flags, and the two disagreed in the one
+   * state that matters most: a live backend with no Edge Functions named. A farmer
+   * signing in through Supabase Auth was shown "Otp — Development" beside the
+   * screen that had just verified them, which is a false statement about where the
+   * account lives — and on a build whose whole point is that its diagnostics are
+   * generated rather than written down.
+   */
+  it('resolves the same provider the registry uses, for the panel that reports it', () => {
+    const onlyBackend: ServiceConfig = {
+      ...unconfigured,
+      supabase: { url: 'https://example.supabase.co', anonKey: 'anon', configured: true },
+    };
+
+    expect(resolveProviders(onlyBackend)).toEqual({ otp: 'supabase', dealer: 'supabase' });
+
+    // The panel's own list, which is what the farmer reads.
+    const shown = new Map(configurationReport(onlyBackend).map((r) => [r.service, r.mode]));
+    expect(shown.get('otp')).toBe('remote');
+    expect(shown.get('dealer')).toBe('remote');
+    expect(shown.get('persistence')).toBe('remote');
+    // Nothing about a database makes the assistant's gateway exist.
+    expect(shown.get('ai')).toBe('development');
+
+    // The registry really does build those, so the report is not a hopeful guess.
+    const services = createServices(onlyBackend);
+    expect(services.otp.name).toBe('Supabase Auth');
+    expect(services.dealer.name).toContain('Supabase');
+
+    // Our own gateway, for a deployment that has the OTP function but no session
+    // issuer — the case the fallback exists for.
+    expect(
+      resolveProviders({
+        ...unconfigured,
+        otpEndpoint: { url: 'https://example.invalid/otp', configured: true },
+      }).otp,
+    ).toBe('gateway');
+
+    // And an unconfigured build is the only one that reports itself as unconfigured.
+    expect(resolveProviders(unconfigured)).toEqual({ otp: 'development', dealer: 'development' });
   });
 });

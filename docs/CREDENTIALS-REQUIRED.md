@@ -9,7 +9,7 @@ from the PRD and are already implemented.
 
 ## How to read this
 
-- **Blocks the backend** means the 19 migrations in `supabase/migrations/` cannot
+- **Blocks the backend** means the 30 migrations in `supabase/migrations/` cannot
   be applied, so the app runs on its local development providers and the device's
   own storage instead of the real services.
 - **Blocks one integration** means the surrounding architecture, schema, adapter
@@ -59,7 +59,7 @@ empty database looks like.
 **To find out in one step:** open the SQL editor of the project you ran it in and
 execute `select count(*) from pg_tables where schemaname = 'public';`.
 
-- **55** → it landed somewhere else; send that project's ref and I will point the
+- **64** → it landed somewhere else; send that project's ref and I will point the
   app at it instead.
 - **0 or an error** → it did not land. Run the file again in
   the project's SQL editor and send me the first error, if any.
@@ -83,13 +83,24 @@ db push --db-url postgresql://postgres.<ref>:<secret key>@aws-0-ap-northeast-1.p
 The secret key you sent is a *PostgREST* key. It is not a database credential and
 cannot execute DDL — which is why the schema is still unapplied.
 
-**2. Deploy the three functions.** They need a CLI login or a paste into the
-dashboard's function editor. `supabase functions deploy ai otp weather-ingest`.
+**2. Deploy the functions.** They need a CLI login or a paste into the
+dashboard's function editor.
+
+```
+supabase functions deploy ai otp weather-ingest market-ingest climate-ingest advisory-ingest forecast-ingest
+```
+
+Each one states in its own header what it will not do without a source — a
+missing feed or key is a failed run recorded in the database, never a silent
+empty table.
 
 **3. Set the function secrets.** `OPENAI_API_KEY` (rotated — see below) or
 `GEMINI_API_KEY`, `OTP_HASH_SECRET` (any long random string), and
 `OTP_DELIVERY_URL` + `OTP_DELIVERY_TOKEN` once an SMS provider exists. For live
-mandi rates, `AMIS_FEED_URL` (+ `AMIS_FEED_TOKEN`) or `MARKET_FEED_URL`.
+mandi rates, `AMIS_FEED_URL` (+ `AMIS_FEED_TOKEN`) or `MARKET_FEED_URL`. For the
+district forecast, `WEATHERAPI_KEY` — used by `forecast-ingest` to fill
+`climate_forecasts`; with it unset, that function records a failed run naming the
+missing secret rather than returning an empty forecast.
 
 The AI gateway supports **both** OpenAI and Gemini. `AI_PROVIDER` chooses one
 (`openai` or `gemini`); with it unset, whichever key is present wins, OpenAI
@@ -111,8 +122,8 @@ function secret — never in chat, never in `.env.local`.
 
 | Service | Why needed | Exact credential / access | Where it will be used | Required for |
 | --- | --- | --- | --- | --- |
-| **Supabase: apply the schema** (see §0) | The project is configured and verified, but has no tables — the 19 migrations have nowhere to land without a DDL-capable credential | One of: the database password, an `sbp_…` personal access token, or a paste of `supabase/apply-all.sql` into the SQL Editor | Nothing client-side — the remote providers already read the schema that this creates | **Blocks the backend.** Real auth, real persistence, real market and dealer data |
-| **WeatherAPI.com** | Live weather instead of a fixture; the PRD names it as the initial MVP candidate | API key (free tier is enough to start) | `weather_readings` ingestion adapter, run on a schedule; read by UI and AI through the same normalised service | Weather in UI and in AI advice |
+| **Supabase: apply the schema** (see §0) | The project is configured and verified, but has no tables — the 30 migrations have nowhere to land without a DDL-capable credential | One of: the database password, an `sbp_…` personal access token, or a paste of `supabase/apply-all.sql` into the SQL Editor | Nothing client-side — the remote providers already read the schema that this creates | **Blocks the backend.** Real auth, real persistence, real market and dealer data |
+| **WeatherAPI.com** | Live weather instead of a fixture, and the **district forecast** (NASA POWER has no forecast product — its temporal services are near-real-time only) | API key (free tier is enough to start); set as the `WEATHERAPI_KEY` secret on the `forecast-ingest` function | `weather_readings` ingestion adapter, run on a schedule; read by UI and AI through the same normalised service. `forecast-ingest` writes the 3-day horizon to `climate_forecasts`, keyed by issue date so a revised forecast never overwrites what was believed yesterday | Weather in UI and in AI advice; the forecast_risk rows in the intel feed. **Licence caveat:** the site advertises commercial use on the free plan while its general T&C says otherwise, so `intel_sources` keeps this at `needs_permission` until that is confirmed in writing |
 | **AMIS Punjab market data** | Real mandi rates. The PRD forbids inventing an AMIS key, so this needs the real thing | Feed endpoint and/or registered credentials, or your written approval of a named alternative source | `market_observations` ingestion adapter → the internal `market_rates()` API | Market rates |
 | **SMS / OTP provider** | The sign-in *machine* is built and the `otp` function is written: codes are generated from a CSPRNG, stored as HMACs (never plaintext), and limited to 5 sends an hour and 3 attempts a code. What is missing is the sender | Name, e.g. Twilio or a Pakistani aggregator: account SID, auth token, sender/mask ID, and a template approved for Urdu. Set as `OTP_DELIVERY_URL` + `OTP_DELIVERY_TOKEN` on the `otp` function, plus a generated `OTP_HASH_SECRET` | The `otp` Edge Function. **With no provider configured it reports `deliveredVia: "none (not delivered)"` and a `deliveryError`, rather than claiming a code was sent** | Real authentication, and the "verified identity" precondition for expert verification |
 | **Firebase Cloud Messaging** | Push delivery. The PRD's notification requirement is not satisfied by an in-app list | `google-services.json` for Android, plus a service account JSON for server-side sends | `notification_events` dispatch Edge Function; `google-services.json` into `android/app/` | Real notifications |
@@ -147,7 +158,7 @@ recommendation is QA first, then production once the sync has run clean for a we
 
 No redesign, no restart. In order:
 
-1. Apply the 19 migrations — either `supabase db push`, or paste the bundled
+1. Apply the 30 migrations — either `supabase db push`, or paste the bundled
    `supabase/apply-all.sql` into the dashboard's SQL editor. Confirm the security
    advisors report no table without RLS. No client change is needed for this
    step — the schema is what the remote providers already read.
@@ -157,10 +168,13 @@ No redesign, no restart. In order:
    same normalised data, and having one remote and another local would let the app
    contradict itself about the same fact. Nothing in a screen or a store changes —
    they are already on the repository boundary.
-3. Deploy the three functions that are written — `ai`, `otp`, `weather-ingest` —
-   and set the `OPENAI_API_KEY` and `OTP_HASH_SECRET` secrets on them. The other
-   server components the PRD names (market ingest, dealer sync, notification
-   dispatch, media processing) are not written yet.
+3. Deploy the functions that are written — `ai`, `otp`, `weather-ingest`,
+   `market-ingest`, `climate-ingest`, `advisory-ingest`, `forecast-ingest` — and
+   set the `OPENAI_API_KEY` / `OTP_HASH_SECRET` / `WEATHERAPI_KEY` secrets on
+   them. Each ingest function records its own failures, so a function deployed
+   without its source is visible in the database rather than silently empty. The
+   remaining server components the PRD names (dealer sync, notification dispatch,
+   media processing) are not written yet.
 4. Run the RLS test pass — one farmer attempting to read another farmer's credit
    request, one guest attempting to write, one dealer attempting to accept a visit
    they were not asked for. Each must fail.

@@ -3,6 +3,7 @@ import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { App } from '@/App';
 import { SESSION_STORAGE_KEY } from '@/session/SessionProvider';
+import { markOnboardingComplete } from '@/onboarding/OnboardingFlow';
 
 /**
  * Credit, driven through the screens.
@@ -15,18 +16,21 @@ import { SESSION_STORAGE_KEY } from '@/session/SessionProvider';
 
 beforeEach(() => {
   localStorage.clear();
+  markOnboardingComplete();
   document.documentElement.lang = 'en';
   document.documentElement.dir = 'ltr';
   document.documentElement.classList.remove('dark');
   vi.restoreAllMocks();
 });
 
+const ACCOUNT_ID = 'phone:03003333333';
+
 const signIn = () =>
   localStorage.setItem(
     SESSION_STORAGE_KEY,
     JSON.stringify({
       account: {
-        id: 'phone:03003333333',
+        id: ACCOUNT_ID,
         name: 'Bilal Ahmed',
         phone: '0300 3333333',
         email: null,
@@ -37,8 +41,57 @@ const signIn = () =>
     }),
   );
 
+/**
+ * A live counteroffer waiting on the farmer — the state the answer flow is
+ * about. The product no longer ships a fixture like this, so the test brings its
+ * own: v1 is what the farmer proposed, v2 is the shop owner's one counter, and
+ * nothing is agreed until the shop owner's final approval.
+ */
+const withCounteroffer = (owner = ''): void => {
+  const now = Date.now();
+  localStorage.setItem(
+    `agri-shop.credit${owner ? `.${owner}` : ''}`,
+    JSON.stringify({
+      requests: [
+        {
+          id: 'credit-order-dap-1',
+          orderId: 'order-dap-1',
+          dealerKey: 'dealer.aliTraders',
+          productKey: 'product.dap',
+          status: 'awaiting_farmer_decision',
+          terms: [
+            {
+              version: 1,
+              source: 'farmer',
+              amount: 12_000,
+              dueKey: 'credit.due.afterHarvest',
+              fee: 0,
+              feeNoteKey: null,
+            },
+            {
+              version: 2,
+              source: 'shop_owner',
+              amount: 12_400,
+              dueKey: 'credit.due.december',
+              fee: 300,
+              feeNoteKey: 'credit.fee.service',
+            },
+          ],
+          consents: [{ actor: 'farmer', termsVersion: 1, at: now - 86_400_000 }],
+          events: [],
+          counterofferUsed: true,
+          createdAt: now - 86_400_000,
+          expiresAt: now + 5 * 86_400_000,
+        },
+      ],
+      agreements: [],
+    }),
+  );
+};
+
 describe('answering a counteroffer', () => {
   it('shows what the shop owner changed, and needs an account to accept', async () => {
+    withCounteroffer();
     render(<App />);
 
     await userEvent.click(screen.getByRole('button', { name: 'One request needs your answer' }));
@@ -60,6 +113,7 @@ describe('answering a counteroffer', () => {
 
   it('moves to final approval after the farmer accepts, without committing', async () => {
     signIn();
+    withCounteroffer(ACCOUNT_ID);
     render(<App />);
 
     await userEvent.click(screen.getByRole('button', { name: 'One request needs your answer' }));
@@ -110,11 +164,13 @@ describe('sending a request', () => {
   });
 
   /**
-   * The seeded counteroffer is already live for the DAP order, which is the order
-   * the form opens on — so the duplicate rule is reachable without any setup.
+   * The live counteroffer is for the DAP order, which is the order the form opens
+   * on — so the duplicate rule is reachable the moment the farmer submits what
+   * the form already shows.
    */
   it('refuses a second live request for the same order', async () => {
     signIn();
+    withCounteroffer(ACCOUNT_ID);
     render(<App />);
 
     await openForm();

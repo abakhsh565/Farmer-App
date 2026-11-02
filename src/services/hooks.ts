@@ -36,6 +36,8 @@ import type {
   DealerSummary,
   GeoPoint,
   MarketRate,
+  ProductHit,
+  ProductSearchQuery,
   Sourced,
   WeatherDay,
   WeatherNow,
@@ -193,6 +195,29 @@ export function useDealerSearch(query: DealerSearchQuery): Resource<DealerSummar
         tags,
         origin,
       }),
+  );
+}
+
+/**
+ * Product search — the same question as dealer search, asked about stock.
+ *
+ * Keyed like its sibling, on radius, text and origin together: pointing the app at
+ * a different area is then a different request rather than a cached answer about
+ * the old one, which is the mistake the key exists to make impossible.
+ */
+export function useProductSearch(query: ProductSearchQuery): Resource<ProductHit[]> {
+  const { radiusKm, query: text, origin } = query;
+  const key = [
+    'product-search',
+    Math.round(radiusKm * 10),
+    text?.trim().toLowerCase() ?? '',
+    origin ? `${origin.lat.toFixed(3)},${origin.lon.toFixed(3)}` : 'profile',
+  ].join(':');
+
+  return useResource<ProductHit[]>(
+    key,
+    EMPTY as unknown as ProductHit[],
+    (services) => services.dealer.searchProducts({ radiusKm, query: text, origin }),
   );
 }
 

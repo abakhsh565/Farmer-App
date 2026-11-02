@@ -7,7 +7,7 @@ import {
   cancel,
   changedFields,
   counter,
-  createSeed,
+  createState,
   currentTerms,
   expireIfDue,
   farmerDecide,
@@ -346,15 +346,12 @@ describe('money', () => {
   });
 });
 
-describe('the demo seed', () => {
-  it('shows something waiting, something live and something closed', () => {
-    const data = createSeed(NOW);
-    expect(awaitingFarmer(data)).toHaveLength(1);
-    expect(data.agreements).toHaveLength(1);
-    expect(data.requests.some((request) => request.status === 'rejected')).toBe(true);
-  });
-
-  it('has no money contradictions of its own', () => {
-    expect(reconcile(createSeed(NOW))).toEqual([]);
+describe('a new credit book', () => {
+  it('starts empty, so no fixture is ever shown as the farmer\'s own record', () => {
+    const data = createState();
+    expect(data.requests).toEqual([]);
+    expect(data.agreements).toEqual([]);
+    expect(awaitingFarmer(data)).toEqual([]);
+    expect(reconcile(data)).toEqual([]);
   });
 });

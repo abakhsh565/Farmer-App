@@ -104,8 +104,81 @@ export const en = {
   'farmer.phone': '0300 3333333',
 
   // ── home ─────────────────────────────────────────────────────────────────
-  'home.greeting': 'Assalam o Alaikum, {name}',
+  'home.greeting': 'Welcome back',
+  'home.watch.title': "What's happening around your crop",
+  'home.watch.empty': 'Nothing new near you yet — advice and reports from your area appear here.',
+  'home.watch.alert': 'Pest alert',
   'home.notifications': 'Notifications',
+
+  // ── disease trends, and crop suitability ─────────────────────────────────
+  /* One heading and one subheading each, both true of a *place and a week*: the
+     disease heading is what the forecast does to the likelihood of disease, never
+     a sighting, and its subheading carries the rain and temperature it was read
+     from. The crop heading names the crop that suits this field next, and its
+     subheading is the season and the crop it follows — not a margin. */
+  'home.disease.title': 'Disease trends',
+  'home.disease.answer.low': 'Disease is unlikely in the week ahead',
+  'home.disease.answer.watch': 'Disease is possible — keep checking the leaves',
+  'home.disease.answer.favourable': 'Disease is likely — the weather favours it',
+  'home.disease.answer.unknown': 'The disease risk cannot be read yet',
+  'home.disease.sub': 'Rain on {rain} of {days} days · {min}–{max}°C · {area}',
+  'home.disease.sub.rainOnly': 'Rain on {rain} of {days} days · {area}',
+  'home.disease.nofeed': 'No forecast for {area} yet',
+  'home.nextCrop.title': 'Crop suitability',
+  'home.nextCrop.season.rabi': 'Rabi',
+  'home.nextCrop.season.kharif': 'Kharif',
+  'home.nextCrop.answer': 'Sow {crop} next',
+  'home.nextCrop.context': '{season} sowing is open · after {crop}',
+  'home.nextCrop.context.opens': '{season} sowing opens {date} · after {crop}',
+  'home.nextCrop.none': 'Nothing else in season to follow {crop} yet',
+  'home.nextCrop.nocrop': 'Name your crop to see what suits this field next',
+  'home.nextCrop.basis': 'Season calendar — not a profit estimate',
+
+  'intel.source.official': 'Official advisory',
+  'intel.source.knowledge': 'Extension bulletin',
+  'intel.area.punjab': 'Punjab',
+  'intel.advisory.punjab.title': 'Punjab Agriculture crop advisory',
+  'intel.advisory.punjab.body':
+    'Current official guidance — sowing windows, pest vigilance and irrigation notes. Open the source portal for your district.',
+  'intel.watch.bollworm.title': 'Pink bollworm vigilance (cotton)',
+  'intel.watch.bollworm.body':
+    'During boll formation, inspect bolls twice a week. Confirm the pest on the plant before spraying.',
+
+  // ── field reports ────────────────────────────────────────────────────────
+  /* The farmer's own observation. The wording keeps "you" and "farmers nearby"
+     rather than "the community" or "users": the report is read by a neighbour,
+     and saying so is what makes it worth writing. */
+  'report.sheet.title': 'Report a field problem',
+  'report.privacy':
+    'Only your approximate area is shared with other farmers — never your exact field.',
+  'report.field.crop': 'Crop',
+  'report.field.topic': 'What is it?',
+  'report.field.title': 'One line',
+  'report.field.body': 'What did you see?',
+  'report.placeholder.title': 'e.g. Pink bollworm in the bolls',
+  'report.placeholder.body': 'How much of the field, and since when…',
+  'report.crop.other': 'Another crop',
+  'report.topic.pest': 'Pest',
+  'report.topic.disease': 'Disease',
+  'report.topic.weed': 'Weed',
+  'report.topic.water': 'Water',
+  'report.topic.weather_damage': 'Weather damage',
+  'report.topic.other': 'Something else',
+  'report.from': 'Reporting from {area}',
+  'report.needsArea': 'A report is shown by area, so choose your area first.',
+  'report.setArea': 'Choose your area',
+  'report.submit': 'Send report',
+  'report.sending': 'Sending…',
+  'report.sent': 'Report sent. Farmers near you can see it.',
+  'report.error.crop': 'Choose a crop from the list.',
+  'report.error.topic': 'Choose what kind of problem it is.',
+  'report.error.emptyTitle': 'Write one line saying what you saw.',
+  'report.error.longTitle': 'That line is too long — shorten it.',
+  'report.error.emptyBody': 'Write what you saw in the field.',
+  'report.error.longBody': 'That description is too long — shorten it.',
+  'report.error.area': 'Your area is not set, so the report has nowhere to be placed.',
+  'report.error.offline': 'No connection to the server. Your report was not sent.',
+  'report.error.generic': 'The report could not be sent. Try again.',
 
   // ── weather and spray advisory ───────────────────────────────────────────
   /* `sprayOther` is the same advisory in the other language, shown underneath as
@@ -113,6 +186,9 @@ export const en = {
      point of it: a farmer who reads one script gets the advice without switching. */
   'weather.today': 'Today · {date}',
   'weather.listen': 'Listen',
+  'weather.stopListening': 'Stop',
+  'weather.listenUnavailable': 'This device has no voice for your language.',
+  'weather.spokenTemp': '{value} degrees',
   'weather.condition': 'Partly cloudy',
   'weather.condition.clear': 'Clear sky',
   'weather.condition.mainlyClear': 'Mainly clear',
@@ -132,8 +208,7 @@ export const en = {
   'weather.alert': 'Pink bollworm risk is high in Wazirabad this week',
 
   // ── scan call to action ──────────────────────────────────────────────────
-  'scanCta.title': 'Check my crop',
-  'scanCta.body': 'Take a photo and get the problem and the right treatment',
+  'scanCta.title': 'Crop check',
   'scanCta.offline': 'Works without internet',
 
   // ── credit ───────────────────────────────────────────────────────────────
@@ -152,6 +227,14 @@ export const en = {
   'crop.wheat': 'Wheat',
   'crop.maize': 'Maize',
   'crop.rice': 'Rice',
+  /* Named because a field report may be about any of them: the report form
+     offers the catalogue, not just the crops the app has been told about. */
+  'crop.sugarcane': 'Sugarcane',
+  'crop.gram': 'Gram',
+  'crop.potato': 'Potato',
+  'crop.mustard': 'Mustard',
+  'crop.mungbean': 'Mung bean',
+  'crop.onion': 'Onion',
 
   // ── dealers ──────────────────────────────────────────────────────────────
   'dealers.title': 'Dealers',
@@ -433,6 +516,9 @@ export const en = {
   'profile.credit': 'My Credit',
   'profile.dealers': 'My Dealers',
   'profile.farmDetails': 'Farm Details',
+  'profile.crops': 'My Crops',
+  'profile.cropsHint': 'Your main crop decides what the advice on your home screen is about.',
+  'profile.locationHint': 'Used for weather, nearby shops and local advice.',
   'profile.language': 'Language',
   'profile.appearance': 'Appearance',
   'profile.notifications': 'Notifications',
@@ -486,6 +572,14 @@ export const en = {
   'session.why.credit': 'Credit requests and answers are recorded against your account.',
   'session.why.visit': 'A field visit request goes to a specific shop, so it needs your account.',
   'session.why.expert': 'A question to an expert carries your crop and photos, so it needs your account.',
+  'session.why.dealers': 'Your dealers are saved to your account, so they come with you to a new phone.',
+  'session.why.farmDetails': 'Your farm details are part of your account, so they stay yours.',
+  'session.why.advice':
+    'Crop advice is tied to your account, so it can follow you to your next phone.',
+  'session.why.creditBook':
+    'Your credit with each shop is kept on your account, so it is yours on any phone.',
+  'session.why.report':
+    'A field report carries your crop and your area, so it needs your account.',
   'session.phone': 'Mobile number',
   'session.email': 'Email',
   'session.name': 'Your name',
@@ -602,6 +696,18 @@ export const en = {
   'credit.home.none': 'No credit taken yet',
   'credit.home.open': '{dealer} · {due}',
   'credit.home.answer': 'One request needs your answer',
+  /* The card is a door, not a ledger: shops, amounts and history live behind it,
+     and before sign-in there is no account for any of it to belong to. */
+  'credit.home.shops': 'Across {count} shops',
+  'credit.entry': 'Your shops and history',
+  /* The two doors on Home for a farmer with no account yet. Labels say where they
+     lead; the notes say what is behind them. No verb, no "sign in". */
+  'quick.credit.note': 'What you owe, and to whom',
+
+  'credit.shops.title': 'Your shops',
+  'credit.shops.limit': 'Credit at up to {count} shops at a time',
+  'credit.shop.products': 'What you bought',
+  'credit.shop.history': 'History with this shop',
   'product.dap': 'DAP fertilizer · 2 bags',
   'product.urea': 'Urea fertilizer · 2 bags',
   'product.roundup': 'Roundup herbicide · 1 litre',
@@ -619,6 +725,8 @@ export const en = {
   'credit.error.overpay': 'That payment is more than the amount owed',
   'credit.error.missing': 'That request is no longer here',
   'credit.error.closed': 'This agreement is already closed',
+  'credit.error.shopLimit':
+    'You already hold credit at the shops you are allowed. Clear one before asking another shop.',
 
   // ── field visit (a separate request, not chat and not credit) ────────────
   'dealer.profile.title': 'Verified dealer',
@@ -683,9 +791,11 @@ export const en = {
   'visit.demo.reject': 'Dealer declines',
 
   // ── recommendations and notifications (one object, two surfaces) ─────────
-  'insight.today': 'Today for your crop',
-  'insight.otherCrops': 'Your other crops',
-  'insight.by': 'for {crop}',
+  /* Shown on the crop card before there is an account — the copy the app's own
+     review asked to have back, with the text button under it. */
+  'insight.signIn.title': 'Advice made for your crop',
+  'insight.signIn.body': 'Sign in to see what your crop needs.',
+  'insight.signIn.action': 'Sign in',
   'insight.confidence': '{percent}% match',
   'insight.evidence': '{source} · {time}',
   'insight.dismiss': 'Not now',
@@ -694,10 +804,9 @@ export const en = {
   'insight.acted': 'Marked done',
   'insight.main': 'Main crop',
   'insight.makeMain': 'Make {crop} my main crop',
-  'insight.none': 'No new advice for {crop} right now.',
+
   'insight.estimated': 'stage estimated from planting date',
   'insight.count': '{count} to look at',
-  'insight.noAdvice': 'Nothing right now',
   'insight.source': 'Source',
   'insight.confidenceLabel': 'Confidence',
   'insight.validUntil': 'Valid until',
@@ -727,7 +836,16 @@ export const en = {
   'notification.open': 'Open',
 
   // ── source and freshness (never a number without both) ───────────────────
-  'weather.source': 'Source: {source} · updated {time}',
+  /*
+   * The footer of the weather card. It used to read `Source: {source} · updated
+   * {time}`; the credit was dropped from the card by request, so the key carries
+   * only the age now, and `weather.refresh` gives the farmer a way to ask for a
+   * newer reading instead of reading a credit they cannot act on. Open-Meteo's
+   * free tier still asks to be credited, so it is owed somewhere visible before
+   * public launch — the About screen (docs/SERVICES.md).
+   */
+  'weather.updated': 'updated {time}',
+  'weather.refresh': 'Refresh',
   'weather.stale': 'This reading is {age} old. Check again before you spray.',
   'weather.stale.title': 'This reading is out of date',
   'weather.unavailable.title': 'Weather is not available',
@@ -806,6 +924,90 @@ export const en = {
   'profile.account.createReason':
     'An account is only needed to post, message a dealer or ask for credit. Browsing stays free.',
   'profile.account.signedOut': 'Signed out. Your crops stay on this phone.',
+  /* Farmer identity — the header name a guest sees, and the way in. */
+  'farmer.guestName': 'Guest farmer',
+  'farmer.guestContact': 'Tap to sign in',
+  'farmer.cropCount': '{count} crops',
+  'farmer.noCrops': 'No crops yet',
+  'community.author.you': 'You',
+
+  /* Credential sheet — number or email, then password, or a new account. */
+
+  'credential.contactLabel': 'Number or email',
+  'credential.contactPlaceholder': 'Enter phone/email here ...',
+  'credential.continue': 'Continue',
+  'credential.checking': 'Checking…',
+  'credential.badContact': 'Write an 11-digit mobile number or a valid email address.',
+  'credential.emptyContact': 'Write your number or email first.',
+  'credential.noBackend': 'No account service is set up in this build, so signing in is not possible yet.',
+  'credential.backendError': 'Could not reach the account service. Check the connection and try again.',
+  'credential.passwordPrompt': 'Enter the password for {contact}',
+  'credential.passwordLabel': 'Password',
+  'credential.passwordPlaceholder': 'Your password',
+  'credential.emptyPassword': 'Write your password.',
+  'credential.wrongPassword': 'That password is not right. Try again.',
+  'credential.signIn': 'Sign in',
+  'credential.signingIn': 'Signing in…',
+  'credential.nameLabel': 'Your name',
+  'credential.namePlaceholder': 'e.g. Muhammad Aslam',
+  'credential.emptyName': 'Write your name.',
+  'credential.weakPassword': 'Use at least 6 characters.',
+  'credential.createPasswordLabel': 'Create a password',
+  'credential.createPasswordPlaceholder': 'At least 6 characters',
+  'credential.create': 'Create account',
+  'credential.creating': 'Creating…',
+  'credential.createFailed': 'The account could not be created. Try again.',
+  'credential.phoneSignupNotSupported': 'This build cannot make an account from a number yet — use an email.',
+  'credential.back': 'Back',
+  'credential.done': 'You are signed in.',
+  'credential.confirmRequired':
+    'The account for {contact} was created. Confirm it from your inbox, then sign in.',
+  'session.liveNote': 'A real code was sent by the live service.',
+
+  /* Saved location. */
+  'location.title': 'Your location',
+  'location.none': 'Not set',
+  'location.current': 'Current location',
+  'location.change': 'Change',
+  'location.add': 'Add location',
+  'location.defaultHint': 'Set your location to see dealers and weather near you.',
+  'location.savedHint': 'Saved to your account.',
+  'location.savedHintDevice': 'Saved on this phone only.',
+  'location.temporaryHint': '{place} — not saved yet. Save it as {saved} to keep it.',
+  'location.temporary': 'Using your current position',
+  'location.searchBarHint': 'Search your village or town',
+  'location.detectFailed': 'Could not get your location. Search for it instead.',
+  'location.searchPlaceholder': 'Search village or town',
+  'location.searchHint': 'Search by village, town or tehsil name.',
+  'location.searching': 'Searching…',
+  'location.searchResults': 'Search results',
+  'location.noMatches': 'Nothing found for "{query}".',
+  'location.tapToSave': 'Tap a place to save it.',
+  'location.saving': 'Saving…',
+  'location.save': 'Save this location',
+  'location.useSaved': 'Use saved location',
+  'location.savedToast': 'Location saved',
+  'location.saveFailed': 'Could not save the location. {reason}',
+
+  /* Search. */
+  'search.title': 'Search',
+  'search.hint': 'Write a dealer, shop or product name.',
+  'search.clear': 'Clear search',
+  'search.suggested': 'Suggestions',
+  'search.suggestedDealers': 'Dealers near you',
+  'search.suggestedProducts': 'Products sold nearby',
+  'search.tabProducts': 'Products',
+  'search.tabDealers': 'Dealers',
+  'search.noProducts': 'No product found for "{query}".',
+  'search.noDealers': 'No dealer found for "{query}".',
+  'search.product.shop': 'at {shop} · {km}',
+
+  /* Data status when there is no server row to write to yet. */
+  'profile.data.deviceOnly': 'On this phone only',
+  'profile.data.deviceOnlyBody':
+    'Your account is still being set up. Everything you write is kept on this phone until it is.',
+  'profile.account.signIn': 'Sign in',
+
 } as const;
 
 export type MessageKey = keyof typeof en;
@@ -866,11 +1068,72 @@ export const ur: Record<MessageKey, string> = {
   'farmer.acres': '8 ایکڑ',
   'farmer.phone': '0300 3333333',
 
-  'home.greeting': 'السلام علیکم، {name}',
+  'home.greeting': 'دوبارہ خوش آمدید',
+  'home.watch.title': 'آپ کی فصل کے گرد کیا چل رہا ہے',
+  'home.watch.empty': 'آپ کے علاقے سے ابھی کچھ نیا نہیں — مشورے اور رپورٹیں یہاں آئیں گی۔',
+  'home.watch.alert': 'کیڑے کا خطرہ',
   'home.notifications': 'اطلاعات',
+  'home.disease.title': 'بیماریوں کا رجحان',
+  'home.disease.answer.low': 'آنے والے ہفتے میں بیماری کا امکان کم ہے',
+  'home.disease.answer.watch': 'بیماری کا امکان ہے — پتے دیکھتے رہیں',
+  'home.disease.answer.favourable': 'بیماری کا امکان زیادہ ہے — موسم اس کے حق میں ہے',
+  'home.disease.answer.unknown': 'بیماری کے خطرے کا ابھی اندازہ نہیں لگ سکتا',
+  'home.disease.sub': '{days} دنوں میں {rain} دن بارش · {min}–{max}°C · {area}',
+  'home.disease.sub.rainOnly': '{days} دنوں میں {rain} دن بارش · {area}',
+  'home.disease.nofeed': '{area} کے لیے ابھی پیش گوئی نہیں',
+  'home.nextCrop.title': 'اگلی فصل کی موزونیت',
+  'home.nextCrop.season.rabi': 'ربیع',
+  'home.nextCrop.season.kharif': 'خریف',
+  'home.nextCrop.answer': 'اگلی فصل {crop}',
+  'home.nextCrop.context': '{season} کی بوائی شروع ہے · {crop} کے بعد',
+  'home.nextCrop.context.opens': '{season} کی بوائی {date} سے · {crop} کے بعد',
+  'home.nextCrop.none': '{crop} کے بعد اس موسم میں اور کوئی فصل نہیں',
+  'home.nextCrop.nocrop': 'اپنی فصل بتائیں، اس کھیت کے لیے اگلی فصل بتائی جائے گی',
+  'home.nextCrop.basis': 'موسمی کیلنڈر — منافع کا اندازہ نہیں',
+  'intel.source.official': 'سرکاری مشورہ',
+  'intel.source.knowledge': 'زرعی رہنمائی',
+  'intel.area.punjab': 'پنجاب',
+  'intel.advisory.punjab.title': 'پنجاب زراعت فصل مشورہ',
+  'intel.advisory.punjab.body': 'موجودہ سرکاری رہنمائی — بوائی کے اوقات، کیڑوں کی نگرانی اور آبپاشی کی ہدایات۔ اپنے ضلع کے لیے اصل پورٹل دیکھیں۔',
+  'intel.watch.bollworm.title': 'گلابی سنڈی کی نگرانی (کپاس)',
+  'intel.watch.bollworm.body': 'گڈی بننے کے دوران ہفتے میں دو بار معائنہ کریں۔ سپرے سے پہلے پودے پر کیڑے کی تصدیق کریں۔',
+
+  'report.sheet.title': 'کھیت کے مسئلے کی رپورٹ',
+  'report.privacy': 'دوسرے کسانوں کے ساتھ صرف آپ کا قریبی علاقہ شیئر ہوتا ہے — کھیت کا درست مقام کبھی نہیں۔',
+  'report.field.crop': 'فصل',
+  'report.field.topic': 'کیا مسئلہ ہے؟',
+  'report.field.title': 'ایک سطر',
+  'report.field.body': 'آپ نے کیا دیکھا؟',
+  'report.placeholder.title': 'مثلاً گڈیوں میں گلابی سنڈی',
+  'report.placeholder.body': 'کھیت کا کتنا حصہ، اور کب سے…',
+  'report.crop.other': 'کوئی اور فصل',
+  'report.topic.pest': 'کیڑا',
+  'report.topic.disease': 'بیماری',
+  'report.topic.weed': 'جڑی بوٹی',
+  'report.topic.water': 'پانی',
+  'report.topic.weather_damage': 'موسم کا نقصان',
+  'report.topic.other': 'کچھ اور',
+  'report.from': '{area} سے رپورٹ',
+  'report.needsArea': 'رپورٹ علاقے کے حساب سے دکھائی جاتی ہے، پہلے اپنا علاقہ منتخب کریں۔',
+  'report.setArea': 'اپنا علاقہ منتخب کریں',
+  'report.submit': 'رپورٹ بھیجیں',
+  'report.sending': 'بھیجی جا رہی ہے…',
+  'report.sent': 'رپورٹ بھیج دی گئی۔ قریب کے کسان اسے دیکھ سکتے ہیں۔',
+  'report.error.crop': 'فہرست میں سے فصل منتخب کریں۔',
+  'report.error.topic': 'منتخب کریں کہ مسئلہ کس قسم کا ہے۔',
+  'report.error.emptyTitle': 'ایک سطر میں لکھیں کہ آپ نے کیا دیکھا۔',
+  'report.error.longTitle': 'سطر بہت لمبی ہے — اسے مختصر کریں۔',
+  'report.error.emptyBody': 'لکھیں کہ کھیت میں کیا دیکھا۔',
+  'report.error.longBody': 'تفصیل بہت لمبی ہے — اسے مختصر کریں۔',
+  'report.error.area': 'آپ کا علاقہ محفوظ نہیں، اس لیے رپورٹ کا مقام معلوم نہیں۔',
+  'report.error.offline': 'سرور سے رابطہ نہیں۔ آپ کی رپورٹ نہیں بھیجی گئی۔',
+  'report.error.generic': 'رپورٹ نہیں بھیجی جا سکی۔ دوبارہ کوشش کریں۔',
 
   'weather.today': 'آج · {date}',
   'weather.listen': 'سنیں',
+  'weather.stopListening': 'روکیں',
+  'weather.listenUnavailable': 'اس فون میں آپ کی زبان کی آواز موجود نہیں۔',
+  'weather.spokenTemp': '{value} ڈگری',
   'weather.condition': 'کچھ بادل',
   'weather.condition.clear': 'صاف آسمان',
   'weather.condition.mainlyClear': 'زیادہ تر صاف',
@@ -890,7 +1153,6 @@ export const ur: Record<MessageKey, string> = {
   'weather.alert': 'اس ہفتے وزیرآباد میں گلابی سنڈی کا خطرہ زیادہ ہے',
 
   'scanCta.title': 'اپنی فصل دیکھیں',
-  'scanCta.body': 'تصویر لیں اور مسئلہ اور اس کا علاج معلوم کریں',
   'scanCta.offline': 'انٹرنیٹ کے بغیر بھی کام کرتا ہے',
 
   'credit.title': 'میرا ادھار',
@@ -907,6 +1169,12 @@ export const ur: Record<MessageKey, string> = {
   'crop.wheat': 'گندم',
   'crop.maize': 'مکئی',
   'crop.rice': 'چاول',
+  'crop.sugarcane': 'گنا',
+  'crop.gram': 'چنا',
+  'crop.potato': 'آلو',
+  'crop.mustard': 'سرسوں',
+  'crop.mungbean': 'ماش',
+  'crop.onion': 'پیاز',
 
   'dealers.title': 'ڈیلر',
   'dealers.mapAria': 'نقشے پر ڈیلر',
@@ -1141,6 +1409,9 @@ export const ur: Record<MessageKey, string> = {
   'profile.credit': 'میرا ادھار',
   'profile.dealers': 'میرے ڈیلر',
   'profile.farmDetails': 'کھیت کی تفصیل',
+  'profile.crops': 'میری فصلیں',
+  'profile.cropsHint': 'آپ کی مرکزی فصل طے کرتی ہے کہ ہوم اسکرین کا مشورہ کس بارے میں ہوگا۔',
+  'profile.locationHint': 'موسم، قریبی دکانیں اور مقامی مشوروں کے لیے استعمال ہوتا ہے۔',
   'profile.language': 'زبان',
   'profile.appearance': 'ظاہری شکل',
   'profile.notifications': 'اطلاعات',
@@ -1192,6 +1463,14 @@ export const ur: Record<MessageKey, string> = {
   'session.why.credit': 'ادھار کی درخواست اور جواب آپ کے اکاؤنٹ پر درج ہوتے ہیں۔',
   'session.why.visit': 'کھیت کے دورے کی درخواست ایک مخصوص دکان کو جاتی ہے، اس لیے اکاؤنٹ چاہیے۔',
   'session.why.expert': 'ماہر کو بھیجا گیا سوال آپ کی فصل اور تصویریں ساتھ لے جاتا ہے، اس لیے اکاؤنٹ چاہیے۔',
+  'session.why.dealers': 'آپ کے ڈیلر آپ کے اکاؤنٹ میں محفوظ رہتے ہیں، اس لیے نئے فون پر بھی ساتھ آتے ہیں۔',
+  'session.why.farmDetails': 'کھیت کی تفصیل آپ کے اکاؤنٹ کا حصہ ہے، اس لیے آپ ہی کی رہتی ہے۔',
+  'session.why.advice':
+    'فصل کی صلاح آپ کے اکاؤنٹ سے جڑی ہوتی ہے، تاکہ وہ آپ کے اگلے فون پر بھی ساتھ آ سکے۔',
+  'session.why.creditBook':
+    'ہر دکان پر آپ کا ادھار آپ کے اکاؤنٹ میں محفوظ رہتا ہے، اس لیے کسی بھی فون پر آپ ہی کا رہتا ہے۔',
+  'session.why.report':
+    'کھیت کی رپورٹ میں آپ کی فصل اور علاقہ شامل ہوتا ہے، اس لیے اکاؤنٹ چاہیے۔',
   'session.phone': 'موبائل نمبر',
   'session.email': 'ای میل',
   'session.name': 'آپ کا نام',
@@ -1306,6 +1585,14 @@ export const ur: Record<MessageKey, string> = {
   'credit.home.none': 'ابھی کوئی ادھار نہیں لیا',
   'credit.home.open': '{dealer} · {due}',
   'credit.home.answer': 'ایک درخواست پر آپ کا جواب چاہیے',
+  'credit.home.shops': '{count} دکانوں پر',
+  'credit.entry': 'آپ کے دکان اور پرانا ریکارڈ',
+  'quick.credit.note': 'کس دکان پر کتنا ادھار ہے',
+
+  'credit.shops.title': 'آپ کے دکان',
+  'credit.shops.limit': 'ایک وقت میں زیادہ سے زیادہ {count} دکانوں پر ادھار',
+  'credit.shop.products': 'آپ نے کیا خریدا',
+  'credit.shop.history': 'اس دکان کے ساتھ پرانا ریکارڈ',
   'product.dap': 'ڈی اے پی کھاد · 2 بوری',
   'product.urea': 'یوریا کھاد · 2 بوری',
   'product.roundup': 'راؤنڈ اپ جڑی بوٹی مار دوا · 1 لیٹر',
@@ -1323,6 +1610,8 @@ export const ur: Record<MessageKey, string> = {
   'credit.error.overpay': 'ادائیگی باقی رقم سے زیادہ ہے',
   'credit.error.missing': 'یہ درخواست اب موجود نہیں',
   'credit.error.closed': 'یہ معاہدہ مکمل ہو چکا',
+  'credit.error.shopLimit':
+    'جن دکانوں پر اجازت ہے، وہاں آپ کا ادھار پہلے سے جاری ہے۔ دوسری دکان سے مانگنے سے پہلے ایک سنبھالیں۔',
 
   // ── کھیت کا دورہ ──────────────────────────────────────────────────────────
   'dealer.profile.title': 'تصدیق شدہ دکاندار',
@@ -1379,9 +1668,9 @@ export const ur: Record<MessageKey, string> = {
   'visit.demo.reject': 'دکاندار نے انکار کیا',
 
   // ── تجاویز اور اطلاعات ────────────────────────────────────────────────────
-  'insight.today': 'آج آپ کی فصل کے لیے',
-  'insight.otherCrops': 'آپ کی باقی فصلیں',
-  'insight.by': '{crop} کے لیے',
+  'insight.signIn.title': 'آپ کی فصل کے لیے صلاح',
+  'insight.signIn.body': 'لاگ ان کریں اور دیکھیں کہ آپ کی فصل کو کیا ضرورت ہے۔',
+  'insight.signIn.action': 'لاگ ان',
   'insight.confidence': '{percent}٪ مطابقت',
   'insight.evidence': '{source} · {time}',
   'insight.dismiss': 'ابھی نہیں',
@@ -1390,10 +1679,9 @@ export const ur: Record<MessageKey, string> = {
   'insight.acted': 'ہو گیا نشان زد',
   'insight.main': 'بنیادی فصل',
   'insight.makeMain': '{crop} کو میری بنیادی فصل بنائیں',
-  'insight.none': 'ابھی {crop} کے لیے کوئی نئی صلاح نہیں۔',
+
   'insight.estimated': 'مرحلہ بوائی کی تاریخ سے اندازہ ہے',
   'insight.count': 'دیکھنے کی {count} باتیں',
-  'insight.noAdvice': 'ابھی کچھ نہیں',
   'insight.source': 'ذریعہ',
   'insight.confidenceLabel': 'یقین',
   'insight.validUntil': 'تک درست',
@@ -1423,7 +1711,8 @@ export const ur: Record<MessageKey, string> = {
   'notification.open': 'کھولیں',
 
   // ── ذریعہ اور تازگی ────────────────────────────────────────────────────────
-  'weather.source': 'ذریعہ: {source} · {time} اپ ڈیٹ',
+  'weather.updated': '{time} اپ ڈیٹ',
+  'weather.refresh': 'تازہ کریں',
   'weather.stale': 'یہ پڑھائی {age} پرانی ہے۔ سپرے سے پہلے دوبارہ دیکھیں۔',
   'weather.stale.title': 'یہ پڑھائی پرانی ہے',
   'weather.unavailable.title': 'موسم دستیاب نہیں',
@@ -1498,6 +1787,85 @@ export const ur: Record<MessageKey, string> = {
   'profile.account.createReason':
     'اکاؤنٹ صرف پوسٹ کرنے، ڈیلر کو پیغام بھیجنے یا ادھار مانگنے کے لیے چاہیے۔ دیکھنا مفت ہے۔',
   'profile.account.signedOut': 'لاگ آؤٹ ہو گئے۔ آپ کی فصلیں اسی فون پر رہیں گی۔',
+  'farmer.guestName': 'مہمان کسان',
+  'farmer.guestContact': 'لاگ ان کے لیے دبائیں',
+  'farmer.cropCount': '{count} فصلیں',
+  'farmer.noCrops': 'ابھی کوئی فصل نہیں',
+  'community.author.you': 'آپ',
+
+
+  'credential.contactLabel': 'نمبر یا ای میل',
+  'credential.contactPlaceholder': 'یہاں نمبر یا ای میل لکھیں ...',
+  'credential.continue': 'آگے بڑھیں',
+  'credential.checking': 'دیکھ رہے ہیں…',
+  'credential.badContact': '11 ہندسوں کا موبائل نمبر یا درست ای میل لکھیں۔',
+  'credential.emptyContact': 'پہلے اپنا نمبر یا ای میل لکھیں۔',
+  'credential.noBackend': 'اس بلڈ میں اکاؤنٹ سروس سیٹ نہیں، اس لیے ابھی لاگ ان ممکن نہیں۔',
+  'credential.backendError': 'اکاؤنٹ سروس تک نہیں پہنچ سکے۔ کنکشن دیکھ کر دوبارہ کوشش کریں۔',
+  'credential.passwordPrompt': '{contact} کا پاس ورڈ لکھیں',
+  'credential.passwordLabel': 'پاس ورڈ',
+  'credential.passwordPlaceholder': 'آپ کا پاس ورڈ',
+  'credential.emptyPassword': 'اپنا پاس ورڈ لکھیں۔',
+  'credential.wrongPassword': 'یہ پاس ورڈ درست نہیں۔ دوبارہ کوشش کریں۔',
+  'credential.signIn': 'لاگ ان',
+  'credential.signingIn': 'لاگ ان ہو رہے ہیں…',
+  'credential.nameLabel': 'آپ کا نام',
+  'credential.namePlaceholder': 'مثلاً محمد اسلم',
+  'credential.emptyName': 'اپنا نام لکھیں۔',
+  'credential.weakPassword': 'کم از کم 6 حروف رکھیں۔',
+  'credential.createPasswordLabel': 'پاس ورڈ بنائیں',
+  'credential.createPasswordPlaceholder': 'کم از کم 6 حروف',
+  'credential.create': 'اکاؤنٹ بنائیں',
+  'credential.creating': 'بنایا جا رہا ہے…',
+  'credential.createFailed': 'اکاؤنٹ نہیں بن سکا۔ دوبارہ کوشش کریں۔',
+  'credential.phoneSignupNotSupported': 'یہ بلڈ ابھی نمبر سے اکاؤنٹ نہیں بنا سکتا — ای میل استعمال کریں۔',
+  'credential.back': 'واپس',
+  'credential.done': 'آپ لاگ ان ہو گئے ہیں۔',
+  'credential.confirmRequired':
+    '{contact} کا اکاؤنٹ بن گیا ہے۔ اپنے ای میل سے اس کی تصدیق کریں، پھر لاگ ان کریں۔',
+  'session.liveNote': 'اصل کوڈ لائیو سروس نے بھیجا ہے۔',
+
+  'location.title': 'آپ کا مقام',
+  'location.none': 'مقرر نہیں',
+  'location.current': 'موجودہ مقام',
+  'location.change': 'بدلیں',
+  'location.add': 'مقام شامل کریں',
+  'location.defaultHint': 'اپنے قریب دکاندار اور موسم دیکھنے کے لیے مقام مقرر کریں۔',
+  'location.savedHint': 'آپ کے اکاؤنٹ میں محفوظ ہے۔',
+  'location.savedHintDevice': 'صرف اسی فون پر محفوظ ہے۔',
+  'location.temporaryHint': '{place} — ابھی محفوظ نہیں۔ اسے {saved} کے طور پر محفوظ کریں۔',
+  'location.temporary': 'آپ کی موجودہ پوزیشن استعمال ہو رہی ہے',
+  'location.searchBarHint': 'اپنا گاؤں یا قصبہ تلاش کریں',
+  'location.detectFailed': 'آپ کی جگہ نہیں مل سکی۔ اسے تلاش کریں۔',
+  'location.searchPlaceholder': 'گاؤں یا قصبہ تلاش کریں',
+  'location.searchHint': 'گاؤں، قصبے یا تحصیل کے نام سے تلاش کریں۔',
+  'location.searching': 'تلاش ہو رہی ہے…',
+  'location.searchResults': 'تلاش کے نتائج',
+  'location.noMatches': '"{query}" کے لیے کچھ نہیں ملا۔',
+  'location.tapToSave': 'محفوظ کرنے کے لیے جگہ دبائیں۔',
+  'location.saving': 'محفوظ ہو رہا ہے…',
+  'location.save': 'یہ مقام محفوظ کریں',
+  'location.useSaved': 'محفوظ مقام استعمال کریں',
+  'location.savedToast': 'مقام محفوظ ہو گیا',
+  'location.saveFailed': 'مقام محفوظ نہیں ہو سکا۔ {reason}',
+
+  'search.title': 'تلاش',
+  'search.hint': 'دکاندار، دکان یا پروڈکٹ کا نام لکھیں۔',
+  'search.clear': 'تلاش صاف کریں',
+  'search.suggested': 'تجاویز',
+  'search.suggestedDealers': 'آپ کے قریب دکاندار',
+  'search.suggestedProducts': 'قریب میں ملنے والی پروڈکٹس',
+  'search.tabProducts': 'پروڈکٹس',
+  'search.tabDealers': 'دکاندار',
+  'search.noProducts': '"{query}" کے لیے کوئی پروڈکٹ نہیں ملی۔',
+  'search.noDealers': '"{query}" کے لیے کوئی دکاندار نہیں ملا۔',
+  'search.product.shop': '{shop} پر · {km}',
+
+  'profile.data.deviceOnly': 'صرف اسی فون پر',
+  'profile.data.deviceOnlyBody':
+    'آپ کا اکاؤنٹ ابھی بن رہا ہے۔ جو کچھ آپ لکھتے ہیں وہ اس وقت تک اسی فون پر محفوظ رہتا ہے۔',
+  'profile.account.signIn': 'لاگ ان',
+
 };
 
 /**

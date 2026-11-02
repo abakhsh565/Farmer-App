@@ -9,7 +9,7 @@ import {
   awaitingFarmer,
   cancel,
   counter,
-  createSeed,
+  createState,
   expireIfDue,
   farmerDecide,
   finalDecision,
@@ -79,7 +79,7 @@ export function CreditProvider({ children }: { children: ReactNode }) {
   const document = usePersistentDocument<CreditData>({
     collection: 'credit',
     ownerId,
-    seed: () => createSeed(Date.now()),
+    seed: createState,
     hydrate,
     serialise,
   });

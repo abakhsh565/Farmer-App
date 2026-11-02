@@ -1,0 +1,4 @@
+title,summary,crop_code,topic,district,area_label,published_at,valid_until,source_url,source_ref
+"Example — replace with a real published advisory","Two or three sentences a farmer can act on: what to look for, when to act, what not to do. Copy the wording from the source document rather than paraphrasing it.",cotton,pest,Layyah,"Layyah district",2026-10-14,,https://agripunjab.gov.pk/crop_advisory,"replace with the document's own number"
+"Find an early sowing window for wheat","Sow on the first reliable rain after the middle of November; late sowing loses about one percent of yield per day after the 25th.",wheat,sowing,,Punjab,2026-11-01,2026-12-31,,
+"A district-scope advisory names no crop and no district","It is stored with an empty crop_code and an area_label of Punjab, so the feed serves it as regional guidance to every crop rather than pinning it to one field.",,water,,Punjab,2026-10-14,,,

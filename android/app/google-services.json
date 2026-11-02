@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "195575511858",
+    "project_id": "farmer-app-c4590",
+    "storage_bucket": "farmer-app-c4590.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:195575511858:android:70ab8d5c839941bf9cf52b",
+        "android_client_info": {
+          "package_name": "pk.agrishop.farmer"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBV-FG4B28-3wNyso2lU7CL2eYVKKbFZ-E"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

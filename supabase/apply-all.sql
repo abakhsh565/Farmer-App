@@ -7,7 +7,7 @@
 --   2. paste this entire file
 --   3. Run. Either every migration applies, or none of them does.
 --
--- 19 migrations, applied in filename order, wrapped in one
+-- 32 migrations, applied in filename order, wrapped in one
 -- transaction on purpose: a chain applied half-way is worse than one that has not
 -- started, because the next attempt then fails on objects that already exist.
 --
@@ -5583,13 +5583,9 @@ as $$
   from public.agri_knowledge_entries e, q
   where e.is_published
     -- A crop-specific question prefers its own crop but is not limited to it:
-    -- a wheat farmer asking about stored grain should still find the answer.
-    and (
-      p_crop is null
-      or e.crop_code is null
-      or e.crop_code = p_crop
-      or e.crop_code <> p_crop
-    )
+    -- a wheat farmer asking about stored grain should still find the answer, so
+    -- there is deliberately no crop filter here — the preference lives in the
+    -- ordering below, not in the WHERE clause.
     and (
       to_tsvector('simple', e.title_en || ' ' || e.body_en) @@ q.ts
       or e.title_en ilike '%' || btrim(p_query) || '%'
@@ -5622,7 +5618,10 @@ security definer
 set search_path = public, pg_temp
 as $$
   with entry as (
-    select e.id, e.slug
+    -- body_local is carried through because the product lookup below reads
+    -- `products` out of it. Selecting only the id here made the second CTE
+    -- reference a column its input does not expose.
+    select e.id, e.slug, e.body_local
     from public.agri_knowledge_entries e
     where e.slug = p_slug and e.is_published
     order by e.version desc
@@ -5820,5 +5819,3037 @@ where e.is_published
 
 comment on column public.agri_knowledge_entries.body_local is
   'Localised extras. `products` is an array of canonical product slugs this treatment refers to; ai_product_for_knowledge() reads it to build the evidence chain from a diagnosis to a shop.';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261003002000_push_devices.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Farmer App · migration 0020 · push notification devices
+--
+-- A push token is a property of a *handset*, not of a farmer. In this app that
+-- distinction is not academic: the target user frequently shares one phone
+-- between two people, and both may sign in on it across a day.
+--
+-- So the token is stored once, keyed by the token itself, and ownership is
+-- reassigned when someone else signs in. Without that, farmer A keeps receiving
+-- "your credit request was declined" notifications on a handset now in farmer
+-- B's hands — which is worse than sending nothing at all.
+--
+-- The client never writes this table directly. `register_push_device` is the
+-- only entry point, because reassignment is a decision the server has to make.
+
+create table public.push_devices (
+  id          uuid primary key default gen_random_uuid(),
+  -- The FCM registration token. Unique: one handset, one row, always.
+  token       text not null unique,
+  -- Whoever is currently signed in on that handset. Null once the device is
+  -- signed out, so a stale row cannot keep delivering to the previous farmer.
+  party_id    uuid references public.parties (id) on delete cascade,
+  platform    text not null default 'android' check (platform in ('android', 'web')),
+  app_version text,
+  -- Refreshed every time the app opens, so "is this device still active?" is a
+  -- comparison rather than a guess.
+  last_seen_at timestamptz not null default now(),
+  created_at  timestamptz not null default now()
+);
+
+create index push_devices_party_idx on public.push_devices (party_id) where party_id is not null;
+create index push_devices_seen_idx on public.push_devices (last_seen_at desc);
+
+comment on table public.push_devices is
+  'One row per handset. Ownership follows whoever is signed in, because a shared phone is the normal case here — a token left pointing at the previous farmer would send one farmer''s credit and visit updates to another.';
+
+-- ---------------------------------------------------------------------------
+-- Registration
+-- ---------------------------------------------------------------------------
+
+-- Called on every app open. Claims the token for the current session, or
+-- refreshes it if this farmer already owns it.
+--
+-- `previous_party_id` is returned so the caller can tell whether a token was
+-- taken over, which is what makes it possible to log that handover rather than
+-- discovering it later.
+create or replace function public.register_push_device(
+  p_token       text,
+  p_platform    text default 'android',
+  p_app_version text default null
+)
+returns table (
+  device_id          uuid,
+  previous_party_id  uuid
+)
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_party   uuid := public.current_party_id();
+  v_previous uuid;
+  v_id      uuid;
+begin
+  if v_party is null then
+    raise exception 'A device can only be registered by a signed-in farmer.'
+      using errcode = 'insufficient_privilege';
+  end if;
+
+  if p_token is null or length(btrim(p_token)) < 8 then
+    raise exception 'That does not look like a push token.' using errcode = 'check_violation';
+  end if;
+
+  select d.party_id into v_previous
+    from public.push_devices d
+   where d.token = btrim(p_token);
+
+  insert into public.push_devices (token, party_id, platform, app_version, last_seen_at)
+  values (btrim(p_token), v_party, coalesce(p_platform, 'android'), p_app_version, now())
+  on conflict (token) do update
+    set party_id    = excluded.party_id,
+        platform    = excluded.platform,
+        app_version = coalesce(excluded.app_version, public.push_devices.app_version),
+        last_seen_at = now()
+  returning id into v_id;
+
+  perform public.write_audit(
+    'push.device_registered', 'push_devices', v_id, null,
+    v_previous::text, v_party::text,
+    jsonb_build_object('platform', coalesce(p_platform, 'android'), 'reassigned', v_previous is distinct from null and v_previous is distinct from v_party)
+  );
+
+  return query select v_id, v_previous;
+end;
+$$;
+
+-- Signing out releases the handset, so the next person to sign in on it can
+-- claim it. Without this the token stays attached to the previous farmer.
+create or replace function public.release_push_device(p_token text)
+returns boolean
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_party uuid := public.current_party_id();
+begin
+  update public.push_devices
+     set party_id = null
+   where token = p_token
+     and party_id = v_party;
+  return found;
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- Reading and RLS
+-- ---------------------------------------------------------------------------
+
+alter table public.push_devices enable row level security;
+
+-- A farmer may see their own handsets. They may not see anyone else's, and
+-- they may not write: the registration function is the only path, so that token
+-- reassignment cannot be bypassed with a direct insert.
+create policy push_devices_own_read on public.push_devices
+  for select to authenticated
+  using (party_id = public.current_party_id());
+
+grant select on public.push_devices to authenticated;
+grant execute on function public.register_push_device(text, text, text) to authenticated;
+grant execute on function public.release_push_device(text) to authenticated;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261003002100_party_provisioning_and_location.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Farmer App · migration 0021 · the missing link between an account and an actor
+--
+-- Three defects are fixed here, all of them found by asking the live database
+-- rather than the local schema files:
+--
+--  1. Signing in created an `auth.users` row and nothing else. `parties` stayed
+--     empty, so `current_party_id()` was NULL, so *every* RLS policy in the RLS
+--     migration matched nothing. A signed-in farmer saw an empty app and could
+--     not write a row. There was no trigger on `auth.users` and no code path
+--     that inserted a party: the account existed and the actor did not.
+--
+--  2. `dealers_within_radius(NULL, lat, lon, radius)` — the guest call the app
+--     actually makes — raised `Farmer <NULL> not found.` It read the profile
+--     into a record and then checked `not found`, which is true when the farmer
+--     id is NULL. So the "0 dealers within 10 km" a guest saw was an error being
+--     rendered as an empty list, which is why seeding dealers alone would not
+--     have fixed it.
+--
+--  3. The farmer's saved location had no write path the client could use. The
+--     table and its completeness constraint existed; nothing could set it. The
+--     functions below are that path, and they validate server-side so the rules
+--     do not depend on the picker being well behaved.
+
+-- ---------------------------------------------------------------------------
+-- 1 · Provisioning
+-- ---------------------------------------------------------------------------
+--
+-- A party is a domain actor that happens to be authenticated. Creating one is
+-- therefore part of becoming authenticated, not a second step a client may or
+-- may not perform. It lives in a trigger so it cannot be skipped, and in a plain
+-- function so it can be re-run for accounts that predate it.
+--
+-- Deliberately NOT a merge point. The PRD forbids merging accounts by phone
+-- number, so a contact row that already exists is left alone rather than
+-- re-pointed at the new party: the duplicate becomes visible to a human instead
+-- of silently joining two people's records.
+
+create or replace function public.provision_party(p_auth_user uuid)
+returns uuid
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_user    auth.users;
+  v_party   uuid;
+  v_display text;
+  v_locale  text;
+  v_digits  text;
+begin
+  if p_auth_user is null then
+    return null;
+  end if;
+
+  -- Already provisioned: make sure the dependent rows exist, then stop. This is
+  -- what makes the function safe to call on every app launch.
+  select id into v_party from public.parties where auth_user_id = p_auth_user;
+  if v_party is not null then
+    insert into public.farmer_profiles (party_id) values (v_party)
+      on conflict (party_id) do nothing;
+    insert into public.farmer_search_settings (farmer_id) values (v_party)
+      on conflict (farmer_id) do nothing;
+    return v_party;
+  end if;
+
+  select * into v_user from auth.users u where u.id = p_auth_user;
+  if not found then
+    return null;
+  end if;
+
+  -- An account with neither a phone nor an email is not an identity anybody can
+  -- be held to; refuse rather than create a nameless actor.
+  if v_user.phone is null and v_user.email is null then
+    return null;
+  end if;
+
+  v_digits := regexp_replace(coalesce(v_user.phone, ''), '\D', '', 'g');
+
+  v_display := coalesce(
+    nullif(btrim(coalesce(v_user.raw_user_meta_data ->> 'display_name', '')), ''),
+    case
+      -- Never the whole number: a display name is shown to other people.
+      when v_digits <> '' then '****' || right(v_digits, 4)
+      else split_part(coalesce(v_user.email, 'farmer'), '@', 1)
+    end
+  );
+
+  -- The column has a check constraint listing supported locales, so a metadata
+  -- value that is not one of them must not reach the insert.
+  v_locale := case
+    when coalesce(v_user.raw_user_meta_data ->> 'locale', '') in ('ur', 'en', 'pa', 'sk', 'sd', 'ps')
+      then v_user.raw_user_meta_data ->> 'locale'
+    else 'ur'
+  end;
+
+  insert into public.parties (kind, auth_user_id, display_name, locale)
+  values ('farmer', p_auth_user, left(v_display, 120), v_locale)
+  returning id into v_party;
+
+  -- The location row is created empty. The completeness constraint explicitly
+  -- allows all-NULL coordinates, which is the honest state of a farmer who has
+  -- not chosen a location yet — and it is what lets the app distinguish "no
+  -- location" from "somewhere at 0,0".
+  insert into public.farmer_profiles (party_id) values (v_party)
+    on conflict (party_id) do nothing;
+
+  insert into public.farmer_search_settings (farmer_id, radius_km) values (v_party, 10)
+    on conflict (farmer_id) do nothing;
+
+  -- The contact is the identifier, never an authorization. `verified_at` is set
+  -- only from what the provider actually confirmed.
+  if v_digits <> '' then
+    insert into public.party_contacts (party_id, channel, value, raw_value, verified_at, is_primary)
+    values (
+      v_party, 'phone', v_digits, coalesce(v_user.phone, v_digits),
+      v_user.phone_confirmed_at, true
+    )
+    on conflict (channel, value) do nothing;
+  end if;
+
+  if v_user.email is not null then
+    insert into public.party_contacts (party_id, channel, value, raw_value, verified_at, is_primary)
+    values (
+      v_party, 'email', lower(v_user.email), v_user.email,
+      v_user.email_confirmed_at, true
+    )
+    on conflict (channel, value) do nothing;
+  end if;
+
+  return v_party;
+end;
+$$;
+
+comment on function public.provision_party(uuid) is
+  'Creates the domain actor for an authenticated user, idempotently. Triggered by auth.users inserts so provisioning cannot be skipped by a client that forgets.';
+
+create or replace function public.on_auth_user_created()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  perform public.provision_party(new.id);
+  return new;
+end;
+$$;
+
+-- Dropped first so re-running this migration on a database that already has the
+-- trigger is a no-op rather than an error.
+drop trigger if exists on_auth_user_created on auth.users;
+
+create trigger on_auth_user_created
+  after insert on auth.users
+  for each row execute function public.on_auth_user_created();
+
+-- Backfill. Every account that already existed — including the test account
+-- used to verify OTP — becomes an actor with a profile.
+do $$
+declare
+  v_user record;
+begin
+  for v_user in
+    select u.id
+    from auth.users u
+    where not exists (select 1 from public.parties p where p.auth_user_id = u.id)
+      and (u.phone is not null or u.email is not null)
+  loop
+    perform public.provision_party(v_user.id);
+  end loop;
+end;
+$$;
+
+-- The self-healing entry point the app calls after a session is established.
+-- Idempotent by construction, and returns NULL for a caller with no session so
+-- a guest is not an error.
+create or replace function public.ensure_party()
+returns uuid
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_uid uuid := auth.uid();
+begin
+  if v_uid is null then
+    return null;
+  end if;
+  return public.provision_party(v_uid);
+end;
+$$;
+
+comment on function public.ensure_party() is
+  'Idempotently provisions the caller''s party, profile and search settings. Returns NULL for a guest session.';
+
+grant execute on function public.ensure_party() to authenticated;
+
+-- ---------------------------------------------------------------------------
+-- 2 · Guest dealer search
+-- ---------------------------------------------------------------------------
+--
+-- Same signature, same output, so nothing that already calls it changes. What
+-- changes is who it accepts: a caller with no farmer id but real coordinates is
+-- a guest doing a temporary search, which the PRD explicitly allows, and the
+-- signed-in caller no longer has to be passed its own id by the client — the
+-- session is the source of truth for that.
+
+create or replace function public.dealers_within_radius(
+  p_farmer_id uuid,
+  p_lat       double precision default null,
+  p_lon       double precision default null,
+  p_radius_km integer default null
+)
+returns table (
+  dealer_id        uuid,
+  shop_name        text,
+  distance_km      numeric,
+  verified_at      timestamptz,
+  opening_hours    text,
+  sync_state       text,
+  synced_at        timestamptz,
+  is_accepting     boolean,
+  effective_radius integer,
+  used_temporary_area boolean
+)
+language plpgsql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_settings public.farmer_search_settings;
+  v_profile  public.farmer_profiles;
+  v_farmer   uuid := p_farmer_id;
+  v_origin   extensions.geography;
+  v_radius   integer;
+  v_temporary boolean := false;
+begin
+  -- The session decides who the caller is. A client that passes someone else's
+  -- id gets its own saved location only if that id is its own; otherwise the id
+  -- is ignored in favour of the session's party.
+  if v_farmer is null then
+    v_farmer := public.current_party_id();
+  elsif v_farmer is distinct from public.current_party_id() then
+    v_farmer := public.current_party_id();
+  end if;
+
+  if v_farmer is not null then
+    select * into v_profile from public.farmer_profiles where party_id = v_farmer;
+    select * into v_settings from public.farmer_search_settings where farmer_id = v_farmer;
+  end if;
+
+  if p_lat is not null and p_lon is not null then
+    -- Caller supplied an origin: this is a temporary search area, and it is used
+    -- for this query only. It is never written back to the profile — that is the
+    -- whole reason "search near Kot Ladha" cannot silently become the farmer's
+    -- location.
+    v_origin    := extensions.ST_SetSRID(extensions.ST_MakePoint(p_lon, p_lat), 4326)::extensions.geography;
+    v_temporary := true;
+  else
+    v_origin := v_profile.geog;
+  end if;
+
+  if v_origin is null then
+    -- A guest with no coordinates, or a farmer who has never saved a location.
+    -- Reported as no data rather than as an empty list, because "we do not know
+    -- where you are" and "there is nothing near you" are different sentences and
+    -- only one of them is fixable by the farmer.
+    raise exception 'No search origin: the farmer has no default location and none was supplied.'
+      using errcode = 'no_data_found';
+  end if;
+
+  v_radius := least(coalesce(p_radius_km, v_settings.radius_km, 10), 100);
+
+  return query
+    select
+      d.id,
+      d.shop_name,
+      round((extensions.ST_Distance(d.geog, v_origin) / 1000.0)::numeric, 1),
+      d.verified_at,
+      d.opening_hours,
+      d.sync_state,
+      d.synced_at,
+      d.is_accepting_requests,
+      v_radius,
+      v_temporary
+    from public.dealer_profiles d
+    where d.geog is not null
+      and extensions.ST_DWithin(d.geog, v_origin, v_radius * 1000)
+    order by d.geog operator(extensions.<->) v_origin
+    limit 200;
+end;
+$$;
+
+comment on function public.dealers_within_radius(uuid, double precision, double precision, integer) is
+  'Radius search capped at 100 km. An origin supplied by the caller is treated as temporary and never written back to the farmer profile. Accepts guests by coordinates, and defaults the farmer to the session rather than to a client-supplied id.';
+
+-- ---------------------------------------------------------------------------
+-- 3 · The saved location
+-- ---------------------------------------------------------------------------
+--
+-- Read and write are separate functions on purpose. Reading is free and belongs
+-- to any signed-in farmer; writing is the single act that may replace a saved
+-- location, so it is one function with one caller-facing meaning. There is no
+-- "update my location" path from a search screen, because the PRD says a
+-- temporary search must not be able to become the saved location silently.
+
+create or replace function public.farmer_location_get()
+returns table (
+  label      text,
+  lat        double precision,
+  lon        double precision,
+  source     text,
+  set_at     timestamptz,
+  radius_km  integer,
+  area_id    uuid
+)
+language plpgsql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_party uuid := public.current_party_id();
+begin
+  if v_party is null then
+    -- A guest has no saved location. That is an answer, not a failure.
+    return;
+  end if;
+
+  return query
+    select
+      f.default_location_label,
+      f.default_lat,
+      f.default_lon,
+      f.default_location_source,
+      f.location_set_at,
+      coalesce(s.radius_km, 10),
+      f.default_area_id
+    from public.farmer_profiles f
+    left join public.farmer_search_settings s on s.farmer_id = f.party_id
+    where f.party_id = v_party;
+end;
+$$;
+
+comment on function public.farmer_location_get() is
+  'The farmer''s saved location and search radius. Returns no row for a guest rather than raising, because "not signed in" is not an error.';
+
+create or replace function public.farmer_location_save(
+  p_label     text,
+  p_lat       double precision,
+  p_lon       double precision,
+  p_source    text default 'profile_entry',
+  p_radius_km integer default null
+)
+returns table (
+  label      text,
+  lat        double precision,
+  lon        double precision,
+  source     text,
+  set_at     timestamptz,
+  radius_km  integer
+)
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_party  uuid := public.current_party_id();
+  v_label  text := btrim(coalesce(p_label, ''));
+  v_radius integer;
+  v_set_at timestamptz := now();
+begin
+  -- Every rule below is enforced here, not in the picker. A caller that skips
+  -- the UI entirely reaches the same checks.
+  if v_party is null then
+    raise exception 'Sign in to save a location.' using errcode = 'insufficient_privilege';
+  end if;
+
+  if p_lat is null or p_lon is null then
+    raise exception 'A saved location needs both a latitude and a longitude.'
+      using errcode = 'invalid_parameter_value';
+  end if;
+
+  if p_lat < -90 or p_lat > 90 or p_lon < -180 or p_lon > 180 then
+    raise exception 'That location is outside the valid range.'
+      using errcode = 'invalid_parameter_value';
+  end if;
+
+  -- A location with no name cannot be shown back to the farmer, and the
+  -- completeness constraint would reject the pair as incomplete anyway.
+  if v_label = '' or length(v_label) > 120 then
+    raise exception 'A saved location needs a name of 1 to 120 characters.'
+      using errcode = 'invalid_parameter_value';
+  end if;
+
+  if p_source is null or p_source not in ('profile_entry', 'device_permission', 'dealer_record') then
+    raise exception 'Unknown location source.' using errcode = 'invalid_parameter_value';
+  end if;
+
+  -- Clamped rather than rejected: the PRD's 100 km ceiling is a rule about what
+  -- the search may do, and the slider already cannot exceed it. A caller asking
+  -- for more gets the maximum, the same way the radius search does.
+  v_radius := least(greatest(coalesce(p_radius_km, 10), 1), 100);
+
+  update public.farmer_profiles f
+     set default_lat            = p_lat,
+         default_lon            = p_lon,
+         default_location_label = v_label,
+         default_location_source = p_source,
+         location_set_at        = v_set_at
+   where f.party_id = v_party;
+
+  if not found then
+    -- The trigger should have created this. If it did not, say so instead of
+    -- reporting a successful save of nothing.
+    raise exception 'This account has no farmer profile to save a location into.'
+      using errcode = 'no_data_found';
+  end if;
+
+  insert into public.farmer_search_settings (farmer_id, radius_km, updated_at)
+  values (v_party, v_radius, v_set_at)
+  on conflict (farmer_id) do update
+    set radius_km = excluded.radius_km,
+        updated_at = excluded.updated_at;
+
+  return query
+    select f.default_location_label, f.default_lat, f.default_lon,
+           f.default_location_source, f.location_set_at, v_radius
+    from public.farmer_profiles f
+    where f.party_id = v_party;
+end;
+$$;
+
+comment on function public.farmer_location_save(text, double precision, double precision, text, integer) is
+  'The only path that may set the saved location. Validates coordinates, label and source server-side, and sets location_set_at so the app can say when it was chosen.';
+
+create or replace function public.farmer_location_clear()
+returns boolean
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_party uuid := public.current_party_id();
+begin
+  if v_party is null then
+    raise exception 'Sign in to change your saved location.' using errcode = 'insufficient_privilege';
+  end if;
+
+  update public.farmer_profiles f
+     set default_lat = null,
+         default_lon = null,
+         default_location_label = null,
+         default_location_source = null,
+         location_set_at = null
+   where f.party_id = v_party;
+
+  return found;
+end;
+$$;
+
+-- Reading is available to a guest (it answers "nothing saved"); writing is not,
+-- so the permission error is the server refusing, not the UI hiding a button.
+grant execute on function public.farmer_location_get() to anon, authenticated;
+grant execute on function public.farmer_location_save(text, double precision, double precision, text, integer) to authenticated;
+grant execute on function public.farmer_location_clear() to authenticated;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261003002200_reference_seed.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Farmer App · migration 0022 · the reference set that makes the pipeline visible
+--
+-- The app was structurally complete and visibly empty: zero dealers, zero
+-- listings, zero rates. Every "0 dealers within 10 km" and "No rate today" the
+-- UI showed was therefore correct and useless — there was no way to tell a
+-- working search from a broken one, and no way to walk the chain the PRD cares
+-- about (crop problem → treatment → canonical product → shops listing it).
+--
+-- This seeds that chain. What it deliberately does NOT do is pretend the data is
+-- official:
+--
+--   · Dealers are attributed to `source_system = 'reference_seed'` and left
+--     `sync_state = 'stale'` with a two-day-old `synced_at`. They did not come
+--     from the dealer POS, so a projection-freshness indicator must not claim
+--     they did, and `verified_at` stays NULL because nobody has visited them.
+--
+--   · Rates are attributed to the pre-existing `research_feed` source, whose own
+--     description already says its rows are not authoritative and are served
+--     through the same path precisely so they cannot be mistaken for AMIS data.
+--     AMIS is not credited with a single number here.
+--
+--   · No phone number is invented for a shop. An unlisted number is "unknown",
+--     and a wrong one sends a farmer to a stranger.
+--
+-- Deleting all of it is a one-line change: `delete from public.dealer_profiles
+-- where source_system = 'reference_seed'` cascades to the listings.
+
+-- ---------------------------------------------------------------------------
+-- Dealers
+-- ---------------------------------------------------------------------------
+--
+-- Placed along the Wazirabad–Gujranwala–Sialkot corridor, which is where the
+-- app's default area and the three existing `areas` rows already sit, so the
+-- radius search can be exercised at 5, 10 and 25 km without inventing geometry.
+
+insert into public.dealer_profiles (
+  source_system, source_ref, shop_name, address, lat, lon,
+  verified_at, verification_source, opening_hours,
+  synced_at, sync_state, is_accepting_requests
+)
+values
+  ('reference_seed', 'wazirabad-al-madina',
+   'Al-Madina Agriculture Store', 'Main G.T. Road, Wazirabad', 32.4390, 74.1180,
+   null, 'pending_field_verification', '09:00–19:00 (Mon–Sat)',
+   now() - interval '2 days', 'stale', true),
+
+  ('reference_seed', 'wazirabad-kissan-centre',
+   'Kissan Pesticides & Fertiliser Centre', 'Sabzi Mandi Road, Wazirabad', 32.4470, 74.1080,
+   null, 'pending_field_verification', '08:30–18:30 (Mon–Sat)',
+   now() - interval '2 days', 'stale', true),
+
+  ('reference_seed', 'kot-ladha-chaudhry',
+   'Chaudhry Agri Services', 'Chak Road, Kot Ladha', 32.5150, 74.0500,
+   null, 'pending_field_verification', '09:00–18:00 (Mon–Sat)',
+   now() - interval '3 days', 'stale', true),
+
+  ('reference_seed', 'gujranwala-punjab-seed',
+   'Punjab Seed & Pesticide Centre', 'Kutchery Road, Gujranwala', 32.1900, 74.1900,
+   null, 'pending_field_verification', '09:00–20:00 (Mon–Sat)',
+   now() - interval '2 days', 'stale', true),
+
+  ('reference_seed', 'gujranwala-bashir-sons',
+   'Bashir Sons Agri Traders', 'G.T. Road, Gujranwala', 32.2100, 74.2100,
+   null, 'pending_field_verification', '09:00–19:00 (Mon–Sat)',
+   now() - interval '4 days', 'stale', false),
+
+  ('reference_seed', 'sialkot-agri-mart',
+   'Sialkot Agri Mart', 'Paris Road, Sialkot', 32.4945, 74.5229,
+   null, 'pending_field_verification', '09:30–19:00 (Mon–Sat)',
+   now() - interval '6 days', 'stale', true)
+on conflict (source_system, source_ref) do nothing;
+
+-- ---------------------------------------------------------------------------
+-- Listings
+-- ---------------------------------------------------------------------------
+--
+-- The join that makes a treatment actionable: a canonical product from the
+-- knowledge seed, listed by a shop, with the price the shop reported.
+--
+-- Two of these carry a NULL price and one a NULL stock figure on purpose. The
+-- schema insists NULL is "not reported" and never 0, and the only way that rule
+-- is proven is if a real row exercises it — a listing whose price is genuinely
+-- unquoted must render as unquoted, not as free.
+
+insert into public.dealer_products (
+  dealer_id, source_system, source_ref, name, brand, category,
+  canonical_product_id, pack_size, registration_no,
+  available_qty, unit, unit_price, currency, in_stock, synced_at, sync_state
+)
+select
+  d.id,
+  'reference_seed',
+  v.source_ref,
+  v.name,
+  v.brand,
+  v.category,
+  c.id,
+  v.pack_size,
+  c.registration_no,
+  v.available_qty,
+  'pack',
+  v.unit_price,
+  'PKR',
+  v.in_stock,
+  now() - interval '2 days',
+  'stale'
+from (values
+  ('wazirabad-al-madina',   'wazirabad-al-madina-confidor',   'Confidor 20% SL',        'Bayer',    'insecticide', 'confidor', '100 ml', 24::numeric, 850::numeric, true),
+  ('wazirabad-al-madina',   'wazirabad-al-madina-tilt',      'Tilt 250 EC',            'Syngenta', 'fungicide',   'tilt',     '250 ml', 11::numeric, 1450::numeric, true),
+  ('wazirabad-kissan-centre','wazirabad-kissan-confidor',    'Confidor 20% SL',        'Bayer',    'insecticide', 'confidor', '250 ml',  6::numeric, 1980::numeric, true),
+  ('wazirabad-kissan-centre','wazirabad-kissan-roundup',     'Roundup',                'Bayer',    'herbicide',   'roundup',  '1 litre', null::numeric, null::numeric, null),
+  ('kot-ladha-chaudhry',    'kot-ladha-tilt',                'Tilt 250 EC',            'Syngenta', 'fungicide',   'tilt',     '250 ml',  4::numeric, 1495::numeric, true),
+  ('gujranwala-punjab-seed','gujranwala-punjab-roundup',     'Roundup',                'Bayer',    'herbicide',   'roundup',  '500 ml', 30::numeric, 760::numeric, true),
+  ('gujranwala-punjab-seed','gujranwala-punjab-confidor',    'Confidor 20% SL',        'Bayer',    'insecticide', 'confidor', '100 ml', 18::numeric, 880::numeric, true),
+  ('gujranwala-bashir-sons','gujranwala-bashir-tilt',        'Tilt 250 EC',            'Syngenta', 'fungicide',   'tilt',     '250 ml',  0::numeric, 1520::numeric, false),
+  ('sialkot-agri-mart',     'sialkot-agri-mart-roundup',     'Roundup',                'Bayer',    'herbicide',   'roundup',  '1 litre',  9::numeric, 1380::numeric, true),
+  ('sialkot-agri-mart',     'sialkot-agri-mart-tilt',        'Tilt 250 EC',            'Syngenta', 'fungicide',   'tilt',     '250 ml', null::numeric, null::numeric, true)
+) as v(dealer_ref, source_ref, name, brand, category, product_slug, pack_size, available_qty, unit_price, in_stock)
+join public.dealer_profiles d
+  on d.source_system = 'reference_seed' and d.source_ref = v.dealer_ref
+join public.canonical_products c on c.slug = v.product_slug
+on conflict (dealer_id, source_system, source_ref) do nothing;
+
+-- ---------------------------------------------------------------------------
+-- Rates
+-- ---------------------------------------------------------------------------
+--
+-- Dated with `current_date` rather than a fixed day, because a rate that is
+-- always "yesterday" is not a useful fixture for testing the freshness rules —
+-- the app must be able to show a recent rate as recent and the schema's 36-hour
+-- window has to mean something. The `raw` column carries the disclosure that
+-- travels with the row.
+
+insert into public.market_observations (
+  source_code, commodity_code, market_name, district, observed_on,
+  min_price, max_price, modal_price, currency, unit, arrivals_tonnes, raw
+)
+values
+  ('research_feed', 'wheat',  'Gujranwala Mandi', 'Gujranwala', current_date, 3850, 4050, 3950, 'PKR', '40kg', 118.5,
+   '{"seed":"reference","note":"Illustrative row for pipeline verification. Not an official release and not an AMIS figure."}'::jsonb),
+
+  ('research_feed', 'wheat',  'Wazirabad Mandi',  'Gujranwala', current_date, 3820, 4020, 3920, 'PKR', '40kg', 42.0,
+   '{"seed":"reference","note":"Illustrative row for pipeline verification. Not an official release and not an AMIS figure."}'::jsonb),
+
+  ('research_feed', 'cotton', 'Sialkot Mandi',    'Sialkot',    current_date, 8300, 8700, 8500, 'PKR', '40kg', null,
+   '{"seed":"reference","note":"Illustrative row for pipeline verification. Not an official release and not an AMIS figure."}'::jsonb),
+
+  ('research_feed', 'rice',   'Gujranwala Mandi', 'Gujranwala', current_date, 3600, 3800, 3700, 'PKR', '40kg', 65.5,
+   '{"seed":"reference","note":"Illustrative row for pipeline verification. Not an official release and not an AMIS figure."}'::jsonb),
+
+  ('research_feed', 'maize',  'Wazirabad Mandi',  'Gujranwala', current_date, 2100, 2300, 2200, 'PKR', '40kg', 12.0,
+   '{"seed":"reference","note":"Illustrative row for pipeline verification. Not an official release and not an AMIS figure."}'::jsonb)
+on conflict (source_code, commodity_code, market_name, observed_on) do nothing;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261003002300_client_document_isolation.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Farmer App · migration 0023 · client document isolation and chat
+--
+-- Two corrections to the client-document layer (migration 0015), both found
+-- while reproducing a real cross-user leak on a shared phone.
+--
+-- 1. `client_document_get` was `security definer` and granted to every signed-in
+--    user, but it never checked that the caller *was* the owner it was asking
+--    about. Any authenticated client could read any party's document by passing
+--    a different `p_owner_id` — the read side of the leak. `put` and `delete`
+--    already refuse a foreign owner; `get` now refuses it the same way.
+--
+-- 2. `chat` was missing from the collection check, which the stores have been
+--    writing since conversations moved behind the repository. Every chat write
+--    was rejected by the constraint, so dealer messages never reached the
+--    backend at all — the queue just kept retrying. It is added here.
+--
+-- Nothing about the document shapes changes; this is a permission and a
+-- constraint, applied on the side that must be able to enforce them.
+
+-- 1. The read is the caller's own document or nothing.
+create or replace function public.client_document_get(
+  p_owner_id   uuid,
+  p_collection text
+)
+returns table (document jsonb, doc_version integer, revision bigint, updated_at timestamptz)
+language plpgsql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  -- A client may only ever read its own document, whatever it passes as a
+  -- parameter. Without this, the function is an oracle for every party's
+  -- private documents to anyone who can guess a uuid.
+  if p_owner_id is distinct from public.current_party_id() then
+    raise exception 'A client may only read its own documents.' using errcode = 'insufficient_privilege';
+  end if;
+
+  return query
+    select d.document, d.doc_version, d.revision, d.updated_at
+    from public.client_documents d
+    where d.owner_id = p_owner_id
+      and d.collection = p_collection;
+end;
+$$;
+
+-- 2. The collections the client actually owns. `chat` was missing.
+alter table public.client_documents
+  drop constraint if exists client_documents_collection_check;
+
+alter table public.client_documents
+  add constraint client_documents_collection_check check (collection in (
+    'session', 'credit', 'visits', 'insights', 'community', 'chat', 'crops', 'media', 'preferences'
+  ));
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261003002400_client_document_put_upsert.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Farmer App · migration 0024 · the document write path, made to actually update
+--
+-- WHAT WAS WRONG
+--
+-- `client_document_put` (migration 0015) tried to be an upsert by hand:
+--
+--     select * into v_current ... for update;
+--     if found then <update>; return next; end if;
+--     insert ... ;
+--
+-- `RETURN NEXT` is not `RETURN`. In a set-returning function it *appends a row
+-- and continues executing*, which is what it is for — and here it meant the
+-- update branch ran, emitted its row, and then fell straight through into the
+-- insert below it. That insert used the same primary key the update had just
+-- written, so the whole statement failed:
+--
+--     409  duplicate key value violates unique constraint "client_documents_pkey"
+--
+-- and the transaction rolled back, taking the update with it. `revision` never
+-- advanced past 1 and `updated_at` never moved: cloud sync was write-once per
+-- collection, per farmer. The client's queue read the 409 as a transient
+-- failure and retried forever, so a signed-in farmer saw a permanent "waiting to
+-- save" badge while their server copy stayed frozen at its first version.
+--
+-- Proven, not inferred. Reproduced against a local PostgreSQL 17 with this
+-- repository's own SQL bytes: an instrumented build of the 0015 function prints
+-- `found=t`, then `taking the UPDATE branch`, then `taking the INSERT branch`,
+-- and finally the duplicate key. The production behaviour was identical,
+-- including the SQLSTATE — which also settles that the deployed function *is*
+-- the 0015 body rather than a hand-edited variant.
+--
+-- WHAT THIS DOES INSTEAD
+--
+-- The same operation, expressed so that no branch can be skipped and there is
+-- exactly one exit: an UPDATE first, an INSERT only when the UPDATE matched
+-- nothing, and a single `return next` at the very end — never one that has to
+-- stop the function, because it cannot. Both statements use FOUND, which
+-- PostgreSQL defines for UPDATE and for INSERT, and the caller's
+-- optimistic-concurrency token is part of the UPDATE's own predicate rather
+-- than a check that has to be reached.
+--
+--   · row exists, revision accepted   → UPDATE, revision + 1
+--   · row exists, revision refused    → UPDATE matches nothing, the INSERT is
+--                                       refused by the primary key, and the
+--                                       caller is told the document changed
+--                                       (SQLSTATE 40001, which the client can
+--                                       tell apart from a network failure)
+--   · row does not exist              → INSERT, revision 1
+--
+-- `updated_at` is set by the existing `client_documents_touch` trigger on
+-- UPDATE and by the column default on INSERT, so this function does not touch
+-- it — one writer for one column.
+--
+-- The ownership guard is unchanged and still first: a client may only ever
+-- write its own document, whatever it passes as a parameter. Everything else
+-- about the table — the collection list, RLS, the grants — is untouched.
+
+create or replace function public.client_document_put(
+  p_owner_id          uuid,
+  p_collection        text,
+  p_document          jsonb,
+  p_expected_revision bigint default null,
+  p_doc_version       integer default 1
+)
+returns table (revision bigint, updated_at timestamptz)
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_revision   bigint;
+  v_updated_at timestamptz;
+begin
+  -- A client may only write its own document, whatever it passes as a parameter.
+  if p_owner_id is distinct from public.current_party_id() then
+    raise exception 'A client may only write its own documents.' using errcode = 'insufficient_privilege';
+  end if;
+
+  /*
+   * The expected revision is a predicate, not a check.
+   *
+   * `p_expected_revision is null` means "I am not tracking a revision" — the
+   * stores are single-device today, which is why the client sends null. A
+   * caller that *is* tracking one gets a real compare-and-set.
+   */
+  update public.client_documents
+     set document    = p_document,
+         doc_version = p_doc_version,
+         revision    = client_documents.revision + 1
+   where owner_id = p_owner_id
+     and collection = p_collection
+     and (p_expected_revision is null or client_documents.revision = p_expected_revision)
+  returning client_documents.revision, client_documents.updated_at
+       into v_revision, v_updated_at;
+
+  if not found then
+    /*
+     * Nothing was updated. Two reasons, and the primary key tells them apart:
+     * the document does not exist yet (insert it), or it exists and the
+     * caller's revision was stale (the insert below is refused, and we say so).
+     */
+    insert into public.client_documents (owner_id, collection, document, doc_version)
+    values (p_owner_id, p_collection, p_document, p_doc_version)
+    on conflict (owner_id, collection) do nothing
+    returning client_documents.revision, client_documents.updated_at
+         into v_revision, v_updated_at;
+
+    if not found then
+      /*
+       * The document exists and the caller's revision is not the current one —
+       * or another device inserted it between the two statements. Either way
+       * the write is refused rather than silently clobbering, and the caller
+       * is told which case by the word "changed": it re-reads and writes again
+       * with the revision it just learned.
+       */
+      raise exception 'Document % for % changed on another device.', p_collection, p_owner_id
+        using errcode = 'serialization_failure';
+    end if;
+  end if;
+
+  revision := v_revision;
+  updated_at := v_updated_at;
+  return next;
+end;
+$$;
+
+comment on function public.client_document_put(uuid, text, jsonb, bigint, integer) is
+  'Writes one client document and advances its revision. A stale p_expected_revision is refused with SQLSTATE 40001 rather than overwriting another device.';
+
+grant execute on function public.client_document_put(uuid, text, jsonb, bigint, integer) to authenticated;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261013052504_user_exists_by_contact.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Farmer App · read-only contact lookup for the sign-in sheet
+--
+-- The sheet asks, before asking for a password: does an account already exist for
+-- this contact (phone number or email)? The answer decides which of the two steps
+-- the farmer sees next — "enter your password" for a known contact, "your name and
+-- a password" for a new one — and it has to be right, because the wrong answer
+-- tells a returning farmer their account does not exist.
+--
+-- There is no client-side way to answer it honestly. Supabase Auth gives the
+-- client no "get user by email/phone" read, and `signInWithPassword` cannot tell
+-- "the user exists but typed the wrong password" from "the user does not exist" —
+-- both come back as `invalid_credentials`.
+--
+-- So the lookup is server-side. It is a security definer, like `ensure_party()`,
+-- because `auth.users` is readable only by the service role. It reads that table
+-- and returns one boolean; it never returns a row, a name or an id, and it is
+-- read-only — it creates and changes nothing.
+--
+-- Honesty rule: this is *not* a user-listing endpoint. One contact in, one boolean
+-- out. Anything broader would let a client enumerate accounts, which the PRD
+-- forbids.
+
+create or replace function public.user_exists_by_contact(p_contact text)
+returns boolean
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_contact text;
+  v_digits  text;
+begin
+  if p_contact is null or btrim(p_contact) = '' then
+    return false;
+  end if;
+
+  v_contact := btrim(p_contact);
+
+  -- Email path: auth.users stores the address lowercased, so match the same way.
+  if v_contact ~* '^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]{2,}$' then
+    return exists (
+      select 1 from auth.users
+      where lower(email) = lower(v_contact)
+      limit 1
+    );
+  end if;
+
+  -- Phone path: compare digits only, so the app can pass the national form it
+  -- asks the farmer for (`03001234567`) while the row holds `+923001234567`.
+  if v_contact ~* '^\+?[0-9]+$' then
+    v_digits := regexp_replace(v_contact, '\D', '', 'g');
+    /*
+     * `03001234567` and `923001234567` are the same number. The trailing-9 match
+     * compares the last ten digits, which is what both forms share, and is narrow
+     * enough that two different numbers cannot collide on it.
+     */
+    return exists (
+      select 1 from auth.users
+      where length(regexp_replace(coalesce(phone, ''), '\D', '', 'g')) >= 10
+        and right(regexp_replace(coalesce(phone, ''), '\D', '', 'g'), 10)
+            = right(v_digits, 10)
+      limit 1
+    );
+  end if;
+
+  return false;
+end;
+$$;
+
+comment on function public.user_exists_by_contact(text) is
+  'Read-only, security-definer lookup of whether an auth.user exists for a given contact (email or phone digits). Used by the sign-in sheet before it asks for a password. Returns one boolean, never a list.';
+
+-- Anonymous callers can reach the sheet, so both roles need execute; the function
+-- itself leaks nothing beyond a yes/no for a contact the caller already typed.
+grant execute on function public.user_exists_by_contact(text) to authenticated;
+grant execute on function public.user_exists_by_contact(text) to anon;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261014000000_crop_intelligence.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Farmer App · migration 0025 · crop intelligence: dynamic-radius local feed
+--
+-- Brief §2 + §5, first backend slice. No hardcoded 10km: radius is a validated
+-- metres parameter (1..500000) and directly controls ST_DWithin eligibility.
+-- Larger radius includes more rows; it never raises severity/confidence.
+--
+-- Reuses: extensions.geography + GiST pattern from dealers_within_radius,
+-- crop_catalog for crop scope, recommendations/farmer_insight_feed as the
+-- canonical advice surface (this feed returns observations/advisories, it does
+-- not duplicate recommendations).
+
+-- ---------------------------------------------------------------------------
+-- Source registry (brief §5: source data stays separate + provenance)
+-- ---------------------------------------------------------------------------
+create table public.intel_sources (
+  code text primary key,
+  name text not null,
+  kind text not null check (kind in ('farmer_report', 'expert', 'official_advisory', 'forecast_risk', 'market_feed', 'weather_feed', 'soil_feed', 'stats_feed')),
+  endpoint_url text,
+  license text,
+  commercial_ok boolean,
+  coverage text,
+  update_cadence text,
+  access_method text not null default 'manual_csv' check (access_method in ('api', 'manual_csv', 'platform', 'dashboard_doc')),
+  status text not null default 'manual_import' check (status in ('verified_api', 'manual_import', 'needs_permission', 'unavailable')),
+  notes text,
+  is_active boolean not null default true,
+  created_at timestamptz not null default now()
+);
+
+comment on table public.intel_sources is
+  'Registry of every upstream the intelligence feed may cite. A visible page is not an API: status stays manual_import until endpoint + license are verified.';
+
+insert into public.intel_sources (code, name, kind, license, commercial_ok, coverage, update_cadence, access_method, status, notes) values
+  ('platform_reports', 'Farmer reports (this app)', 'farmer_report', 'platform terms', true, 'per-report location', 'event-driven', 'platform', 'verified_api', 'First-party observations collected by community_create_post path; evidence=farmer_report until verified.'),
+  ('expert_network', 'Expert verifications', 'expert', 'platform terms', true, 'per-report location', 'event-driven', 'platform', 'verified_api', 'Uses expert_verifications badge; evidence=expert_verified only after grant_expert_verification.'),
+  ('open_meteo', 'Open-Meteo forecast/history', 'forecast_risk', 'CC BY 4.0 data; free API non-commercial only', false, 'global incl. Pakistan, 16-day forecast, ERA5 history', 'model-dependent', 'api', 'needs_permission', 'Free tier is non-commercial: budget paid plan for production or choose another vendor. Used only for forecast_risk, never as outbreak proof.'),
+  ('nasa_power', 'NASA POWER agroclimatology', 'weather_feed', 'CC BY 4.0', true, 'global incl. Pakistan, daily from 1981', '2-7 day latency', 'api', 'verified_api', 'Best free commercial-safe history source. Point API max 20 params; avoid >5 concurrent.'),
+  ('soilgrids', 'ISRIC SoilGrids 250m', 'soil_feed', 'CC BY 4.0 maps; REST API paused', true, 'global incl. Pakistan, static maps', 'irregular model releases', 'api', 'unavailable', 'REST paused: use WCS/WebDAV + cache. Never infer field precision from district.'),
+  ('pbs_stats', 'Pakistan Bureau of Statistics agriculture', 'stats_feed', 'PBS dissemination policy, confirm per-product tier', true, 'national/province/district, 121 crops on dashboard', 'seasonal Rabi/Kharif', 'dashboard_doc', 'manual_import', 'Publications mostly PDF; no verified crop API. Manual CSV import path.'),
+  ('amis_punjab', 'AMIS Punjab market rates', 'market_feed', 'unconfirmed: seek permission', false, 'Punjab mandis (list unconfirmed)', 'daily (unconfirmed)', 'dashboard_doc', 'needs_permission', 'amis.pk pages verified as pages only; no documented public API. Never scrape without permission.'),
+  ('punjab_advisory', 'Punjab Agriculture crop advisories', 'official_advisory', 'unconfirmed: seek permission', false, 'Punjab districts (unconfirmed)', 'irregular', 'dashboard_doc', 'needs_permission', 'agripunjab.gov.pk/crop_advisory unreachable from research network; treat as manual import.');
+
+-- ---------------------------------------------------------------------------
+-- Crop reports: farmer + expert observations with geography
+-- ---------------------------------------------------------------------------
+create table public.crop_reports (
+  id uuid primary key default gen_random_uuid(),
+  reporter_id uuid references public.parties (id) on delete set null,
+  crop_code text references public.crop_catalog (code),
+  topic text not null check (topic in ('pest', 'disease', 'weed', 'water', 'weather_damage', 'other')),
+  title text not null check (length(btrim(title)) between 1 and 200),
+  body text not null check (length(btrim(body)) between 1 and 4000),
+  evidence text not null default 'farmer_report' check (evidence in ('farmer_report', 'expert_verified', 'official_advisory', 'forecast_risk')),
+  status text not null default 'published' check (status in ('pending', 'published', 'rejected')),
+  visibility text not null default 'public' check (visibility in ('public', 'hidden')),
+  -- Approximate location only. Clients must round before insert; the feed never
+  -- returns lat/lon, only distance_m + area_label.
+  geog extensions.geography(Point, 4326) not null,
+  area_label text not null,
+  district text,
+  cluster_id uuid,
+  observed_at timestamptz not null default now(),
+  expires_at timestamptz not null default now() + interval '21 days',
+  source_code text not null default 'platform_reports' references public.intel_sources (code),
+  source_ref text,
+  idempotency_key text,
+  created_at timestamptz not null default now(),
+  constraint crop_reports_expiry check (expires_at > observed_at)
+);
+
+create index crop_reports_geog_idx on public.crop_reports using gist (geog)
+  where status = 'published' and visibility = 'public';
+create index crop_reports_crop_time_idx on public.crop_reports (crop_code, observed_at desc)
+  where status = 'published' and visibility = 'public';
+create unique index crop_reports_idempotency_idx on public.crop_reports (reporter_id, idempotency_key)
+  where idempotency_key is not null;
+
+comment on column public.crop_reports.geog is
+  'Approximate report location (~village cell, never the exact field). Feed returns distance + area_label only.';
+
+-- ---------------------------------------------------------------------------
+-- Official advisories: district/region scope, never pinned to farmer coords
+-- ---------------------------------------------------------------------------
+create table public.agri_advisories (
+  id uuid primary key default gen_random_uuid(),
+  title text not null,
+  summary text not null,
+  crop_code text references public.crop_catalog (code),
+  topic text not null check (topic in ('pest', 'disease', 'weed', 'water', 'weather_damage', 'sowing', 'other')),
+  district text,
+  area_label text not null,
+  geog extensions.geography(Point, 4326),
+  source_code text not null default 'punjab_advisory' references public.intel_sources (code),
+  source_ref text,
+  source_url text,
+  published_at timestamptz not null default now(),
+  valid_until timestamptz,
+  is_active boolean not null default true,
+  created_at timestamptz not null default now(),
+  constraint agri_advisories_validity check (valid_until is null or valid_until > published_at)
+);
+
+create index agri_advisories_geog_idx on public.agri_advisories using gist (geog)
+  where is_active;
+create index agri_advisories_crop_time_idx on public.agri_advisories (crop_code, published_at desc)
+  where is_active;
+
+comment on table public.agri_advisories is
+  'Official advisories are regional. A district advisory is served as regional fallback, never as a point at the farmer location.';
+
+-- ---------------------------------------------------------------------------
+-- RLS: public read paths stay honest; writes go through guarded functions
+-- ---------------------------------------------------------------------------
+alter table public.intel_sources enable row level security;
+alter table public.crop_reports enable row level security;
+alter table public.agri_advisories enable row level security;
+
+create policy intel_sources_read on public.intel_sources
+  for select to anon, authenticated using (is_active);
+
+-- Guests read published public rows; exact coords are never selected by the
+-- feed function, and direct select exposes area_label only via the feed.
+-- This policy keeps direct reads to live rows; the feed remains the product path.
+create policy crop_reports_read on public.crop_reports
+  for select to anon, authenticated
+  using (status = 'published' and visibility = 'public' and expires_at > now());
+
+create policy agri_advisories_read on public.agri_advisories
+  for select to anon, authenticated
+  using (is_active and (valid_until is null or valid_until > now()));
+
+revoke insert, update, delete on public.intel_sources from authenticated;
+revoke insert, update, delete on public.crop_reports from authenticated;
+revoke insert, update, delete on public.agri_advisories from authenticated;
+
+-- ---------------------------------------------------------------------------
+-- Submit a report: approximate location required, idempotent, never exact
+-- ---------------------------------------------------------------------------
+create or replace function public.submit_crop_report(
+  p_reporter_id uuid,
+  p_crop_code text,
+  p_topic text,
+  p_title text,
+  p_body text,
+  p_lat double precision,
+  p_lon double precision,
+  p_area_label text,
+  p_district text default null,
+  p_observed_at timestamptz default null,
+  p_idempotency_key text default null
+)
+returns public.crop_reports
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_report public.crop_reports;
+  v_lat double precision;
+  v_lon double precision;
+begin
+  if p_reporter_id is null then
+    raise exception 'Reporting requires an identified farmer.' using errcode = 'insufficient_privilege';
+  end if;
+  if p_lat is null or p_lat < -90 or p_lat > 90 or p_lon is null or p_lon < -180 or p_lon > 180 then
+    raise exception 'Invalid report location.' using errcode = 'check_violation';
+  end if;
+  if coalesce(btrim(p_area_label), '') = '' then
+    raise exception 'An approximate area label is required; exact field locations are never stored.' using errcode = 'check_violation';
+  end if;
+  -- Round to ~1.1km cell so the stored point is approximate by construction.
+  v_lat := round(p_lat::numeric, 2)::double precision;
+  v_lon := round(p_lon::numeric, 2)::double precision;
+
+  insert into public.crop_reports (
+    reporter_id, crop_code, topic, title, body, evidence, status, visibility,
+    geog, area_label, district, observed_at, source_code, idempotency_key
+  ) values (
+    p_reporter_id, p_crop_code, p_topic, btrim(p_title), btrim(p_body),
+    'farmer_report', 'published', 'public',
+    extensions.ST_SetSRID(extensions.ST_MakePoint(v_lon, v_lat), 4326)::extensions.geography,
+    btrim(p_area_label), p_district, coalesce(p_observed_at, now()), 'platform_reports', p_idempotency_key
+  )
+  returning * into v_report;
+  return v_report;
+exception
+  when unique_violation then
+    select * into v_report from public.crop_reports
+     where reporter_id = p_reporter_id and idempotency_key = p_idempotency_key;
+    if found then return v_report; end if;
+    raise;
+end;
+$$;
+
+comment on function public.submit_crop_report(uuid, text, text, text, text, double precision, double precision, text, text, timestamptz, text) is
+  'Farmer report intake. Rounds coords to 2 decimals (approximate cell), labels evidence farmer_report, idempotent on (reporter, key).';
+
+-- ---------------------------------------------------------------------------
+-- Dynamic-radius local feed: radius in METRES drives ST_DWithin directly
+-- ---------------------------------------------------------------------------
+create or replace function public.intel_feed(
+  p_lat double precision,
+  p_lon double precision,
+  p_radius_m double precision default 10000,
+  p_crop_code text default null,
+  p_topic text default null,
+  p_limit integer default 20
+)
+returns table (
+  id uuid,
+  kind text,
+  title text,
+  summary text,
+  crop_code text,
+  topic text,
+  evidence text,
+  area_label text,
+  district text,
+  observed_at timestamptz,
+  valid_until timestamptz,
+  distance_m double precision,
+  source_code text
+)
+language plpgsql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_origin extensions.geography;
+begin
+  if p_lat is null or p_lat < -90 or p_lat > 90 or p_lon is null or p_lon < -180 or p_lon > 180 then
+    raise exception 'Invalid origin: lat/lon required.' using errcode = 'check_violation';
+  end if;
+  -- Brief §2: 8km/10km/100km/500km examples; metres stored + validated.
+  if p_radius_m is null or p_radius_m < 1 or p_radius_m > 500000 then
+    raise exception 'Radius must be between 1 and 500000 metres.' using errcode = 'check_violation';
+  end if;
+
+  v_origin := extensions.ST_SetSRID(extensions.ST_MakePoint(p_lon, p_lat), 4326)::extensions.geography;
+
+  return query
+  with reports as (
+    select
+      r.id, 'report'::text as kind, r.title, r.body as summary, r.crop_code, r.topic,
+      r.evidence, r.area_label, r.district, r.observed_at, r.expires_at as valid_until,
+      extensions.ST_Distance(r.geog, v_origin) as distance_m, r.source_code, r.cluster_id,
+      r.observed_at as sort_at,
+      row_number() over (
+        partition by coalesce(r.cluster_id, r.id)
+        order by case when r.evidence = 'expert_verified' then 0 else 1 end, r.observed_at desc, r.id
+      ) as dup_rank
+    from public.crop_reports r
+    where r.status = 'published'
+      and r.visibility = 'public'
+      and r.observed_at <= now()
+      and r.expires_at > now()
+      and (p_crop_code is null or r.crop_code = p_crop_code or r.crop_code is null)
+      and (p_topic is null or r.topic = p_topic)
+      and extensions.ST_DWithin(r.geog, v_origin, p_radius_m)
+  ),
+  advisories as (
+    -- Regional rows: included when their point (if any) is in radius OR when
+    -- they carry no point (district scope) as honest fallback, labelled advisory.
+    select
+      a.id, 'advisory'::text as kind, a.title, a.summary, a.crop_code, a.topic,
+      'official_advisory'::text as evidence, a.area_label, a.district, a.published_at as observed_at,
+      a.valid_until, null::double precision as distance_m, a.source_code, null::uuid as cluster_id,
+      a.published_at as sort_at, 1 as dup_rank
+    from public.agri_advisories a
+    where a.is_active
+      and a.published_at <= now()
+      and (a.valid_until is null or a.valid_until > now())
+      and (p_crop_code is null or a.crop_code = p_crop_code or a.crop_code is null)
+      and (p_topic is null or a.topic = p_topic)
+      and (a.geog is null or extensions.ST_DWithin(a.geog, v_origin, p_radius_m))
+  )
+  select c.id, c.kind, c.title, c.summary, c.crop_code, c.topic, c.evidence,
+         c.area_label, c.district, c.observed_at, c.valid_until, c.distance_m, c.source_code
+  from (select * from reports where dup_rank = 1 union all select * from advisories) c
+  -- Radius changes eligibility only; severity/confidence are never derived here.
+  order by c.sort_at desc, c.id
+  limit greatest(1, least(coalesce(p_limit, 20), 100));
+end;
+$$;
+
+comment on function public.intel_feed(double precision, double precision, double precision, text, text, integer) is
+  'Dynamic-radius local intelligence. p_radius_m (metres) is the ST_DWithin argument; dedupes by cluster (verified, newest wins); expires at read time; returns distance + area_label, never coordinates.';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261015000000_dgkhan_intake.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Farmer App · migration 0026 · DG Khan intake: districts, climate, import runs
+--
+-- Step 1 of the Crop Intelligence build (DG Khan division pilot). No invented
+-- endpoints: districts are reference data with headquarters coordinates from
+-- public gazetteers; climate_observations stores normalised NASA POWER /
+-- Open-Meteo district history written by the climate-ingest function; the two
+-- run tables record every ingestion attempt so a failed fetch is visible rather
+-- than silent. Nothing here claims a live AMIS or advisory API exists.
+
+-- ---------------------------------------------------------------------------
+-- Districts (DG Khan division pilot)
+-- ---------------------------------------------------------------------------
+
+create table public.districts (
+  code text primary key,
+  name_en text not null,
+  name_ur text not null,
+  division text not null,
+  province text not null default 'Punjab',
+  hq_lat double precision not null check (hq_lat between -90 and 90),
+  hq_lon double precision not null check (hq_lon between -180 and 180),
+  is_active boolean not null default true
+);
+
+comment on table public.districts is
+  'Reference districts for the intelligence pilot. Coordinates are headquarters cities (approximate fetch points), never farm locations.';
+
+insert into public.districts (code, name_en, name_ur, division, hq_lat, hq_lon) values
+  ('dera_ghazi_khan', 'Dera Ghazi Khan', 'ڈیرہ غازی خان', 'Dera Ghazi Khan', 30.0325, 70.6402),
+  ('taunsa',          'Taunsa',          'تونسہ',        'Dera Ghazi Khan', 30.7056, 70.6578),
+  ('rajanpur',        'Rajanpur',        'راجن پور',     'Dera Ghazi Khan', 29.1038, 70.3202),
+  ('layyah',          'Layyah',          'لیہ',          'Dera Ghazi Khan', 30.9648, 70.9399),
+  ('muzaffargarh',    'Muzaffargarh',    'مظفر گڑھ',     'Dera Ghazi Khan', 30.0744, 71.1847),
+  ('kot_addu',        'Kot Addu',        'کوٹ ادو',       'Dera Ghazi Khan', 30.4667, 70.9667)
+on conflict (code) do nothing;
+
+-- ---------------------------------------------------------------------------
+-- The climate provider, registered before anything references it
+-- ---------------------------------------------------------------------------
+
+-- `climate_observations.provider_code` is a foreign key into the provider
+-- registry, and NASA POWER was not in it: the registry was seeded with the
+-- current-conditions vendors only, and the history source is a different kind of
+-- provider — keyless, licensed CC BY 4.0, and carrying an attribution obligation
+-- rather than a secret. Registered here, with the attribution the licence
+-- requires, rather than relaxing the constraint to let an unknown code through.
+insert into public.weather_providers (
+  code, name, is_initial_candidate, requires_api_key, attribution, notes
+) values (
+  'nasa_power',
+  'NASA POWER agroclimatology',
+  false,
+  false,
+  'NASA POWER (NASA Langley Research Center) — data provided by the POWER Project, CC BY 4.0',
+  'Keyless daily district history from 1981, used for climate features rather than current conditions. NASA asks for no more than ~5 concurrent requests; the ingest function makes one per call.'
+)
+on conflict (code) do nothing;
+
+-- ---------------------------------------------------------------------------
+-- Climate observations (district history, normalised)
+-- ---------------------------------------------------------------------------
+
+-- One row per provider, district and day. Missing values stay NULL: a day the
+-- vendor did not report is not a day of zero rain.
+create table public.climate_observations (
+  id bigserial primary key,
+  provider_code text not null references public.weather_providers (code),
+  district_code text not null references public.districts (code),
+  observed_on date not null,
+  tmax_c numeric,
+  tmin_c numeric,
+  precip_mm numeric check (precip_mm is null or precip_mm >= 0),
+  humidity_pct numeric check (humidity_pct is null or (humidity_pct between 0 and 100)),
+  wind_kph numeric check (wind_kph is null or wind_kph >= 0),
+  raw jsonb not null default '{}'::jsonb,
+  ingested_at timestamptz not null default now(),
+  run_id bigint,
+  unique (provider_code, district_code, observed_on)
+);
+
+create index climate_observations_lookup_idx
+  on public.climate_observations (district_code, observed_on desc);
+
+comment on table public.climate_observations is
+  'District climate history for suitability and risk features. Re-pulling a range upserts rather than duplicating, so a re-run is safe.';
+
+create table public.climate_ingestion_runs (
+  id bigserial primary key,
+  provider_code text not null references public.weather_providers (code),
+  district_code text references public.districts (code),
+  range_start date,
+  range_end date,
+  started_at timestamptz not null default now(),
+  finished_at timestamptz,
+  status text not null default 'running' check (status in ('running', 'ok', 'partial', 'failed')),
+  rows_seen integer not null default 0,
+  rows_written integer not null default 0,
+  error text
+);
+
+comment on table public.climate_ingestion_runs is
+  'Every climate pull is recorded. A district with no rows and no failed run was never attempted; one with a failed run is known-broken.';
+
+-- ---------------------------------------------------------------------------
+-- Advisory import runs (automated attempts, honestly recorded)
+-- ---------------------------------------------------------------------------
+
+create table public.advisory_import_runs (
+  id bigserial primary key,
+  source_code text not null references public.intel_sources (code),
+  started_at timestamptz not null default now(),
+  finished_at timestamptz,
+  status text not null default 'running' check (status in ('running', 'ok', 'partial', 'failed')),
+  rows_seen integer not null default 0,
+  rows_written integer not null default 0,
+  rows_rejected integer not null default 0,
+  error text
+);
+
+comment on table public.advisory_import_runs is
+  'Every advisory fetch attempt is recorded, including failures. A missing machine-readable feed is a failed run with a reason, never silently empty.';
+
+-- ---------------------------------------------------------------------------
+-- RLS: public reads, server-only writes
+-- ---------------------------------------------------------------------------
+
+alter table public.districts enable row level security;
+alter table public.climate_observations enable row level security;
+alter table public.climate_ingestion_runs enable row level security;
+alter table public.advisory_import_runs enable row level security;
+
+create policy districts_read on public.districts
+  for select to anon, authenticated using (is_active);
+
+create policy climate_observations_read on public.climate_observations
+  for select to anon, authenticated using (true);
+
+create policy climate_runs_read on public.climate_ingestion_runs
+  for select to authenticated using (true);
+
+create policy advisory_runs_read on public.advisory_import_runs
+  for select to authenticated using (true);
+
+revoke insert, update, delete on public.districts from authenticated;
+revoke insert, update, delete on public.climate_observations from authenticated;
+revoke insert, update, delete on public.climate_ingestion_runs from authenticated;
+revoke insert, update, delete on public.advisory_import_runs from authenticated;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261015000100_crop_report_intake_guard.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Farmer App · migration 0027 · field-report intake: the author comes from the
+-- session, not from the request body
+--
+-- `submit_crop_report` shipped in 0025 taking `p_reporter_id uuid`. That is a
+-- client-supplied identity in a `security definer` function, and it means any
+-- caller holding the anon key could file a report *as* another farmer — the
+-- exact thing a traceable report cannot allow, and the reason every other write
+-- in this chain derives its actor from `auth.uid()`.
+--
+-- The body is otherwise unchanged: same validation, same two-decimal rounding,
+-- same idempotency on (reporter, key). What changes is where the reporter comes
+-- from, and who may call it.
+
+-- The old signature is dropped, not left beside the new one: an overload nobody
+-- calls is still an overload an attacker can call.
+drop function if exists public.submit_crop_report(
+  uuid, text, text, text, text, double precision, double precision, text, text, timestamptz, text
+);
+
+create or replace function public.submit_crop_report(
+  p_crop_code text,
+  p_topic text,
+  p_title text,
+  p_body text,
+  p_lat double precision,
+  p_lon double precision,
+  p_area_label text,
+  p_district text default null,
+  p_observed_at timestamptz default null,
+  p_idempotency_key text default null
+)
+returns public.crop_reports
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_report public.crop_reports;
+  v_reporter uuid;
+  v_lat double precision;
+  v_lon double precision;
+begin
+  -- The actor is the session's party. A guest has none, and is told so rather
+  -- than silently filing an anonymous report.
+  v_reporter := public.current_party_id();
+  if v_reporter is null then
+    raise exception 'Reporting requires an identified farmer.' using errcode = 'insufficient_privilege';
+  end if;
+  if p_lat is null or p_lat < -90 or p_lat > 90 or p_lon is null or p_lon < -180 or p_lon > 180 then
+    raise exception 'Invalid report location.' using errcode = 'check_violation';
+  end if;
+  if coalesce(btrim(p_area_label), '') = '' then
+    raise exception 'An approximate area label is required; exact field locations are never stored.' using errcode = 'check_violation';
+  end if;
+  -- Round to ~1.1km cell so the stored point is approximate by construction.
+  v_lat := round(p_lat::numeric, 2)::double precision;
+  v_lon := round(p_lon::numeric, 2)::double precision;
+
+  insert into public.crop_reports (
+    reporter_id, crop_code, topic, title, body, evidence, status, visibility,
+    geog, area_label, district, observed_at, source_code, idempotency_key
+  ) values (
+    v_reporter, p_crop_code, p_topic, btrim(p_title), btrim(p_body),
+    'farmer_report', 'published', 'public',
+    extensions.ST_SetSRID(extensions.ST_MakePoint(v_lon, v_lat), 4326)::extensions.geography,
+    btrim(p_area_label), p_district, coalesce(p_observed_at, now()), 'platform_reports', p_idempotency_key
+  )
+  returning * into v_report;
+  return v_report;
+exception
+  when unique_violation then
+    select * into v_report from public.crop_reports
+     where reporter_id = v_reporter and idempotency_key = p_idempotency_key;
+    if found then return v_report; end if;
+    raise;
+end;
+$$;
+
+comment on function public.submit_crop_report(text, text, text, text, double precision, double precision, text, text, timestamptz, text) is
+  'Farmer report intake. Author is the caller''s own party (no client-supplied id); rounds coords to 2 decimals; labels evidence farmer_report; idempotent on (reporter, key).';
+
+-- A guest must not be able to file a report at all, and `create function` grants
+-- EXECUTE to PUBLIC by default — which for a `security definer` function is a
+-- standing invitation. Revoked here and granted only where it belongs.
+revoke all on function public.submit_crop_report(text, text, text, text, double precision, double precision, text, text, timestamptz, text) from public;
+revoke all on function public.submit_crop_report(text, text, text, text, double precision, double precision, text, text, timestamptz, text) from anon;
+grant execute on function public.submit_crop_report(text, text, text, text, double precision, double precision, text, text, timestamptz, text) to authenticated;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261015000200_climate_forecast.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Farmer App · migration 0027 · district forecast: storage + provenance
+--
+-- Step 1 asks for weather *history and forecast*. History landed in migration
+-- 0026 (NASA POWER, keyless, CC BY 4.0). Forecast could not come from the same
+-- vendor: NASA POWER's own documentation describes its temporal services as
+-- hourly/daily/monthly/climatology, all near-real-time with a 2-3 day lag, and
+-- documents no forecast product. Building "forecast" out of lagged observations
+-- would have been a lie with a column name.
+--
+-- So the forecast source is WeatherAPI.com — the vendor the PRD already named as
+-- the initial MVP candidate and that `weather_providers` already carries as
+-- `is_initial_candidate` with its required attribution. That row needs no change
+-- here; what is new is the table the adapter writes, and the provenance entry
+-- that records the licence question honestly.
+--
+-- Licence status, recorded rather than assumed: WeatherAPI.com's own site
+-- advertises the free plan with "commercial use is allowed", while its general
+-- Terms and Conditions contain a clause saying site materials may not be used
+-- commercially without a licence. Two pages, two answers, so the registry row
+-- below is `needs_permission` and `commercial_ok = false` until that is resolved
+-- in writing. The adapter is written and waits; nothing here pretends otherwise.
+
+-- ---------------------------------------------------------------------------
+-- Provenance for the forecast feed
+-- ---------------------------------------------------------------------------
+
+insert into public.intel_sources (
+  code, name, kind, license, commercial_ok, coverage, update_cadence,
+  access_method, status, notes
+) values (
+  'weatherapi',
+  'WeatherAPI.com forecast',
+  'forecast_risk',
+  'Free tier advertised as commercial-use-allowed; the site T&C contains a conflicting clause — written confirmation pending',
+  false,
+  'global incl. Pakistan; 3-day forecast on the free plan',
+  'daily',
+  'api',
+  'needs_permission',
+  'PRD initial MVP candidate. Key lives in the Edge Function secret WEATHERAPI_KEY, never in the client bundle. Cited in the intel feed as forecast_risk only — never as outbreak proof.'
+)
+on conflict (code) do nothing;
+
+-- ---------------------------------------------------------------------------
+-- District forecasts
+-- ---------------------------------------------------------------------------
+
+-- Perishable by nature, so `issued_on` is part of the key rather than a column
+-- that gets overwritten: re-pulling the same day upserts the same rows (a re-run
+-- is safe), while tomorrow's pull adds new rows beside today's — which is what
+-- makes forecast drift visible instead of silently rewriting what was believed
+-- yesterday.
+--
+-- Every measure is nullable, and a day the vendor did not report is not stored at
+-- all. Zero rain is a fact; a missing day is not, and the two must stay
+-- distinguishable exactly as they do in `climate_observations`.
+create table public.climate_forecasts (
+  id            bigserial primary key,
+  provider_code text not null references public.weather_providers (code),
+  district_code text not null references public.districts (code),
+  -- The day being forecast, and the day the forecast was issued.
+  forecast_on   date not null,
+  issued_on     date not null default current_date,
+  tmax_c        numeric,
+  tmin_c        numeric,
+  precip_mm     numeric check (precip_mm is null or precip_mm >= 0),
+  humidity_pct  numeric check (humidity_pct is null or (humidity_pct between 0 and 100)),
+  wind_kph      numeric check (wind_kph is null or wind_kph >= 0),
+  -- The vendor's own day object, so a normalisation mistake stays debuggable.
+  raw           jsonb not null default '{}'::jsonb,
+  ingested_at   timestamptz not null default now(),
+  run_id        bigint,
+  -- A row whose "forecast" is for a day that has already passed is a re-labelled
+  -- observation. The database refuses it rather than trusting every future
+  -- adapter to get this right.
+  constraint climate_forecasts_horizon check (forecast_on >= issued_on),
+  constraint climate_forecasts_temps check (
+    tmax_c is null or tmin_c is null or tmin_c <= tmax_c
+  ),
+  unique (provider_code, district_code, forecast_on, issued_on)
+);
+
+create index climate_forecasts_lookup_idx
+  on public.climate_forecasts (district_code, forecast_on);
+
+comment on table public.climate_forecasts is
+  'District forecasts, keyed by issue date so a later issue does not overwrite an earlier belief. Written only by the forecast-ingest function.';
+
+comment on column public.climate_forecasts.issued_on is
+  'The day this forecast was issued. Part of the unique key: re-pulling the same day updates, a new day adds. Forecast drift is data, not an overwrite.';
+
+-- ---------------------------------------------------------------------------
+-- RLS: public reads, server-only writes
+-- ---------------------------------------------------------------------------
+
+alter table public.climate_forecasts enable row level security;
+
+create policy climate_forecasts_read on public.climate_forecasts
+  for select to anon, authenticated using (true);
+
+revoke insert, update, delete on public.climate_forecasts from authenticated;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261015000300_advisory_raw.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Farmer App · migration 0028 · keep the received advisory, not only the parsed row
+--
+-- Step 1 asks each importer to store raw *and* normalised rows. Three of the four
+-- sources already do: `market_observations`, `climate_observations` and
+-- `climate_forecasts` each keep the payload as received. `agri_advisories` kept
+-- only the parsed result, so every normalisation decision — a topic coerced to
+-- `other`, a summary cut at the column's limit, a date reinterpreted, a crop code
+-- that failed the catalogue check — was unrecoverable the moment the row was
+-- written. That is precisely the failure mode the raw copy exists to prevent.
+--
+-- Existing rows keep the default rather than a reconstruction: an invented
+-- "original" is worse than an absent one, because it would be indistinguishable
+-- from a real payload and could be trusted.
+
+alter table public.agri_advisories
+  add column if not exists raw jsonb not null default '{}'::jsonb;
+
+comment on column public.agri_advisories.raw is
+  'The advisory exactly as received (CSV cells or feed record), so a normalisation mistake stays debuggable and the original is never lost. Empty for rows imported before this column existed — deliberately, rather than a reconstruction.';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261015000400_report_photo.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Farmer App · migration 0029 · the field report's photo
+--
+-- Step 1's fourth source asks for a "report a problem in your field" flow with
+-- approximate location, crop **and photo**. The first three landed in 0026; the
+-- photo did not, and without it the flow is a written description of a plant
+-- disease. That is not a detail: Step 2 turns on a person deciding whether a
+-- report is true, and the person deciding needs to see the leaf.
+--
+-- WHY A SECOND STORAGE BUCKET AND NOT `storage.buckets`' EXISTING ONES
+--
+-- The four buckets in 0012 are named for what they hold — `scan-media` is a
+-- camera frame the AI diagnoses, `community` is a post, `verification` is a
+-- qualification. A report photo is neither, and filing it under a neighbour's
+-- class would mean its retention, its access rules and its deletion all follow
+-- the wrong owner. A bucket is also the cheapest thing in this schema to add:
+-- it is one row, and it carries no enum change.
+--
+-- WHY NOT `media_assets` AND `media_class`
+--
+-- `media_assets` is the right home for this, and it cannot be used yet — not by
+-- preference but by a hard constraint. `media_class` is an enum, the new class
+-- would have to be added with `alter type ... add value`, and the whole chain is
+-- shipped as ONE transaction (`supabase/apply-all.sql`, `begin; … commit;`).
+-- PostgreSQL refuses to *use* a value added by `alter type` in the same
+-- transaction that adds it, so the chain would fail on the paste that matters
+-- most. Reusing an existing class instead (`scan_source`) would put a field
+-- report's evidence under a class whose retention rule is written for a scan.
+-- So the report carries its own three columns until the enum can be extended
+-- safely, and this comment is the note to move it then.
+
+-- ---------------------------------------------------------------------------
+-- The bucket
+-- ---------------------------------------------------------------------------
+
+-- Private, 15 MiB. Private because a field photo is the farmer's own: it is
+-- served to a reviewer through the policies below, never by URL.
+insert into storage.buckets (id, name, public, file_size_limit)
+values ('report-media', 'report-media', false, 15728640)
+on conflict (id) do nothing;
+
+-- ---------------------------------------------------------------------------
+-- Storage access: the owner's own folder, and a reviewer's read
+-- ---------------------------------------------------------------------------
+--
+-- Paths are `{auth uid}/{uuid}.{ext}`, so the first folder segment *is* the
+-- uploader's auth id and ownership is a property of the path rather than of a
+-- row that could disagree with it. The report insert function checks the same
+-- prefix, so a client cannot file a report pointing at someone else's photo —
+-- and cannot upload into someone else's folder to begin with.
+
+create policy report_media_own_read on storage.objects
+  for select to authenticated
+  using (
+    bucket_id = 'report-media'
+    and (storage.foldername(name))[1] = (select auth.uid())::text
+  );
+
+create policy report_media_own_insert on storage.objects
+  for insert to authenticated
+  with check (
+    bucket_id = 'report-media'
+    and (storage.foldername(name))[1] = (select auth.uid())::text
+  );
+
+-- A replace is what a retried upload does. It is scoped to the same folder and
+-- to the same owner, so a retry cannot overwrite anyone else's object.
+create policy report_media_own_update on storage.objects
+  for update to authenticated
+  using (
+    bucket_id = 'report-media'
+    and (storage.foldername(name))[1] = (select auth.uid())::text
+  )
+  with check (
+    bucket_id = 'report-media'
+    and (storage.foldername(name))[1] = (select auth.uid())::text
+  );
+
+-- Whoever is reviewing reports has to be able to see them. `expert` is the
+-- capability `grant_expert_verification` already writes, so this reuses the
+-- verification gate rather than inventing a second notion of who a reviewer is.
+create policy report_media_reviewer_read on storage.objects
+  for select to authenticated
+  using (
+    bucket_id = 'report-media'
+    and (
+      public.has_capability('expert')
+      or public.has_capability('admin')
+      or public.has_capability('moderator')
+    )
+  );
+
+-- ---------------------------------------------------------------------------
+-- The photo's reference, on the report itself
+-- ---------------------------------------------------------------------------
+
+-- Three columns, all-or-nothing: a path with no declared type and size could
+-- not be validated, and a type with no path names an object that does not
+-- exist. The `check` below refuses a half-filled triple rather than storing one.
+alter table public.crop_reports
+  add column if not exists photo_path  text,
+  add column if not exists photo_mime  text,
+  add column if not exists photo_bytes bigint;
+
+alter table public.crop_reports
+  drop constraint if exists crop_reports_photo_complete;
+
+alter table public.crop_reports
+  add constraint crop_reports_photo_complete check (
+    (photo_path is null and photo_mime is null and photo_bytes is null)
+    or (
+      photo_path is not null
+      and photo_mime is not null
+      and photo_bytes is not null
+      and length(btrim(photo_path)) between 1 and 400
+      and photo_mime in ('image/jpeg', 'image/png', 'image/webp', 'image/heic')
+      and photo_bytes > 0
+      and photo_bytes <= 15728640
+    )
+  );
+
+comment on column public.crop_reports.photo_path is
+  'Object path inside the private `report-media` bucket, always `{uploader auth uid}/{uuid}.{ext}`. The insert function refuses a path outside the caller''s own folder, so a report can never cite a photo it did not upload.';
+
+comment on column public.crop_reports.photo_bytes is
+  'Declared size, validated against the 15 MiB cap and the bucket''s own limit. Never inferred from the file the client claims to have sent.';
+
+-- ---------------------------------------------------------------------------
+-- Registration: the owner comes from the session, not the body
+-- ---------------------------------------------------------------------------
+--
+-- `validate_media_upload` (0012) takes `p_owner_id` as a parameter and is
+-- granted to `authenticated`, which lets any signed-in caller register a media
+-- asset owned by any other party — the same defect `submit_crop_report` had
+-- before 0027, in the same kind of `security definer` function. It is the
+-- registration step for the upload path, so it is fixed here rather than left
+-- as the one remaining place where a client names an owner.
+create or replace function public.validate_media_upload(
+  p_owner_id  uuid,
+  p_class     public.media_class,
+  p_bucket    text,
+  p_path      text,
+  p_mime      text,
+  p_bytes     bigint
+)
+returns public.media_assets
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_allowed text[];
+  v_max     bigint;
+  v_asset   public.media_assets;
+  v_caller  uuid := public.current_party_id();
+begin
+  -- A caller may only register its own asset, whatever it passes as a
+  -- parameter. A session with no party owns nothing and is told so.
+  if v_caller is null then
+    raise exception 'Registering media requires an identified account.' using errcode = 'insufficient_privilege';
+  end if;
+  if p_owner_id is distinct from v_caller then
+    raise exception 'A client may only register its own media.' using errcode = 'insufficient_privilege';
+  end if;
+
+  v_allowed := case p_class
+    when 'voice_note'           then array['audio/mp4', 'audio/mpeg', 'audio/webm', 'audio/ogg', 'audio/aac']
+    when 'community_photo'      then array['image/jpeg', 'image/png', 'image/webp', 'image/heic']
+    when 'community_video'      then array['video/mp4', 'video/webm', 'video/quicktime']
+    when 'scan_source'          then array['image/jpeg', 'image/png', 'image/webp', 'image/heic']
+    when 'scan_derived'         then array['image/jpeg', 'image/png', 'image/webp']
+    when 'verification_evidence' then array['image/jpeg', 'image/png', 'image/webp', 'application/pdf']
+  end;
+
+  v_max := case p_class
+    when 'voice_note'           then 10485760
+    when 'community_photo'      then 15728640
+    when 'community_video'      then 52428800
+    when 'scan_source'          then 26214400
+    when 'verification_evidence' then 26214400
+    else 15728640
+  end;
+
+  if not (p_mime = any (v_allowed)) then
+    raise exception 'A % may not be uploaded as %.', p_mime, p_class using errcode = 'check_violation';
+  end if;
+
+  if p_bytes > v_max then
+    raise exception 'File is % bytes; the limit for % is % bytes.', p_bytes, p_class, v_max
+      using errcode = 'check_violation';
+  end if;
+
+  insert into public.media_assets (
+    owner_id, media_class, state, bucket, storage_path, mime_type, bytes, validated_at
+  ) values (
+    p_owner_id, p_class, 'uploading', p_bucket, p_path, p_mime, p_bytes, now()
+  )
+  returning * into v_asset;
+
+  return v_asset;
+end;
+$$;
+
+comment on function public.validate_media_upload(uuid, public.media_class, text, text, text, bigint) is
+  'Registers an upload after checking its class, type and size. The owner is the caller''s own party; a client can no longer register an asset for somebody else.';
+
+-- ---------------------------------------------------------------------------
+-- submit_crop_report, with the photo
+-- ---------------------------------------------------------------------------
+--
+-- Redefined rather than overloaded: an overload nobody calls is still an
+-- overload an attacker can call, which is why 0027 dropped the previous
+-- signature instead of adding beside it. The three photo parameters are
+-- optional and appended, so a caller that sends none gets exactly the 0027
+-- behaviour.
+
+drop function if exists public.submit_crop_report(
+  text, text, text, text, double precision, double precision, text, text, timestamptz, text
+);
+
+create or replace function public.submit_crop_report(
+  p_crop_code text,
+  p_topic text,
+  p_title text,
+  p_body text,
+  p_lat double precision,
+  p_lon double precision,
+  p_area_label text,
+  p_district text default null,
+  p_observed_at timestamptz default null,
+  p_idempotency_key text default null,
+  p_photo_path text default null,
+  p_photo_mime text default null,
+  p_photo_bytes bigint default null
+)
+returns public.crop_reports
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_report public.crop_reports;
+  v_reporter uuid;
+  v_lat double precision;
+  v_lon double precision;
+  v_uid text := auth.uid()::text;
+  v_path text := nullif(btrim(coalesce(p_photo_path, '')), '');
+begin
+  -- The actor is the session's party. A guest has none, and is told so rather
+  -- than silently filing an anonymous report.
+  v_reporter := public.current_party_id();
+  if v_reporter is null then
+    raise exception 'Reporting requires an identified farmer.' using errcode = 'insufficient_privilege';
+  end if;
+  if p_lat is null or p_lat < -90 or p_lat > 90 or p_lon is null or p_lon < -180 or p_lon > 180 then
+    raise exception 'Invalid report location.' using errcode = 'check_violation';
+  end if;
+  if coalesce(btrim(p_area_label), '') = '' then
+    raise exception 'An approximate area label is required; exact field locations are never stored.' using errcode = 'check_violation';
+  end if;
+
+  -- The photo is optional, and blank is treated as absent: a farmer whose
+  -- upload failed must still be able to warn a neighbour, and refusing the
+  -- sentence because the picture is missing would lose the warning.
+  if v_path is not null then
+    -- The path has to be under the caller's own folder. Without this a report
+    -- could cite any object in the bucket, including another farmer's photo.
+    if v_uid is null or v_path not like v_uid || '/%' then
+      raise exception 'A report photo must be inside your own upload folder.' using errcode = 'insufficient_privilege';
+    end if;
+    if p_photo_mime is null or p_photo_mime not in ('image/jpeg', 'image/png', 'image/webp', 'image/heic') then
+      raise exception 'A report photo must be a JPEG, PNG, WebP or HEIC image.' using errcode = 'check_violation';
+    end if;
+    if p_photo_bytes is null or p_photo_bytes <= 0 or p_photo_bytes > 15728640 then
+      raise exception 'A report photo must be between 1 byte and 15 MB.' using errcode = 'check_violation';
+    end if;
+  end if;
+
+  -- Round to ~1.1km cell so the stored point is approximate by construction.
+  v_lat := round(p_lat::numeric, 2)::double precision;
+  v_lon := round(p_lon::numeric, 2)::double precision;
+
+  insert into public.crop_reports (
+    reporter_id, crop_code, topic, title, body, evidence, status, visibility,
+    geog, area_label, district, observed_at, source_code, idempotency_key,
+    photo_path, photo_mime, photo_bytes
+  ) values (
+    v_reporter, p_crop_code, p_topic, btrim(p_title), btrim(p_body),
+    'farmer_report', 'published', 'public',
+    extensions.ST_SetSRID(extensions.ST_MakePoint(v_lon, v_lat), 4326)::extensions.geography,
+    btrim(p_area_label), p_district, coalesce(p_observed_at, now()), 'platform_reports', p_idempotency_key,
+    case when v_path is null then null else v_path end,
+    case when v_path is null then null else p_photo_mime end,
+    case when v_path is null then null else p_photo_bytes end
+  )
+  returning * into v_report;
+  return v_report;
+exception
+  when unique_violation then
+    select * into v_report from public.crop_reports
+     where reporter_id = v_reporter and idempotency_key = p_idempotency_key;
+    if found then return v_report; end if;
+    raise;
+end;
+$$;
+
+comment on function public.submit_crop_report(text, text, text, text, double precision, double precision, text, text, timestamptz, text, text, text, bigint) is
+  'Farmer report intake, with an optional photo. Author is the caller''s own party; coordinates are rounded to 2 decimals; a photo path must sit in the caller''s own upload folder. Idempotent on (reporter, key).';
+
+revoke all on function public.submit_crop_report(text, text, text, text, double precision, double precision, text, text, timestamptz, text, text, text, bigint) from public;
+revoke all on function public.submit_crop_report(text, text, text, text, double precision, double precision, text, text, timestamptz, text, text, text, bigint) from anon;
+grant execute on function public.submit_crop_report(text, text, text, text, double precision, double precision, text, text, timestamptz, text, text, text, bigint) to authenticated;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261015000500_report_verification.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Farmer App · migration 0030 · the verification loop
+--
+-- Step 2. Step 1 got reports *in*; nothing yet turns one into intelligence. The
+-- evidence column already exists on `crop_reports` — `farmer_report` by default,
+-- and `expert_verified`, `official_advisory` and `forecast_risk` as the three
+-- ways a report can earn more than a farmer's word. What did not exist is a way
+-- to *reach* those three values, a record of who did it, and any rule about who
+-- is entitled to.
+--
+-- The design rule this migration enforces everywhere: **evidence is only ever
+-- raised by a named person acting inside a stated competence, and every raise is
+-- reversible and recorded.** No path here upgrades a report automatically, and
+-- nothing can label a forecast a fact.
+--
+-- The state machine is deliberately one step wide:
+--
+--     farmer_report ──confirm──▶ expert_verified
+--                   ──match────▶ official_advisory
+--          ▲                         │
+--          └──────── withdraw ───────┘
+--
+-- A report at `farmer_report` can be promoted. A promoted report cannot be
+-- promoted *again* by the other path, and cannot be silently re-rated: the way
+-- to change the basis is to withdraw first, which puts both acts in the ledger
+-- instead of hiding the first one behind the second.
+
+-- ---------------------------------------------------------------------------
+-- The current review state, on the report
+-- ---------------------------------------------------------------------------
+
+-- Three columns rather than a status enum: the *history* lives in
+-- `report_reviews`, and these are only where the report stands now. Keeping both
+-- means "who vouched for this" is answerable without a join, and "how many times
+-- did the answer change" is answerable with one.
+alter table public.crop_reports
+  add column if not exists reviewed_at timestamptz,
+  add column if not exists reviewed_by uuid references public.parties (id) on delete set null,
+  add column if not exists review_note text,
+  add column if not exists matched_advisory_id uuid references public.agri_advisories (id) on delete set null;
+
+comment on column public.crop_reports.reviewed_by is
+  'The person who last raised this report''s evidence. Null on a report nobody has reviewed, which is the default and the majority case.';
+
+comment on column public.crop_reports.matched_advisory_id is
+  'The official advisory an `official_advisory` report was matched to. Set only by match_report_to_advisory, so the claim points at the document rather than at a reviewer''s memory of it.';
+
+-- ---------------------------------------------------------------------------
+-- The ledger
+-- ---------------------------------------------------------------------------
+
+create table public.report_reviews (
+  id             uuid primary key default gen_random_uuid(),
+  report_id      uuid not null references public.crop_reports (id) on delete cascade,
+  reviewer_id    uuid references public.parties (id) on delete set null,
+  -- The capability the reviewer acted on, recorded rather than inferred from the
+  -- reviewer's roles at read time: a badge can be revoked, and the review it
+  -- authorised must not be re-explained after the fact.
+  reviewer_basis text not null check (reviewer_basis in ('expert', 'admin')),
+  action         text not null check (action in ('confirm_expert', 'match_official', 'withdraw')),
+  from_evidence  text not null check (from_evidence in ('farmer_report', 'expert_verified', 'official_advisory', 'forecast_risk')),
+  to_evidence    text not null check (to_evidence in ('farmer_report', 'expert_verified', 'official_advisory', 'forecast_risk')),
+  advisory_id    uuid references public.agri_advisories (id) on delete set null,
+  note           text,
+  created_at     timestamptz not null default now(),
+  constraint report_reviews_changes_something check (from_evidence <> to_evidence)
+);
+
+create index report_reviews_report_idx on public.report_reviews (report_id, created_at desc);
+create index report_reviews_reviewer_idx on public.report_reviews (reviewer_id, created_at desc);
+
+comment on table public.report_reviews is
+  'Append-only record of every evidence change on a report: who, on what basis, from what to what, and why. A withdrawal is a row here, never a delete — the wrong call stays visible next to the right one.';
+
+-- ---------------------------------------------------------------------------
+-- Forecast risk: a rule that may not exist without a citation
+-- ---------------------------------------------------------------------------
+
+-- A rule is a threshold on one forecast metric, and it is *data* rather than
+-- code for the same reason retention policies are: a threshold is an agronomic
+-- judgement, and a judgement should be changeable by the person who owns it
+-- without a deployment.
+--
+-- The constraint that matters is `knowledge_entry_id`: it is NOT NULL, so a rule
+-- cannot be written until the published entry that justifies its threshold
+-- exists. That is what keeps "the model says conditions suit a pest" from being
+-- an assertion with no author.
+create table public.forecast_risk_rules (
+  code             text primary key,
+  crop_code        text references public.crop_catalog (code),
+  topic            text not null check (topic in ('pest', 'disease', 'weed', 'water', 'weather_damage', 'other')),
+  -- Which forecast column, and the comparison. The pair is the whole rule.
+  metric           text not null check (metric in ('tmax_c', 'tmin_c', 'precip_mm', 'humidity_pct', 'wind_kph')),
+  operator         text not null check (operator in ('gt', 'gte', 'lt', 'lte')),
+  threshold        numeric not null,
+  unit             text not null,
+  -- The justification, and the wording the served row carries.
+  knowledge_entry_id uuid not null references public.agri_knowledge_entries (id),
+  source_code      text not null references public.intel_sources (code),
+  label_en         text not null check (position('%s' in label_en) > 0),
+  label_ur         text not null check (position('%s' in label_ur) > 0),
+  -- What the threshold is, in words. "The entry says 'light and steady'; this
+  -- number is the interpretation" is the honest kind of note here.
+  threshold_basis  text not null,
+  -- Off until an agronomist turns it on. See activate_forecast_risk_rule.
+  is_active        boolean not null default false,
+  activated_at     timestamptz,
+  activated_by     uuid references public.parties (id) on delete set null,
+  activation_note  text,
+  created_at       timestamptz not null default now()
+);
+
+comment on table public.forecast_risk_rules is
+  'Thresholds the forecast-risk generator may apply. A rule is inert until an agronomist activates it: a migration may ship the mechanism, but it cannot assert that a number is agronomically right.';
+
+comment on column public.forecast_risk_rules.knowledge_entry_id is
+  'The published entry that justifies this threshold. NOT NULL on purpose — the mechanism refuses to exist without a citation.';
+
+create table public.forecast_risks (
+  id            uuid primary key default gen_random_uuid(),
+  rule_code     text not null references public.forecast_risk_rules (code) on delete cascade,
+  provider_code text not null references public.weather_providers (code),
+  district_code text not null references public.districts (code),
+  crop_code     text references public.crop_catalog (code),
+  topic         text not null check (topic in ('pest', 'disease', 'weed', 'water', 'weather_damage', 'other')),
+  -- The day the risk is about, taken from the forecast row's own date.
+  risk_on       date not null,
+  issued_on     date not null,
+  -- The evidence, stored so the claim can be re-checked without re-running the
+  -- model: which metric, which comparison, what was measured, against what.
+  metric        text not null,
+  operator      text not null,
+  threshold     numeric not null,
+  observed_value numeric,
+  basis         jsonb not null default '{}'::jsonb,
+  -- Both languages, because the rule carries both and a warning a farmer cannot
+  -- read is not a warning. `intel_feed` returns all four so the client picks by
+  -- locale, exactly as it picks a district's name. Advisories imported from a
+  -- source document stay single-language: that text is a quotation, and there is
+  -- nothing to translate it into.
+  title         text not null,
+  title_ur      text,
+  summary       text not null,
+  summary_ur    text,
+  observed_at   timestamptz not null default now(),
+  expires_at    timestamptz not null,
+  constraint forecast_risks_expiry check (expires_at > risk_on::timestamptz),
+  unique (rule_code, district_code, risk_on, issued_on)
+);
+
+create index forecast_risks_lookup_idx on public.forecast_risks (district_code, risk_on desc);
+create index forecast_risks_crop_time_idx on public.forecast_risks (crop_code, risk_on desc);
+
+comment on table public.forecast_risks is
+  'Conditions the forecast says are likely to favour a problem. Every row is a *risk*: it is derived from a model rather than observed in a field, it is labelled as such wherever it is shown, and it can never be served as an outbreak.';
+
+-- ---------------------------------------------------------------------------
+-- The one rule this repository can justify
+-- ---------------------------------------------------------------------------
+--
+-- Step 2 names "weather models say conditions suit a pest" as the third evidence
+-- path, and this repository cannot honestly implement it yet. The published
+-- knowledge set (migration 0019) states pest thresholds as *field* counts —
+-- "a pheromone trap count that rises for two consecutive weeks", "the adult count
+-- on the underside of a leaf crosses the economic threshold" — and neither is a
+-- function of a forecast. Inventing a temperature or humidity number for pink
+-- bollworm and labelling the output with an extension bulletin would attribute a
+-- claim to a source that does not make it.
+--
+-- What the set does state, and a forecast can answer, is wind. The `spray-wind`
+-- entry says to spray "when the wind is light and steady", that high wind causes
+-- drift onto neighbouring fields, and that it is a legal and health risk. That is
+-- a genuine forecast-derivable condition with a citation, so it is the rule that
+-- ships — as a *proposal*, inactive, with the interpretation it requires written
+-- down.
+insert into public.forecast_risk_rules (
+  code, crop_code, topic, metric, operator, threshold, unit,
+  knowledge_entry_id, source_code, label_en, label_ur, threshold_basis, is_active
+)
+values (
+  'spray-wind-too-strong',
+  null,
+  'weather_damage',
+  'wind_kph',
+  'gt',
+  20,
+  'km/h',
+  (select id from public.agri_knowledge_entries where slug = 'spray-wind'),
+  'weatherapi',
+  'Wind is forecast above %s km/h, so spraying would drift onto neighbouring fields. It is a spray-conditions warning, not a forecast of damage.',
+  'ہوا %s کلومیٹر فی گھنٹہ سے زیادہ رہنے کی پیش گوئی ہے، اس لیے سپرے پڑوسی کھیتوں میں جائے گا۔ یہ سپرے کے حالات کی تنبیہ ہے، نقصان کی پیش گوئی نہیں۔',
+  'The cited entry says "light and steady" and that high wind causes drift; it states no number. 20 km/h is an interpretation, not a quote — which is exactly why this rule ships inactive and needs an agronomist''s sign-off (activate_forecast_risk_rule) before it can produce a row.',
+  false
+)
+on conflict (code) do nothing;
+
+comment on column public.forecast_risk_rules.threshold_basis is
+  'What the number is and where it came from. For spray-wind-too-strong it records that the source states no number, so the value is visible as the interpretation it is.';
+
+-- ---------------------------------------------------------------------------
+-- RLS
+-- ---------------------------------------------------------------------------
+
+alter table public.report_reviews enable row level security;
+alter table public.forecast_risk_rules enable row level security;
+alter table public.forecast_risks enable row level security;
+
+-- Live risks are public, like every other row the feed serves.
+create policy forecast_risks_read on public.forecast_risks
+  for select to anon, authenticated
+  using (expires_at > now());
+
+-- The rules are published read-only: a threshold that silently changed is worse
+-- than no threshold, so the wording and the number are visible to anyone.
+create policy forecast_risk_rules_read on public.forecast_risk_rules
+  for select to anon, authenticated
+  using (true);
+
+-- The review ledger is readable by the reviewer and by the report's own author.
+-- A farmer may see who stood behind their report; that is the point of a record.
+create policy report_reviews_read on public.report_reviews
+  for select to authenticated
+  using (
+    reviewer_id = public.current_party_id()
+    or report_id in (select r.id from public.crop_reports r where r.reporter_id = public.current_party_id())
+    or public.has_capability('admin')
+    or public.has_capability('moderator')
+  );
+
+revoke insert, update, delete on public.report_reviews from authenticated;
+revoke insert, update, delete on public.forecast_risk_rules from authenticated;
+revoke insert, update, delete on public.forecast_risks from authenticated;
+
+-- ---------------------------------------------------------------------------
+-- Who may review what
+-- ---------------------------------------------------------------------------
+
+-- The client asks this to decide whether to show a review surface at all. It
+-- returns the *basis*, not a boolean, because "you are an expert but not for
+-- cotton" is the state a review screen has to be able to explain.
+create or replace function public.my_review_capability()
+returns table (
+  can_review    boolean,
+  is_admin      boolean,
+  is_expert     boolean,
+  crop_codes    text[],
+  verified_until timestamptz
+)
+language plpgsql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_actor uuid := public.current_party_id();
+  v_admin boolean := false;
+  v_ver   public.expert_verifications;
+begin
+  if v_actor is null then
+    return query select false, false, false, '{}'::text[], null::timestamptz;
+    return;
+  end if;
+
+  v_admin := public.has_capability('admin');
+
+  select * into v_ver
+    from public.expert_verifications
+   where party_id = v_actor
+     and status = 'verified'
+     and suspended_at is null
+     and (expires_at is null or expires_at > now());
+
+  -- An expert whose badge has lapsed keeps the capability row but is no longer a
+  -- reviewer. The two are deliberately allowed to disagree, because the badge is
+  -- the thing with an expiry date.
+  return query select
+    v_admin or found,
+    v_admin,
+    found,
+    coalesce(v_ver.crop_codes, '{}'::text[]),
+    v_ver.expires_at;
+end;
+$$;
+
+comment on function public.my_review_capability() is
+  'Whether the caller may review reports, and on what basis. An expert keeps the capability after a lapsed verification; the badge expiring is what stops the reviewing.';
+
+-- ---------------------------------------------------------------------------
+-- Confirming a report with expertise
+-- ---------------------------------------------------------------------------
+
+create or replace function public.verify_crop_report(
+  p_report_id uuid,
+  p_note      text default null
+)
+returns public.crop_reports
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_report  public.crop_reports;
+  v_actor   uuid := public.current_party_id();
+  v_admin   boolean;
+  v_ver     public.expert_verifications;
+  v_basis   text;
+begin
+  if v_actor is null then
+    raise exception 'Reviewing a report requires an identified account.' using errcode = 'insufficient_privilege';
+  end if;
+
+  select * into v_report from public.crop_reports where id = p_report_id for update;
+  if not found then
+    raise exception 'Report % not found.', p_report_id using errcode = 'no_data_found';
+  end if;
+
+  v_admin := public.has_capability('admin');
+
+  select * into v_ver
+    from public.expert_verifications
+   where party_id = v_actor
+     and status = 'verified'
+     and suspended_at is null
+     and (expires_at is null or expires_at > now());
+
+  if not (v_admin or found) then
+    raise exception 'Confirming a field report requires verified expertise.' using errcode = 'insufficient_privilege';
+  end if;
+  v_basis := case when v_admin and not found then 'admin' else 'expert' end;
+
+  -- An author cannot vouch for themselves. This is the rule that makes the
+  -- column worth anything: a report confirmed by its own reporter is a farmer
+  -- grading their own homework wearing an expert's badge.
+  if v_report.reporter_id is not null and v_report.reporter_id = v_actor and not v_admin then
+    raise exception 'You cannot confirm your own report.' using errcode = 'insufficient_privilege';
+  end if;
+
+  -- Competence, not seniority. An expert verified for wheat does not get to
+  -- vouch for a cotton disease, and a report that names no crop can be confirmed
+  -- by anyone verified. Admin is the final authority, so it is not constrained —
+  -- and the row records that it acted as admin.
+  if not v_admin and v_report.crop_code is not null
+     and not (v_report.crop_code = any (coalesce(v_ver.crop_codes, '{}'::text[]))) then
+    raise exception 'Your verification does not cover %. A report outside your crops needs an admin.', v_report.crop_code
+      using errcode = 'insufficient_privilege';
+  end if;
+
+  if v_report.status <> 'published' then
+    raise exception 'A % report cannot be confirmed.', v_report.status using errcode = 'check_violation';
+  end if;
+  if v_report.expires_at <= now() then
+    raise exception 'This report has expired and is no longer served.' using errcode = 'check_violation';
+  end if;
+
+  -- Only from an unverified report. To change an expert confirmation into an
+  -- official match the reviewer withdraws first, so both acts are on the record
+  -- rather than the first being erased by the second.
+  if v_report.evidence <> 'farmer_report' then
+    if v_report.evidence = 'expert_verified' then
+      raise exception 'This report is already confirmed. Withdraw the confirmation first to change it.' using errcode = 'check_violation';
+    end if;
+    raise exception 'This report is already recorded as %. Withdraw that first to change it.', v_report.evidence
+      using errcode = 'check_violation';
+  end if;
+
+  update public.crop_reports
+     set evidence     = 'expert_verified',
+         reviewed_at  = now(),
+         reviewed_by  = v_actor,
+         review_note  = nullif(btrim(coalesce(p_note, '')), '')
+   where id = p_report_id
+  returning * into v_report;
+
+  insert into public.report_reviews (
+    report_id, reviewer_id, reviewer_basis, action, from_evidence, to_evidence, note
+  ) values (
+    p_report_id, v_actor, v_basis, 'confirm_expert', 'farmer_report', 'expert_verified',
+    nullif(btrim(coalesce(p_note, '')), '')
+  );
+
+  perform public.write_audit(
+    'intel.report_confirmed', 'crop_reports', p_report_id, null,
+    'farmer_report', 'expert_verified',
+    jsonb_build_object('basis', v_basis, 'crop_code', v_report.crop_code),
+    v_actor, v_basis
+  );
+
+  return v_report;
+end;
+$$;
+
+comment on function public.verify_crop_report(uuid, text) is
+  'Raises a field report to expert_verified. Requires a live verification covering the report''s crop, refuses self-review, and records the act in report_reviews and the audit log.';
+
+grant execute on function public.verify_crop_report(uuid, text) to authenticated;
+
+-- ---------------------------------------------------------------------------
+-- Matching a report to an official advisory
+-- ---------------------------------------------------------------------------
+
+-- A match is a *claim about two rows*, so the function checks that the two rows
+-- can be about the same thing before it ties them together: the advisory must be
+-- live, its crop must be the report's crop or unset (an unset crop is an
+-- everything advisory), and its topic must be the report's topic. Without that,
+-- "official" would mean "an official document exists somewhere", which is how a
+-- match becomes a decoration.
+create or replace function public.match_report_to_advisory(
+  p_report_id   uuid,
+  p_advisory_id uuid,
+  p_note        text default null
+)
+returns public.crop_reports
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_report   public.crop_reports;
+  v_advisory public.agri_advisories;
+  v_actor    uuid := public.current_party_id();
+  v_basis    text;
+begin
+  if v_actor is null then
+    raise exception 'Reviewing a report requires an identified account.' using errcode = 'insufficient_privilege';
+  end if;
+
+  if not public.has_capability('admin') then
+    if not exists (
+      select 1 from public.expert_verifications ev
+       where ev.party_id = v_actor
+         and ev.status = 'verified'
+         and ev.suspended_at is null
+         and (ev.expires_at is null or ev.expires_at > now())
+    ) then
+      raise exception 'Matching an advisory requires verified expertise or admin.' using errcode = 'insufficient_privilege';
+    end if;
+    v_basis := 'expert';
+  else
+    v_basis := 'admin';
+  end if;
+
+  select * into v_report from public.crop_reports where id = p_report_id for update;
+  if not found then
+    raise exception 'Report % not found.', p_report_id using errcode = 'no_data_found';
+  end if;
+
+  select * into v_advisory from public.agri_advisories where id = p_advisory_id;
+  if not found then
+    raise exception 'Advisory % not found.', p_advisory_id using errcode = 'no_data_found';
+  end if;
+
+  -- A report that is not being served cannot be matched to anything: the match
+  -- would be recorded against a row no farmer will ever see.
+  if v_report.status <> 'published' then
+    raise exception 'A % report cannot be matched to an advisory.', v_report.status using errcode = 'check_violation';
+  end if;
+  if v_report.expires_at <= now() then
+    raise exception 'This report has expired and is no longer served.' using errcode = 'check_violation';
+  end if;
+
+  if v_report.evidence <> 'farmer_report' then
+    raise exception 'This report is already recorded as %. Withdraw that first to match an advisory.', v_report.evidence
+      using errcode = 'check_violation';
+  end if;
+
+  if not v_advisory.is_active then
+    raise exception 'That advisory is no longer active.' using errcode = 'check_violation';
+  end if;
+  if v_advisory.published_at > now() then
+    raise exception 'That advisory is not published yet.' using errcode = 'check_violation';
+  end if;
+  if v_advisory.valid_until is not null and v_advisory.valid_until <= now() then
+    raise exception 'That advisory has expired.' using errcode = 'check_violation';
+  end if;
+
+  if v_advisory.topic <> v_report.topic then
+    raise exception 'The advisory is about % and the report is about %; they do not match.', v_advisory.topic, v_report.topic
+      using errcode = 'check_violation';
+  end if;
+  if v_advisory.crop_code is not null and v_advisory.crop_code is distinct from v_report.crop_code then
+    raise exception 'The advisory names % and the report names %; they do not match.',
+      v_advisory.crop_code, coalesce(v_report.crop_code, 'no crop')
+      using errcode = 'check_violation';
+  end if;
+
+  update public.crop_reports
+     set evidence             = 'official_advisory',
+         matched_advisory_id  = p_advisory_id,
+         reviewed_at          = now(),
+         reviewed_by          = v_actor,
+         review_note          = nullif(btrim(coalesce(p_note, '')), '')
+   where id = p_report_id
+  returning * into v_report;
+
+  insert into public.report_reviews (
+    report_id, reviewer_id, reviewer_basis, action, from_evidence, to_evidence, advisory_id, note
+  ) values (
+    p_report_id, v_actor, v_basis, 'match_official', 'farmer_report', 'official_advisory', p_advisory_id,
+    nullif(btrim(coalesce(p_note, '')), '')
+  );
+
+  perform public.write_audit(
+    'intel.report_matched', 'crop_reports', p_report_id, null,
+    'farmer_report', 'official_advisory',
+    jsonb_build_object('advisory_id', p_advisory_id, 'basis', v_basis, 'advisory_source', v_advisory.source_url),
+    v_actor, v_basis
+  );
+
+  return v_report;
+end;
+$$;
+
+comment on function public.match_report_to_advisory(uuid, uuid, text) is
+  'Records that a field report matches a live official advisory on crop and topic, and stores the advisory id so the claim points at the document.';
+
+grant execute on function public.match_report_to_advisory(uuid, uuid, text) to authenticated;
+
+-- ---------------------------------------------------------------------------
+-- Withdrawing a verification
+-- ---------------------------------------------------------------------------
+
+-- A wrong call has to be correctable, and the correction has to be as visible as
+-- the call. Withdrawal returns the report to `farmer_report` — it does not
+-- delete it, and it does not delete the review that promoted it.
+create or replace function public.withdraw_report_verification(
+  p_report_id uuid,
+  p_reason    text
+)
+returns public.crop_reports
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_report public.crop_reports;
+  v_actor  uuid := public.current_party_id();
+  v_basis  text;
+  -- Read before the update: the UPDATE nulls the column and RETURNING then
+  -- overwrites v_report, so the ledger row would otherwise always claim the
+  -- withdrawal was of an expert confirmation.
+  v_prev_evidence text;
+begin
+  if v_actor is null then
+    raise exception 'Withdrawing a verification requires an identified account.' using errcode = 'insufficient_privilege';
+  end if;
+
+  if coalesce(btrim(p_reason), '') = '' then
+    raise exception 'Withdrawing a verification requires a reason.' using errcode = 'check_violation';
+  end if;
+
+  select * into v_report from public.crop_reports where id = p_report_id for update;
+  if not found then
+    raise exception 'Report % not found.', p_report_id using errcode = 'no_data_found';
+  end if;
+
+  if v_report.evidence = 'farmer_report' then
+    raise exception 'This report has no verification to withdraw.' using errcode = 'check_violation';
+  end if;
+  if v_report.evidence = 'forecast_risk' then
+    raise exception 'A forecast risk is not a verification and cannot be withdrawn this way.' using errcode = 'check_violation';
+  end if;
+
+  v_prev_evidence := v_report.evidence;
+
+  -- The reviewer who made the call, or an admin. Nobody else.
+  if public.has_capability('admin') then
+    v_basis := 'admin';
+  elsif v_report.reviewed_by = v_actor then
+    v_basis := 'expert';
+  else
+    raise exception 'Only the reviewer who made this call, or an admin, can withdraw it.'
+      using errcode = 'insufficient_privilege';
+  end if;
+
+  update public.crop_reports
+     set evidence            = 'farmer_report',
+         reviewed_at         = now(),
+         reviewed_by         = v_actor,
+         review_note         = btrim(p_reason),
+         matched_advisory_id = null
+   where id = p_report_id
+  returning * into v_report;
+
+  insert into public.report_reviews (
+    report_id, reviewer_id, reviewer_basis, action, from_evidence, to_evidence, note
+  ) values (
+    p_report_id, v_actor, v_basis, 'withdraw', v_prev_evidence,
+    'farmer_report', btrim(p_reason)
+  );
+
+  perform public.write_audit(
+    'intel.report_verification_withdrawn', 'crop_reports', p_report_id, null,
+    null, 'farmer_report', jsonb_build_object('reason', btrim(p_reason), 'basis', v_basis),
+    v_actor, v_basis
+  );
+
+  return v_report;
+end;
+$$;
+
+comment on function public.withdraw_report_verification(uuid, text) is
+  'Returns a reviewed report to farmer_report, with a reason. Only the original reviewer or an admin; the promotion stays in the ledger.';
+
+grant execute on function public.withdraw_report_verification(uuid, text) to authenticated;
+
+-- ---------------------------------------------------------------------------
+-- Activating a threshold
+-- ---------------------------------------------------------------------------
+
+-- Admin, a reason, and the act is recorded. This is the only way a rule can
+-- start producing rows, and it is deliberately a person's decision rather than a
+-- default: a threshold is agronomy, and this schema does not own agronomy.
+create or replace function public.activate_forecast_risk_rule(
+  p_code text,
+  p_note text
+)
+returns public.forecast_risk_rules
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_rule  public.forecast_risk_rules;
+  v_actor uuid := public.current_party_id();
+  v_entry public.agri_knowledge_entries;
+begin
+  if not public.has_capability('admin') then
+    raise exception 'Activating a risk threshold requires the admin capability.' using errcode = 'insufficient_privilege';
+  end if;
+  if coalesce(btrim(p_note), '') = '' then
+    raise exception 'Activating a threshold requires a note saying why it is right.' using errcode = 'check_violation';
+  end if;
+
+  select * into v_rule from public.forecast_risk_rules where code = p_code for update;
+  if not found then
+    raise exception 'Risk rule % not found.', p_code using errcode = 'no_data_found';
+  end if;
+
+  select * into v_entry from public.agri_knowledge_entries where id = v_rule.knowledge_entry_id;
+  if not found or not v_entry.is_published then
+    raise exception 'Rule % cites an entry that is missing or unpublished.', p_code using errcode = 'check_violation';
+  end if;
+
+  update public.forecast_risk_rules
+     set is_active       = true,
+         activated_at    = now(),
+         activated_by    = v_actor,
+         activation_note = btrim(p_note)
+   where code = p_code
+  returning * into v_rule;
+
+  perform public.write_audit(
+    'intel.risk_rule_activated', 'forecast_risk_rules', null, p_code,
+    'inactive', 'active',
+    jsonb_build_object('threshold', v_rule.threshold, 'metric', v_rule.metric, 'citation', v_entry.slug),
+    v_actor, 'admin'
+  );
+
+  return v_rule;
+end;
+$$;
+
+comment on function public.activate_forecast_risk_rule(text, text) is
+  'Turns a threshold on, with a reason, as an admin. A rule with no citation cannot be activated — the knowledge entry it points at must exist and be published.';
+
+grant execute on function public.activate_forecast_risk_rule(text, text) to authenticated;
+
+-- ---------------------------------------------------------------------------
+-- Generating the risks
+-- ---------------------------------------------------------------------------
+
+-- Applies the active rules to the stored forecast. Runs over `climate_forecasts`,
+-- which is already keyed by issue date, so the same day re-run is an upsert and a
+-- new issue date adds beside yesterday's belief instead of rewriting it.
+--
+-- The expiry is the end of the day the risk is about: a spray warning for
+-- Thursday is not intelligence on Friday, and leaving it in the feed would be
+-- exactly the drift the evidence column exists to prevent.
+create or replace function public.generate_forecast_risks(
+  p_from date default current_date,
+  p_to   date default current_date + 2
+)
+returns integer
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_written integer := 0;
+  -- Read from the request's own claims rather than from auth.role(), whose
+  -- presence depends on the auth schema the database was initialised with. This
+  -- is the value PostgREST sets from the calling key: 'service_role' for the
+  -- server key, 'authenticated'/'anon' for the client keys.
+  v_role text := coalesce(nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'role', '');
+begin
+  if v_role <> 'service_role' and not public.has_capability('admin') then
+    raise exception 'Generating forecast risks requires the service role or admin.' using errcode = 'insufficient_privilege';
+  end if;
+
+  with rule_metric as (
+    select
+      r.code, r.crop_code, r.topic, r.metric, r.operator, r.threshold, r.unit,
+      r.label_en, r.label_ur, r.knowledge_entry_id, r.source_code,
+      f.provider_code, f.district_code, f.forecast_on, f.issued_on,
+      case r.metric
+        when 'tmax_c'       then f.tmax_c
+        when 'tmin_c'       then f.tmin_c
+        when 'precip_mm'    then f.precip_mm
+        when 'humidity_pct' then f.humidity_pct
+        when 'wind_kph'     then f.wind_kph
+      end as observed
+    from public.forecast_risk_rules r
+    join public.climate_forecasts f on true
+    where r.is_active
+      and f.forecast_on between p_from and p_to
+  ),
+  fired as (
+    select *
+    from rule_metric
+    where observed is not null
+      and case operator
+        when 'gt'  then observed >  threshold
+        when 'gte' then observed >= threshold
+        when 'lt'  then observed <  threshold
+        when 'lte' then observed <= threshold
+      end
+  ),
+  written as (
+    insert into public.forecast_risks (
+      rule_code, provider_code, district_code, crop_code, topic, risk_on, issued_on,
+      metric, operator, threshold, observed_value, basis, title, title_ur, summary, summary_ur, expires_at
+    )
+    select
+      code, provider_code, district_code, crop_code, topic, forecast_on, issued_on,
+      metric, operator, threshold, observed,
+      jsonb_build_object('metric', metric, 'observed', observed, 'threshold', threshold,
+                         'unit', unit, 'source_row', 'climate_forecasts'),
+      -- `%s` becomes the measurement, `%s` becomes the day. The label is written
+      -- by the person who set the threshold, so the wording and the number come
+      -- from the same decision.
+      format(label_en, round(observed, 1), forecast_on),
+      format(label_ur, round(observed, 1), forecast_on),
+      format('%s Published guidance: %s Risk, not an outbreak: this is what the forecast suggests, not what has been seen in a field.',
+             unit, (select title_en from public.agri_knowledge_entries e where e.id = knowledge_entry_id)),
+      format('%s شائع شدہ رہنمائی: %s خطرہ، وبا نہیں: یہ پیش گوئی ہے، کھیت میں دیکھی گئی چیز نہیں۔',
+             unit, (select title_ur from public.agri_knowledge_entries e where e.id = knowledge_entry_id)),
+      (forecast_on + 1)::timestamptz
+    from fired
+    on conflict (rule_code, district_code, risk_on, issued_on) do update
+      set observed_value = excluded.observed_value,
+          basis          = excluded.basis,
+          title          = excluded.title,
+          title_ur       = excluded.title_ur,
+          summary        = excluded.summary,
+          summary_ur     = excluded.summary_ur,
+          expires_at     = excluded.expires_at,
+          observed_at    = now()
+    returning 1
+  )
+  select count(*) into v_written from written;
+
+  return v_written;
+end;
+$$;
+
+comment on function public.generate_forecast_risks(date, date) is
+  'Applies every active rule to the stored forecast for a window and upserts the resulting risk rows. Idempotent per (rule, district, day, issue date). Every row it writes is a risk derived from a model, never an observation.';
+
+grant execute on function public.generate_forecast_risks(date, date) to authenticated;
+
+-- ---------------------------------------------------------------------------
+-- The queue a reviewer works from
+-- ---------------------------------------------------------------------------
+
+-- Newest unverified reports, nearest first when an origin is given, and never a
+-- coordinate: the reviewer sees the same approximate area the feed shows, which
+-- is what keeps the review path from becoming a way to read exact farm
+-- locations out of the database.
+create or replace function public.report_review_queue(
+  p_lat      double precision default null,
+  p_lon      double precision default null,
+  p_radius_m double precision default 500000,
+  p_limit    integer default 20
+)
+returns table (
+  id           uuid,
+  crop_code    text,
+  topic        text,
+  title        text,
+  body         text,
+  area_label   text,
+  district     text,
+  observed_at  timestamptz,
+  photo_path   text,
+  photo_mime   text,
+  distance_m   double precision
+)
+language plpgsql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_origin extensions.geography;
+  v_actor  uuid := public.current_party_id();
+begin
+  if v_actor is null then
+    raise exception 'The review queue requires an identified account.' using errcode = 'insufficient_privilege';
+  end if;
+  if not (
+    public.has_capability('admin')
+    or exists (
+      select 1 from public.expert_verifications ev
+       where ev.party_id = v_actor and ev.status = 'verified' and ev.suspended_at is null
+         and (ev.expires_at is null or ev.expires_at > now())
+    )
+  ) then
+    raise exception 'The review queue requires verified expertise or admin.' using errcode = 'insufficient_privilege';
+  end if;
+
+  if p_lat is null or p_lon is null then
+    return query
+      select r.id, r.crop_code, r.topic, r.title, r.body, r.area_label, r.district,
+             r.observed_at, r.photo_path, r.photo_mime, null::double precision
+        from public.crop_reports r
+       where r.evidence = 'farmer_report'
+         and r.status = 'published'
+         and r.expires_at > now()
+       order by r.observed_at desc
+       limit greatest(1, least(coalesce(p_limit, 20), 100));
+    return;
+  end if;
+
+  if p_radius_m is null or p_radius_m < 1 or p_radius_m > 500000 then
+    raise exception 'Radius must be between 1 and 500000 metres.' using errcode = 'check_violation';
+  end if;
+
+  v_origin := extensions.ST_SetSRID(extensions.ST_MakePoint(p_lon, p_lat), 4326)::extensions.geography;
+
+  return query
+    select r.id, r.crop_code, r.topic, r.title, r.body, r.area_label, r.district,
+           r.observed_at, r.photo_path, r.photo_mime,
+           extensions.ST_Distance(r.geog, v_origin)
+      from public.crop_reports r
+     where r.evidence = 'farmer_report'
+       and r.status = 'published'
+       and r.expires_at > now()
+       and extensions.ST_DWithin(r.geog, v_origin, p_radius_m)
+     order by extensions.ST_Distance(r.geog, v_origin), r.observed_at desc
+     limit greatest(1, least(coalesce(p_limit, 20), 100));
+end;
+$$;
+
+comment on function public.report_review_queue(double precision, double precision, double precision, integer) is
+  'Unverified reports for a reviewer to work, nearest first when an origin is given. Returns area_label and distance, never coordinates.';
+
+grant execute on function public.report_review_queue(double precision, double precision, double precision, integer) to authenticated;
+
+-- ---------------------------------------------------------------------------
+-- The feed, with risks
+-- ---------------------------------------------------------------------------
+--
+-- Redefined to carry the third kind, and to carry the Urdu wording a risk is
+-- written in. A risk is district-scope like an advisory and is served on one of
+-- two grounds: the origin's nearest district is the risk's district, or the
+-- origin is inside the radius of the district headquarters the risk was computed
+-- for. Being strict here is what stops a Layyah spray warning appearing in
+-- Rajanpur.
+--
+-- Dropped rather than replaced: the return type gains two columns, and
+-- `create or replace` cannot change a function's result row.
+drop function if exists public.intel_feed(
+  double precision, double precision, double precision, text, text, integer
+);
+
+create or replace function public.intel_feed(
+  p_lat double precision,
+  p_lon double precision,
+  p_radius_m double precision default 10000,
+  p_crop_code text default null,
+  p_topic text default null,
+  p_limit integer default 20
+)
+returns table (
+  id uuid,
+  kind text,
+  title text,
+  summary text,
+  crop_code text,
+  topic text,
+  evidence text,
+  area_label text,
+  district text,
+  observed_at timestamptz,
+  valid_until timestamptz,
+  distance_m double precision,
+  source_code text,
+  title_ur text,
+  summary_ur text
+)
+language plpgsql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_origin extensions.geography;
+begin
+  if p_lat is null or p_lat < -90 or p_lat > 90 or p_lon is null or p_lon < -180 or p_lon > 180 then
+    raise exception 'Invalid origin: lat/lon required.' using errcode = 'check_violation';
+  end if;
+  if p_radius_m is null or p_radius_m < 1 or p_radius_m > 500000 then
+    raise exception 'Radius must be between 1 and 500000 metres.' using errcode = 'check_violation';
+  end if;
+
+  v_origin := extensions.ST_SetSRID(extensions.ST_MakePoint(p_lon, p_lat), 4326)::extensions.geography;
+
+  return query
+  with nearest_district as (
+    select d.code
+      from public.districts d
+     where d.is_active
+     order by extensions.ST_Distance(
+       extensions.ST_SetSRID(extensions.ST_MakePoint(d.hq_lon, d.hq_lat), 4326)::extensions.geography,
+       v_origin
+     )
+     limit 1
+  ),
+  reports as (
+    select
+      r.id, 'report'::text as kind, r.title, r.body as summary, r.crop_code, r.topic,
+      r.evidence, r.area_label, r.district, r.observed_at, r.expires_at as valid_until,
+      extensions.ST_Distance(r.geog, v_origin) as distance_m, r.source_code, r.cluster_id,
+      r.observed_at as sort_at, null::text as title_ur, null::text as summary_ur,
+      row_number() over (
+        partition by coalesce(r.cluster_id, r.id)
+        order by case when r.evidence = 'expert_verified' then 0 else 1 end, r.observed_at desc, r.id
+      ) as dup_rank
+    from public.crop_reports r
+    where r.status = 'published'
+      and r.visibility = 'public'
+      and r.observed_at <= now()
+      and r.expires_at > now()
+      and (p_crop_code is null or r.crop_code = p_crop_code or r.crop_code is null)
+      and (p_topic is null or r.topic = p_topic)
+      and extensions.ST_DWithin(r.geog, v_origin, p_radius_m)
+  ),
+  advisories as (
+    select
+      a.id, 'advisory'::text as kind, a.title, a.summary, a.crop_code, a.topic,
+      'official_advisory'::text as evidence, a.area_label, a.district, a.published_at as observed_at,
+      a.valid_until, null::double precision as distance_m, a.source_code, null::uuid as cluster_id,
+      a.published_at as sort_at, null::text as title_ur, null::text as summary_ur, 1 as dup_rank
+    from public.agri_advisories a
+    where a.is_active
+      and a.published_at <= now()
+      and (a.valid_until is null or a.valid_until > now())
+      and (p_crop_code is null or a.crop_code = p_crop_code or a.crop_code is null)
+      and (p_topic is null or a.topic = p_topic)
+      and (a.geog is null or extensions.ST_DWithin(a.geog, v_origin, p_radius_m))
+  ),
+  risks as (
+    select
+      k.id, 'risk'::text as kind, k.title,
+      k.summary, k.crop_code, k.topic,
+      'forecast_risk'::text as evidence,
+      d.name_en as area_label, d.name_en as district,
+      k.observed_at, k.expires_at as valid_until,
+      extensions.ST_Distance(
+        extensions.ST_SetSRID(extensions.ST_MakePoint(d.hq_lon, d.hq_lat), 4326)::extensions.geography,
+        v_origin
+      ) as distance_m,
+      'weatherapi'::text as source_code, null::uuid as cluster_id,
+      k.observed_at as sort_at, k.title_ur, k.summary_ur, 1 as dup_rank
+    from public.forecast_risks k
+    join public.districts d on d.code = k.district_code
+    where k.expires_at > now()
+      and (k.crop_code is null or p_crop_code is null or k.crop_code = p_crop_code)
+      and (p_topic is null or k.topic = p_topic)
+      and (
+        k.district_code = (select code from nearest_district)
+        or extensions.ST_DWithin(
+          extensions.ST_SetSRID(extensions.ST_MakePoint(d.hq_lon, d.hq_lat), 4326)::extensions.geography,
+          v_origin, p_radius_m
+        )
+      )
+  )
+  select c.id, c.kind, c.title, c.summary, c.crop_code, c.topic, c.evidence,
+         c.area_label, c.district, c.observed_at, c.valid_until, c.distance_m, c.source_code,
+         c.title_ur, c.summary_ur
+  from (select * from reports where dup_rank = 1 union all select * from advisories union all select * from risks) c
+  order by c.sort_at desc, c.id
+  limit greatest(1, least(coalesce(p_limit, 20), 100));
+end;
+$$;
+
+comment on function public.intel_feed(double precision, double precision, double precision, text, text, integer) is
+  'Dynamic-radius local intelligence: reports (radius-gated), advisories (regional fallback) and forecast risks (nearest district or radius). Returns the evidence on every row and no coordinates at all. title_ur/summary_ur are null for a row whose source text is a quotation rather than authored wording.';
+
+-- A read model the guest may use, granted explicitly rather than left to the
+-- CREATE FUNCTION default: for a `security definer` function, EXECUTE to PUBLIC
+-- is a standing invitation, and re-creating the function above silently reset it.
+revoke all on function public.intel_feed(double precision, double precision, double precision, text, text, integer) from public;
+grant execute on function public.intel_feed(double precision, double precision, double precision, text, text, integer) to anon, authenticated, service_role;
 
 commit;

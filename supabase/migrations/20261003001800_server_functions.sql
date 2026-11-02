@@ -134,13 +134,9 @@ as $$
   from public.agri_knowledge_entries e, q
   where e.is_published
     -- A crop-specific question prefers its own crop but is not limited to it:
-    -- a wheat farmer asking about stored grain should still find the answer.
-    and (
-      p_crop is null
-      or e.crop_code is null
-      or e.crop_code = p_crop
-      or e.crop_code <> p_crop
-    )
+    -- a wheat farmer asking about stored grain should still find the answer, so
+    -- there is deliberately no crop filter here — the preference lives in the
+    -- ordering below, not in the WHERE clause.
     and (
       to_tsvector('simple', e.title_en || ' ' || e.body_en) @@ q.ts
       or e.title_en ilike '%' || btrim(p_query) || '%'
@@ -173,7 +169,10 @@ security definer
 set search_path = public, pg_temp
 as $$
   with entry as (
-    select e.id, e.slug
+    -- body_local is carried through because the product lookup below reads
+    -- `products` out of it. Selecting only the id here made the second CTE
+    -- reference a column its input does not expose.
+    select e.id, e.slug, e.body_local
     from public.agri_knowledge_entries e
     where e.slug = p_slug and e.is_published
     order by e.version desc

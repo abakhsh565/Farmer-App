@@ -72,7 +72,7 @@ VITE_AI_ENDPOINT                              → AI
 VITE_OTP_ENDPOINT                             → one-time codes
 VITE_WEATHER_INGEST_ENDPOINT                  → server-side weather ingestion
 VITE_DEALER_ENDPOINT                          → dealer integration endpoint
-VITE_POSTHOG_KEY                              → analytics
+VITE_ANALYTICS_KEY                             → analytics
 ```
 
 ## The server side: `supabase/functions/`

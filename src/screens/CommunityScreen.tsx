@@ -12,6 +12,7 @@ import { GuidelinesSheet } from '@/components/community/Moderation';
 import { PostCard } from '@/components/community/PostCard';
 import { StoryRow, StoryViewer } from '@/components/community/Stories';
 import { ThreadView } from '@/components/community/ThreadView';
+import { useSession } from '@/session/SessionProvider';
 
 /**
  * The Community tab: what nearby farmers are asking, and what they have learned.
@@ -24,6 +25,7 @@ import { ThreadView } from '@/components/community/ThreadView';
  */
 export function CommunityScreen() {
   const { t } = useLocale();
+  const { account } = useSession();
   const {
     status,
     retry,
@@ -73,7 +75,7 @@ export function CommunityScreen() {
             </button>
           </GuidelinesSheet>
           <span className="grid size-9 shrink-0 place-items-center rounded-full bg-brand text-caption font-medium text-brand-foreground">
-            {initialsOf(t('farmer.name'))}
+            {initialsOf(account?.name ?? t('farmer.guestName'))}
           </span>
         </div>
       </header>

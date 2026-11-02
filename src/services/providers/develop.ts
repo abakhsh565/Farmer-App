@@ -41,6 +41,8 @@ import type {
   DealerSearchQuery,
   DealerStockist,
   DealerSummary,
+  ProductHit,
+  ProductSearchQuery,
   GeoPoint,
   MarketProvider,
   MarketRate,
@@ -664,6 +666,52 @@ export class DevelopmentDealerProvider implements DealerProvider {
       freshness: fixture && fixture.syncState === 'fresh' ? 'fresh' : 'stale',
       status: fixture && fixture.syncState === 'unreachable' ? 'failing' : 'development',
       error: fixture?.syncState === 'unreachable' ? 'The dealer system could not be reached.' : undefined,
+    };
+  }
+
+  /**
+   * Products by name, across the shops in range.
+   *
+   * Every listing comes from the same per-shop fixtures that a shop's own page
+   * shows, so a price found by searching is the price found by opening the shop.
+   * A search that kept its own copy of the catalogue is how the two drift.
+   *
+   * A shop the source cannot reach is still searched and still listed, because its
+   * listing exists — only its stock state is unknown, and that is already carried
+   * on the row. Dropping the shop would answer a question the source did not.
+   */
+  async searchProducts(query: ProductSearchQuery): Promise<Sourced<ProductHit[]>> {
+    const t = this.now();
+    const origin = query.origin ?? this.profilePoint;
+    const radius = Math.min(Math.max(query.radiusKm, 1), this.maxRadiusKm);
+    const text = query.query?.trim().toLowerCase() ?? '';
+
+    const hits: ProductHit[] = [];
+    for (const dealer of DEALER_FIXTURE) {
+      const distanceKm = Number(haversineKm(origin, dealer.point).toFixed(1));
+      if (distanceKm > radius) continue;
+
+      for (const product of DEALER_PRODUCTS[dealer.id] ?? []) {
+        const haystack = [product.name, product.brand ?? '', product.category ?? '']
+          .join(' ')
+          .toLowerCase();
+        if (text.length > 0 && !haystack.includes(text)) continue;
+        hits.push({ product, dealerId: dealer.id, dealerName: dealer.name, distanceKm });
+      }
+    }
+
+    hits.sort((a, b) => a.distanceKm - b.distanceKm);
+
+    return {
+      data: hits,
+      sourceLabel: this.name,
+      observedAt: t,
+      fetchedAt: t,
+      // A listing from a shop whose projection has gone unreachable is not fresh,
+      // and saying "fresh" here would make the search the one screen that lies
+      // about the age of its prices.
+      freshness: hits.some((hit) => hit.product.syncState === 'fresh') ? 'fresh' : 'stale',
+      status: 'development',
     };
   }
 

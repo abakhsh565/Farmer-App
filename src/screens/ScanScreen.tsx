@@ -13,6 +13,7 @@ import { SectionLabel } from '@/components/SectionLabel';
 import { LoadingState } from '@/components/States';
 import { useCredit } from '@/credit/CreditProvider';
 import { dealerNameKey } from '@/data/dealers';
+import { useLocation } from '@/location/LocationProvider';
 import { ROUNDUP } from '@/data/products';
 import { useStockists } from '@/services/hooks';
 import { verdictFor, type Verdict } from '@/scan/analyze';
@@ -72,8 +73,6 @@ const SYMPTOMS: ReadonlyArray<MessageKey> = [
 /** The design's staged confidence, shown as a match rather than a bare number. */
 const MATCH = 82;
 
-/** The default nearby radius; the dealer screen lets the farmer widen it. */
-const SEARCH_RADIUS_KM = 10;
 
 /** A follow-up the farmer typed, and what the assistant did with it. */
 type Turn =
@@ -95,6 +94,10 @@ export function ScanScreen({ onOpenDealers }: { onOpenDealers: () => void }) {
   const [listening, setListening] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
 
+  /* The radius the farmer chose on the location page, so "no shop within N km"
+     here is about the same N km the dealer list searched. */
+  const location = useLocation();
+
   /*
    * The shops that have the recommended product, read from the dealer service —
    * not written beside the treatment. This is what makes the price on a diagnosis
@@ -106,7 +109,7 @@ export function ScanScreen({ onOpenDealers }: { onOpenDealers: () => void }) {
    * the time the result appears. It is one read of a projection that is already
    * warm by then.
    */
-  const stockists = useStockists(ROUNDUP.id, SEARCH_RADIUS_KM);
+  const stockists = useStockists(ROUNDUP.id, location.radiusKm);
 
   /* Object URLs for attached photos, released on unmount and only then — a
      cleanup keyed on the photo list would revoke the last one while it is still
@@ -389,7 +392,7 @@ export function ScanScreen({ onOpenDealers }: { onOpenDealers: () => void }) {
             <p className="mt-2 text-label text-cream-50/80">
               {stockists.status === 'error'
                 ? t('scan.product.error')
-                : t('scan.product.none', { radius: SEARCH_RADIUS_KM })}
+                : t('scan.product.none', { radius: location.radiusKm })}
             </p>
           )}
 

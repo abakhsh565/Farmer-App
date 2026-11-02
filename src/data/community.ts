@@ -35,7 +35,7 @@ export type Author = {
 };
 
 export const AUTHORS: Record<AuthorId, Author> = {
-  me: { nameKey: 'farmer.name', tint: 'bg-brand' },
+  me: { nameKey: 'community.author.you', tint: 'bg-brand' },
   sajid: { nameKey: 'community.author1', tint: 'bg-blue-500' },
   rafiq: { nameKey: 'community.author2', tint: 'bg-amber-600' },
   amna: { nameKey: 'community.author.amna', tint: 'bg-violet-500', expert: true },
@@ -240,6 +240,12 @@ export type CommunitySeed = { posts: Post[]; stories: Story[] };
  * The feed as it is on first launch. A new install with an empty feed reads as a
  * broken feature rather than an unstarted one, and a farmer who has been in this
  * village for years always has neighbours to answer.
+ *
+ * Note the authors: every seeded post belongs to a *neighbour*, none to `me`.
+ * One used to be attributed to the farmer — a harvest update, with likes, that
+ * they had never written — which on a shared phone is read as the previous
+ * person's post and, on a fresh install, simply as a lie. Content the farmer did
+ * not write is never labelled as the farmer's.
  */
 export function createSeed(now: number): CommunitySeed {
   const posts: Post[] = [
@@ -268,7 +274,7 @@ export function createSeed(now: number): CommunitySeed {
     },
     {
       id: 'p3',
-      author: 'me',
+      author: 'akram',
       kind: 'update',
       topics: ['cotton', 'market'],
       place: 'wazirabad',

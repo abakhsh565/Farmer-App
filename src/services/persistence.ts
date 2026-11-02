@@ -22,11 +22,19 @@
  * Two decisions worth stating, because they are the kind of thing that is obvious
  * only after it has gone wrong:
  *
- * · The phone's mirror is keyed by collection, not by account. A farm phone
- *   belongs to one farmer, and a document that changed its key at sign-in would
- *   mean a farmer losing their crops by signing in. The account identity is used
- *   for the *backend* document, so a farmer who signs in on a second phone gets
- *   their data — and the device copy stays the thing that works with no network.
+ * · A document belongs to exactly one owner, and owners never inherit each
+ *   other's documents. The device's own copy (`agri-shop.<collection>`) is the
+ *   guest's; an account's copy lives beside it, keyed by the account
+ *   (`agri-shop.<collection>.<account>`). The one hand-over the product promises
+ *   is guest → account at the moment a farmer signs in. Everything else — sign
+ *   out, or a different account signing in on the same phone — starts from the
+ *   new owner's own copy or from the store's seed, never from the previous
+ *   owner's document.
+ *
+ * · Only a party-owned document ever reaches the backend. The device's own
+ *   document has no server-side owner (there is no party until someone signs
+ *   in), so it stays on the phone; the guest's work enters the backend once,
+ *   when it is migrated to the account that was made for it.
  *
  * · Read is async and write is not awaited by callers. A store that had to await
  *   a network write before showing a farmer their own post would be a store that
@@ -103,6 +111,46 @@ export function deviceOwnerId(): string {
  */
 export function ownerFor(accountId: string | null): string {
   return accountId && accountId.length > 0 ? accountId : deviceOwnerId();
+}
+
+/**
+ * Whether this document belongs to the phone itself rather than to a person.
+ *
+ * The device's own document has no owner on the backend: there is no party
+ * until someone signs in, and `client_document_*` match every row against a
+ * party id, so asking the backend about it could only produce an error — and a
+ * failed write is retried forever, which is how a phone ends up with a queue
+ * that never drains. It is written to the phone and nowhere else. Once someone
+ * signs in, the guest's work is migrated to the account, which is the form the
+ * backend is able to accept.
+ */
+export function isDeviceDocument(ownerId: string): boolean {
+  return ownerId === deviceOwnerId();
+}
+
+/**
+ * Whether the backend can address this owner at all.
+ *
+ * The server keys a document by a party id, which is a UUID, and there are two
+owner ids in normal use that it cannot address:
+ *
+ *   · `device-…` — nobody has signed in yet.
+ *   · `phone:+923001234567` (or `email:…`) — someone signed in but the party id
+ *     never arrived, which is what happens when `ensure_party()` fails at the
+ *     moment of sign-in. The account is real and the session is real; the *row
+ *     key* is not.
+ *
+ * Writing either of them can only ever fail: PostgreSQL rejects the value with
+ * `22P02 invalid input syntax for type uuid`, which is a permanent error, and a
+ * permanent error retried forever is a "waiting to save" badge that never
+ * clears. So the test is the *shape* of the id rather than whether it looks like
+ * a device — anything the server cannot address stays on the phone, and is
+ * pushed up the moment a party id arrives.
+ */
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export function isServerOwned(ownerId: string): boolean {
+  return UUID_PATTERN.test(ownerId);
 }
 
 export function readMirror(collection: Collection, ownerId: string): string | null {
@@ -229,6 +277,32 @@ type QueuedWrite = {
 const RETRY_DELAYS_MS = [1_000, 3_000, 8_000, 20_000, 30_000] as const;
 
 /**
+ * Whether another attempt could plausibly succeed.
+ *
+ * Two failures look identical to a queue and are not: "the backend could not be
+ * reached" resolves when the signal returns, and "the backend refused this
+ * write" never does. Retrying the second forever is how the app tells a farmer
+ * their work is waiting to save while nothing is going to happen. So the message
+ * is classified, and a refusal stops the timer while keeping the document
+ * queued — nothing is lost, and an explicit retry can still try again.
+ */
+export function isPermanentWriteFailure(message: string): boolean {
+  const text = message.toLowerCase();
+  return (
+    // A stale revision, or the pre-0024 duplicate-key refusal from the server.
+    text.includes('changed on another device') ||
+    text.includes('duplicate key') ||
+    // The database refused the row: not this farmer's document, or not this shape.
+    text.includes('may only write its own') ||
+    text.includes('row-level security') ||
+    text.includes('insufficient_privilege') ||
+    text.includes('permission denied') ||
+    // The owner id is not a uuid, and no number of retries makes it one.
+    text.includes('invalid input syntax')
+  );
+}
+
+/**
  * One queue for the whole app, not one per store.
  *
  * A shared queue means a single retry timer and a single "3 changes waiting"
@@ -251,13 +325,26 @@ class WriteQueue {
     if (this.entries.size > 0) void this.flush();
   }
 
-  private publish(): void {
-    const next: QueueSnapshot = {
-      pending: this.entries.size,
-      error: [...this.entries.values()].some((entry) => entry.attempts > 0)
-        ? this.snapshot.error
-        : null,
-    };
+  /**
+   * The snapshot the entries describe, with `error` carried only while some
+   * entry is actually in a failed state.
+   */
+  private snapshotWith(error: string | null): QueueSnapshot {
+    const anyAttempted = [...this.entries.values()].some((entry) => entry.attempts > 0);
+    return { pending: this.entries.size, error: anyAttempted ? error : null };
+  }
+
+  /**
+   * Announce a new snapshot — and only ever replace it here.
+   *
+   * The drain path used to assign `this.snapshot` itself and then call publish,
+   * which compares the newly computed value against the value just assigned and
+   * returns early: the subscribers were never told that a write had landed, so a
+   * "5 waiting to sync" badge stayed on screen after the backend had already
+   * accepted all five. Every snapshot change goes through this one door now, so
+   * the count a farmer sees is the count that exists.
+   */
+  private publish(next: QueueSnapshot): void {
     if (next.pending === this.snapshot.pending && next.error === this.snapshot.error) return;
     this.snapshot = next;
     for (const listener of this.listeners) listener();
@@ -274,7 +361,7 @@ class WriteQueue {
       value,
       attempts: 0,
     });
-    this.publish();
+    this.publish(this.snapshotWith(this.snapshot.error));
     void this.flush();
   }
 
@@ -299,16 +386,16 @@ class WriteQueue {
         await repository.write(entry.collection, entry.ownerId, entry.value);
         // Removed only if it was not replaced while the write was in flight.
         if (this.entries.get(key) === entry) this.entries.delete(key);
-        this.snapshot = { ...this.snapshot, error: null, pending: this.entries.size };
-        this.publish();
+        this.publish(this.snapshotWith(null));
       } catch (error) {
         entry.attempts += 1;
-        this.snapshot = {
-          pending: this.entries.size,
-          error: error instanceof Error ? error.message : 'Write failed.',
-        };
-        this.publish();
-        this.scheduleRetry(entry.attempts);
+        const message = error instanceof Error ? error.message : 'Write failed.';
+        this.publish(this.snapshotWith(message));
+        /* A refusal is not a bad connection: retrying it forever leaves a
+           permanent "waiting to save" badge, so the timer stops. The entry stays
+           queued, so the next change, a reconnect or the retry control still
+           gets another attempt. */
+        if (!isPermanentWriteFailure(message)) this.scheduleRetry(entry.attempts);
         /* Leave the rest queued: a backend that refused one write is likely to
            refuse the next, and hammering it is not a fix. */
         return;
@@ -342,9 +429,12 @@ class WriteQueue {
       clearTimeout(this.timer);
       this.timer = null;
     }
+    const was = this.snapshot;
     this.entries.clear();
     this.snapshot = { pending: 0, error: null };
-    this.publish();
+    if (was.pending !== 0 || was.error !== null) {
+      for (const listener of this.listeners) listener();
+    }
   }
 }
 
@@ -358,6 +448,18 @@ export function attachRepository(repository: Repository): void {
 /** Wait for everything queued to be written. Used by tests and by sign-out. */
 export function flushWrites(): Promise<void> {
   return writeQueue.flush();
+}
+
+/**
+ * Drop everything queued instead of retrying it.
+ *
+ * Sign-out uses this *after* a flush: once the server session is gone, the
+ * token those writes were authorised by is gone too, so retrying them can only
+ * fail. The documents themselves are safe on the phone; this only stops the
+ * queue from pretending a write is still coming.
+ */
+export function discardWrites(): void {
+  writeQueue.clear();
 }
 
 export function pendingWrites(): number {
@@ -527,22 +629,45 @@ export function usePersistentDocument<T>(spec: DocumentSpec<T>): PersistentDocum
    */
   const syncedRaw = useRef<string | null>(null);
   const ownerRef = useRef(ownerId);
-
+  /**
+   * The newest document on screen, for the one hand-over that may adopt it.
+   *
+   * The load is async, and a guest who is signing in can write something while
+   * it is in flight — the post they were asked to sign in for. Reading the
+   * *latest* guest document (not the one captured when the effect ran) is what
+   * makes that request survive the round trip; every other owner change must
+   * never read this ref, because it holds the previous owner's document.
+   */
+  const dataRef = useRef(data);
+  dataRef.current = data;
 
   useEffect(() => {
     let cancelled = false;
     const current = specRef.current;
-    const isOwnerChange = ownerRef.current !== ownerId;
+    const previousOwner = ownerRef.current;
+    const isOwnerChange = previousOwner !== ownerId;
     ownerRef.current = ownerId;
 
     /*
-     * Signing *out*: the account's document is not this guest's to look at, so it
-     * is replaced now — from this device's own copy, or from the seed — rather
-     * than left on the screen until the backend answers. Signing *in* is the other
-     * direction and is deliberately not treated this way: what is on screen there
-     * is the guest's own work, and it is about to become the account's.
+     * The one hand-over the product promises is guest → account: what is on
+     * screen belongs to the guest, and it is about to become the account's. It
+     * is also the only direction that may adopt the in-memory document. In every
+     * other owner change — signing out, or a different account signing in on the
+     * same phone — `data` still belongs to the *previous* owner and is replaced
+     * now, from the new owner's own copy or from the seed, rather than left on
+     * screen until the backend answers.
      */
-    if (isOwnerChange && ownerId === deviceOwnerId()) {
+    /*
+     * Generalised from "the previous owner was the device": a hand-over is *any*
+     * move from an owner the backend cannot address to one it can. The second
+     * case is the one that matters in practice — a farmer whose sign-in produced
+     * no party id works against a `phone:…` document, and the moment the party id
+     * arrives their crops, posts and conversations must move with them, not be
+     * replaced by the seed because the key changed.
+     */
+    const isHandOver = isOwnerChange && !isServerOwned(previousOwner) && isServerOwned(ownerId);
+
+    if (isOwnerChange && !isHandOver) {
       let own: T | null = null;
       try {
         own = current.hydrate(readMirrorStrict(collection, ownerId), current.now?.() ?? Date.now());
@@ -567,7 +692,14 @@ export function usePersistentDocument<T>(spec: DocumentSpec<T>): PersistentDocum
       setDurable(mirrorWritable());
 
       try {
-        const remote = await repository.read<unknown>(collection, ownerId);
+        /*
+         * The device's own document is local by definition and has no backend
+         * counterpart to ask about; an account's document is read through the
+         * repository, which is where the backend lives when one is configured.
+         */
+        const remote = isDeviceDocument(ownerId)
+          ? null
+          : await repository.read<unknown>(collection, ownerId);
         if (cancelled) return;
         setReadError(null);
 
@@ -619,34 +751,38 @@ export function usePersistentDocument<T>(spec: DocumentSpec<T>): PersistentDocum
         }
 
         /*
-         * The backend has nothing for this owner. Two cases, one behaviour:
+         * The backend has nothing for this owner. Three cases, and only one of
+         * them may adopt what is in memory:
          *
-         *   · first run — the seed becomes the backend's starting document
+         *   · first run — the seed becomes this owner's starting document
+         *   · this owner already has a copy on the phone — it *is* the document,
+         *     and the screen is switched to it. Without that switch, a farmer
+         *     signing back in on their own phone would watch the guest's copy on
+         *     screen overwrite the account's record.
          *   · a guest signing in — the device's document is migrated to the
          *     account, which is the "carry the farming context into the account"
-         *     rule, enforced for every collection at once
-         *
-         * In both cases the bytes sent are the ones the farmer is looking at —
-         * read from *this owner's* copy on the phone rather than closed over,
-         * because on an owner change the render's `data` still belongs to the
-         * previous owner. And what is sent is the document's own bytes, not the
-         * in-memory state: the store's `hydrate` is the reader on the way back, so
-         * a write that skipped it could never be read at all.
+         *     rule. This is the only case where the in-memory document is read;
+         *     for every other owner change it still belongs to the previous
+         *     owner, and adopting it is how one account's private chat and credit
+         *     would surface inside the next account's record.
          */
-        let deviceCopy: T | null = null;
+        let ownCopy: T | null = null;
         try {
-          deviceCopy = current.hydrate(
+          ownCopy = current.hydrate(
             readMirrorStrict(collection, ownerId),
             current.now?.() ?? Date.now(),
           );
         } catch {
-          deviceCopy = null;
+          ownCopy = null;
         }
 
-        const bytes = current.serialise(deviceCopy ?? data);
+        const carried = isHandOver ? dataRef.current : null;
+        const resolved = ownCopy ?? carried ?? current.seed();
+        const bytes = current.serialise(resolved);
         syncedRaw.current = bytes;
         writeMirror(collection, ownerId, bytes);
-        writeQueue.enqueue(collection, ownerId, bytes);
+        if (isServerOwned(ownerId)) writeQueue.enqueue(collection, ownerId, bytes);
+        setData(resolved);
         /*
          * Neither source could produce the farmer's document: the phone refused
          * and the backend has nothing for this owner. That is the one failure the
@@ -710,8 +846,9 @@ export function usePersistentDocument<T>(spec: DocumentSpec<T>): PersistentDocum
     syncedRaw.current = raw;
     writeMirror(collection, ownerId, raw);
     /* The document's own bytes, not the state object: `hydrate` is what reads it
-       back, and it cannot read a shape it did not write. */
-    writeQueue.enqueue(collection, ownerId, raw);
+       back, and it cannot read a shape it did not write. A device-owned document
+       is written to the phone only — it has no owner on the backend. */
+    if (isServerOwned(ownerId)) writeQueue.enqueue(collection, ownerId, raw);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [data, collection, ownerId, loading]);
 

@@ -41,6 +41,8 @@ import type {
   OtpProvider,
   OtpRequest,
   OtpVerifyResult,
+  ProductHit,
+  ProductSearchQuery,
   Repository,
   Sourced,
   StockistQuery,
@@ -49,66 +51,21 @@ import type {
   WeatherProvider,
 } from '../types';
 import { serviceConfig } from '../config';
+import { currentAccessToken, getSupabaseClient } from '../supabaseClient';
 import type { MessageKey } from '../../i18n/catalog';
 
 /* -------------------------------------------------------------------------- */
 /* Supabase client                                                            */
 /* -------------------------------------------------------------------------- */
 
-type SupabaseLike = {
-  from: (table: string) => unknown;
-  rpc: (fn: string, args?: Record<string, unknown>) => Promise<{ data: unknown; error: { message: string } | null }>;
-  auth: {
-    getSession: () => Promise<{ data: { session: { access_token: string } | null } }>;
-  };
-};
-
-let cachedClient: SupabaseLike | null = null;
-let clientFailed = false;
-
 /**
- * Lazily creates the client. Returns null rather than throwing when the backend
- * is not configured or the dependency is unavailable, so callers degrade to
- * their development behaviour instead of crashing the screen.
+ * The shared client, so the token that authorises these reads is the same token
+ * the auth provider issued. It lives in `supabaseClient.ts` because the saved
+ * location and the session exchange need it too, and two clients would be two
+ * copies of one session.
  */
-async function supabase(): Promise<SupabaseLike | null> {
-  if (cachedClient) return cachedClient;
-  if (clientFailed) return null;
-
-  if (!serviceConfig.supabase.configured) return null;
-
-  try {
-    // Dynamic so the dependency is code-split and is not required to run the app.
-    const mod = await import('@supabase/supabase-js');
-    cachedClient = mod.createClient(
-      serviceConfig.supabase.url as string,
-      serviceConfig.supabase.anonKey as string,
-      { auth: { persistSession: true, autoRefreshToken: true } },
-    ) as unknown as SupabaseLike;
-    return cachedClient;
-  } catch {
-    clientFailed = true;
-    return null;
-  }
-}
-
-/**
- * The signed-in farmer's access token, or null.
- *
- * Read from the Supabase client's own session rather than from a store of our
- * own, so there is exactly one copy of the token and one place that refreshes it.
- * A guest is a legitimate answer here: the AI gateway answers guests, and an
- * expired token in the moment before refresh simply arrives as one.
- */
-async function currentAccessToken(): Promise<string | null> {
-  const client = cachedClient;
-  if (!client) return null;
-  try {
-    const { data } = await client.auth.getSession();
-    return data.session?.access_token ?? null;
-  } catch {
-    return null;
-  }
+async function supabase() {
+  return getSupabaseClient(serviceConfig.supabase);
 }
 
 function failing<T>(fallback: T, sourceLabel: string, error: string): Sourced<T> {
@@ -379,6 +336,41 @@ function syncStateOf(value: string): 'fresh' | 'stale' | 'unreachable' {
   return value === 'fresh' || value === 'stale' ? value : 'unreachable';
 }
 
+/**
+ * One row of the dealer system's product projection, normalised.
+ *
+ * Shared by the shop's own product list and by product search, because the two
+ * must not be able to disagree about a price: a search result and the page it
+ * came from read the same mapping.
+ */
+function toDealerProduct(r: DealerProductRow): DealerProduct {
+  return {
+    id: r.id,
+    name: r.name,
+    brand: r.brand,
+    category: r.category,
+    canonicalProductId: r.canonical_product_id,
+    registrationNo: r.registration_no,
+    packSize: r.pack_size,
+    // NULL passes through untouched: unknown quantity must not become zero.
+    availableQty: r.available_qty,
+    inStock: r.in_stock,
+    unitPrice: r.unit_price,
+    currency: r.currency,
+    syncState: syncStateOf(r.sync_state),
+  };
+}
+
+/**
+ * How many shops product search will ask.
+ *
+ * The count is a bound on requests, not a claim about the area: the nearest shops
+ * are asked and the number asked is reported back in the source label, so a search
+ * that looked at part of the radius says so rather than presenting a partial
+ * answer as a complete one.
+ */
+const PRODUCT_SEARCH_SHOP_LIMIT = 8;
+
 export class SupabaseDealerProvider implements DealerProvider {
   readonly name = 'Supabase dealer projection';
   readonly maxRadiusKm = 100 as const;
@@ -435,21 +427,7 @@ export class SupabaseDealerProvider implements DealerProvider {
     if (error) return failing<DealerProduct[]>([], this.name, error.message);
 
     const rows = (data as DealerProductRow[] | null) ?? [];
-    const mapped: DealerProduct[] = rows.map((r) => ({
-      id: r.id,
-      name: r.name,
-      brand: r.brand,
-      category: r.category,
-      canonicalProductId: r.canonical_product_id,
-      registrationNo: r.registration_no,
-      packSize: r.pack_size,
-      // NULL passes through untouched: unknown quantity must not become zero.
-      availableQty: r.available_qty,
-      inStock: r.in_stock,
-      unitPrice: r.unit_price,
-      currency: r.currency,
-      syncState: syncStateOf(r.sync_state),
-    }));
+    const mapped: DealerProduct[] = rows.map(toDealerProduct);
 
     return {
       data: mapped,
@@ -457,6 +435,80 @@ export class SupabaseDealerProvider implements DealerProvider {
       observedAt: Date.now(),
       fetchedAt: Date.now(),
       freshness: rows.some((r) => r.sync_state === 'fresh') ? 'fresh' : 'stale',
+      status: 'live',
+    };
+  }
+
+  /**
+   * Products by name, across the shops in range.
+   *
+   * There is no product-search function on the server, and adding one would put
+   * the text match in SQL while the radius and the distance stayed here — the same
+   * rule stated in two places, which is how the two come to disagree. So this
+   * composes the two reads the app already trusts: the shops come from
+   * `dealers_within_radius`, and each nearest shop's own projection is read
+   * through `dealer_products_for`.
+   *
+   * That is a fan-out, so it is bounded. A 100 km radius can hold dozens of shops,
+   * and dozens of requests per keystroke is not a search box. The nearest shops are
+   * asked and the number is named in the source label, because quietly searching
+   * part of the area and presenting it as all of it is the failure this whole
+   * layer exists to prevent.
+   */
+  async searchProducts(query: ProductSearchQuery): Promise<Sourced<ProductHit[]>> {
+    const client = await supabase();
+    if (!client) return failing<ProductHit[]>([], this.name, 'Backend is not configured.');
+
+    const { data, error } = await client.rpc('dealers_within_radius', {
+      p_farmer_id: null,
+      p_lat: query.origin?.lat ?? null,
+      p_lon: query.origin?.lon ?? null,
+      p_radius_km: Math.min(query.radiusKm, this.maxRadiusKm),
+    });
+    if (error) return failing<ProductHit[]>([], this.name, error.message);
+
+    const shops = ((data as DealerRow[] | null) ?? [])
+      .map((r) => ({ id: r.dealer_id, name: r.shop_name, distanceKm: Number(r.distance_km) }))
+      .sort((a, b) => a.distanceKm - b.distanceKm)
+      .slice(0, PRODUCT_SEARCH_SHOP_LIMIT);
+
+    const text = query.query?.trim().toLowerCase() ?? '';
+
+    const listings = await Promise.all(
+      shops.map(async (shop) => {
+        const { data: productData, error: productError } = await client.rpc('dealer_products_for', {
+          p_dealer_id: shop.id,
+        });
+        /* One shop's projection failing does not fail the search: the other shops
+           answered, and their listings are still true. It does mean this shop's
+           stock is unknown, which is why the row it would have contributed is
+           simply absent rather than present and guessed. */
+        if (productError) return [] as ProductHit[];
+        return ((productData as DealerProductRow[] | null) ?? [])
+          .filter((row) => {
+            if (text.length === 0) return true;
+            const haystack = [row.name, row.brand ?? '', row.category ?? '']
+              .join(' ')
+              .toLowerCase();
+            return haystack.includes(text);
+          })
+          .map((row) => ({
+            product: toDealerProduct(row),
+            dealerId: shop.id,
+            dealerName: shop.name,
+            distanceKm: shop.distanceKm,
+          }));
+      }),
+    );
+
+    const hits = listings.flat().sort((a, b) => a.distanceKm - b.distanceKm);
+
+    return {
+      data: hits,
+      sourceLabel: `${this.name} (nearest ${shops.length} shops)`,
+      observedAt: Date.now(),
+      fetchedAt: Date.now(),
+      freshness: hits.some((hit) => hit.product.syncState === 'fresh') ? 'fresh' : 'stale',
       status: 'live',
     };
   }

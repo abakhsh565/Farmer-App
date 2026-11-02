@@ -12,6 +12,8 @@ import { useSession } from '@/session/SessionProvider';
 import { InsightSheets } from '@/components/insights/Insights';
 import {
   activeForCrop,
+  addCrop as addCropIn,
+  chooseCrop as chooseCropIn,
   createSeed,
   dismiss as dismissIn,
   hydrate,
@@ -23,6 +25,7 @@ import {
   serialise,
   unreadCount,
   visibleNotifications,
+  type AddCropInput,
   type CropInstance,
   type Insight,
   type InsightData,
@@ -50,6 +53,18 @@ export type InsightValue = {
   act: (insightId: string) => void;
   dismiss: (insightId: string) => void;
   makePrimary: (cropId: string) => void;
+  /**
+   * Adding a crop, the only way the list grows. Exposed on the provider so the
+   * onboarding flow adds a crop through the same writer as every other screen
+   * rather than reaching into the document itself.
+   */
+  addCrop: (input: AddCropInput) => void;
+  /**
+   * Names the farmer's main crop, adding it to the list first when they have not
+   * mentioned it before. Profile's crop strip is the caller: choosing "Cotton"
+   * there is both "I grow this" and "this is the one my home screen is about".
+   */
+  chooseCrop: (input: AddCropInput) => void;
   notifications: InsightNotification[];
   unread: number;
   notificationsOpen: boolean;
@@ -111,6 +126,8 @@ export function InsightProvider({ children }: { children: ReactNode }) {
         setOpenInsightId(null);
       },
       makePrimary: (cropId) => setData((current) => makePrimaryIn(current, cropId)),
+      addCrop: (input) => setData((current) => addCropIn(current, input, Date.now())),
+      chooseCrop: (input) => setData((current) => chooseCropIn(current, input, Date.now())),
       notifications: visibleNotifications(data, now),
       unread: unreadCount(data, now),
       notificationsOpen,

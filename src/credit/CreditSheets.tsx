@@ -1,4 +1,4 @@
-import { ChevronLeft, Info, TriangleAlert, Wrench } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Info, TriangleAlert, Wrench } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { toast } from 'sonner';
 import { SectionLabel } from '@/components/SectionLabel';
@@ -13,9 +13,11 @@ import { formatDay, formatMoney, formatRelativeTime } from '@/i18n/format';
 import { useSession } from '@/session/SessionProvider';
 import { useCredit } from './CreditProvider';
 import {
+  MAX_CREDIT_SHOPS,
   changedFields,
   currentTerms,
   isActive,
+  shopsHoldingCredit,
   totalOf,
   type Agreement,
   type CreditEvent,
@@ -37,7 +39,19 @@ import {
  * a demo of the shop owner's app rather than anywhere near the farmer's actions.
  */
 
-type View = { kind: 'summary' } | { kind: 'request' } | { kind: 'detail'; id: string };
+type View =
+  | { kind: 'summary' }
+  | { kind: 'request' }
+  | { kind: 'detail'; id: string }
+  | { kind: 'shop'; dealerKey: MessageKey };
+
+/** One creditor, as the summary lists them: what is owed there and what for. */
+type ShopSummary = {
+  dealerKey: MessageKey;
+  outstanding: number;
+  paidPercent: number;
+  products: MessageKey[];
+};
 
 export function CreditCenter({
   open,
@@ -69,6 +83,39 @@ export function CreditCenter({
     0,
   );
 
+  /*
+   * Credit is held per *shop*, so the summary lists creditors, not purchases: one
+   * row per shop, with everything bought there behind it. A shop's purchases are
+   * summarised rather than listed — the row answers "who do I owe, and how much"
+   * first, and what it was for is one tap away.
+   */
+  const shops: ShopSummary[] = shopsHoldingCredit(credit.data).map((dealerKey) => {
+    const agreements = credit.data.agreements.filter(
+      (agreement) =>
+        agreement.closedAt === null &&
+        credit.requestById(agreement.requestId)?.dealerKey === dealerKey,
+    );
+    const totals = agreements.reduce(
+      (sum, agreement) => {
+        const request = credit.requestById(agreement.requestId);
+        const terms = request?.terms.find((version) => version.version === agreement.termsVersion);
+        return {
+          paid: sum.paid + agreement.paid,
+          total: sum.total + (terms ? terms.amount + terms.fee : 0),
+        };
+      },
+      { paid: 0, total: 0 },
+    );
+    return {
+      dealerKey,
+      outstanding: agreements.reduce((sum, agreement) => sum + credit.outstandingOf(agreement), 0),
+      paidPercent: totals.total > 0 ? Math.round((totals.paid / totals.total) * 100) : 0,
+      products: agreements
+        .map((agreement) => credit.requestById(agreement.requestId)?.productKey)
+        .filter((key): key is MessageKey => key !== undefined),
+    };
+  });
+
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent side="bottom" className="mx-auto max-h-[88dvh] w-full max-w-[430px] overflow-y-auto">
@@ -88,7 +135,9 @@ export function CreditCenter({
               ? t('credit.center.title')
               : view.kind === 'request'
                 ? t('credit.form.title')
-                : t('credit.detail.title')}
+                : view.kind === 'shop'
+                  ? t(view.dealerKey)
+                  : t('credit.detail.title')}
           </SheetTitle>
         </SheetHeader>
 
@@ -135,43 +184,20 @@ export function CreditCenter({
                 </section>
               ) : null}
 
-              {credit.data.agreements.length > 0 ? (
+              {shops.length > 0 ? (
                 <section>
-                  <SectionLabel>{t('credit.section.agreements')}</SectionLabel>
+                  <SectionLabel>{t('credit.shops.title')}</SectionLabel>
+                  <p className="mt-1 text-caption text-muted-foreground">
+                    {t('credit.shops.limit', { count: MAX_CREDIT_SHOPS })}
+                  </p>
                   <ul className="mt-2 space-y-2">
-                    {credit.data.agreements.map((agreement) => {
-                      const request = credit.requestById(agreement.requestId);
-                      if (!request) return null;
-                      const outstanding = credit.outstandingOf(agreement);
-                      return (
-                        <li key={agreement.requestId}>
-                          <button
-                            type="button"
-                            onClick={() => setView({ kind: 'detail', id: agreement.requestId })}
-                            className="w-full rounded-md border border-border bg-card p-3.5 text-start"
-                          >
-                            <span className="flex items-center justify-between gap-2">
-                              <span className="truncate text-body font-medium">
-                                {t(request.productKey)}
-                              </span>
-                              <span className="shrink-0 text-caption text-muted-foreground">
-                                {t(request.dealerKey)}
-                              </span>
-                            </span>
-                            <span className="mt-1.5 flex items-baseline justify-between gap-2 text-label">
-                              <span className="text-muted-foreground">
-                                {agreement.closedAt === null
-                                  ? t('credit.agreement.outstanding')
-                                  : t('credit.agreement.closed')}
-                              </span>
-                              {agreement.closedAt === null ? (
-                                <span className="tabular-nums">{formatMoney(outstanding, locale, t)}</span>
-                              ) : null}
-                            </span>
-                          </button>
-                        </li>
-                      );
-                    })}
+                    {shops.map((shop) => (
+                      <ShopRow
+                        key={shop.dealerKey}
+                        shop={shop}
+                        onOpen={() => setView({ kind: 'shop', dealerKey: shop.dealerKey })}
+                      />
+                    ))}
                   </ul>
                 </section>
               ) : null}
@@ -200,6 +226,13 @@ export function CreditCenter({
           {view.kind === 'request' ? <RequestForm onDone={(id) => setView({ kind: 'detail', id })} /> : null}
 
           {view.kind === 'detail' ? <RequestDetail id={view.id} /> : null}
+
+          {view.kind === 'shop' ? (
+            <ShopDetail
+              dealerKey={view.dealerKey}
+              onOpen={(id) => setView({ kind: 'detail', id })}
+            />
+          ) : null}
         </div>
       </SheetContent>
     </Sheet>
@@ -249,6 +282,167 @@ function StatusChip({ status }: { status: CreditStatus }) {
     <span className={`shrink-0 rounded-full px-2 py-0.5 text-caption font-medium ${tone[status]}`}>
       {t(`credit.status.${status}` as MessageKey)}
     </span>
+  );
+}
+
+/**
+ * One creditor, in the summary.
+ *
+ * The row leads with what is owed there, because that is the question a farmer
+ * opens this screen with; the products are stated underneath so the row is not
+ * anonymous, and the whole of it is one tap from the shop's own page. A shop
+ * holding two agreements is still one row — the limit this list shows is a count
+ * of shops, not of debts.
+ */
+function ShopRow({ shop, onOpen }: { shop: ShopSummary; onOpen: () => void }) {
+  const { t, locale } = useLocale();
+  return (
+    <li>
+      <button
+        type="button"
+        onClick={onOpen}
+        className="w-full rounded-md border border-border bg-card p-3.5 text-start"
+      >
+        <span className="flex items-baseline justify-between gap-2">
+          <span className="truncate text-body font-medium">{t(shop.dealerKey)}</span>
+          <span className="shrink-0 text-body tabular-nums">
+            {formatMoney(shop.outstanding, locale, t)}
+          </span>
+        </span>
+        <span className="mt-1 block truncate text-caption text-muted-foreground">
+          {t('credit.shop.products')} · {shop.products.map((key) => t(key)).join(' · ')}
+        </span>
+        <span className="mt-2 block h-1.5 overflow-hidden rounded-full bg-secondary">
+          <span
+            className="block h-full rounded-full bg-brand"
+            style={{ width: `${shop.paidPercent}%` }}
+          />
+        </span>
+        <span className="mt-1 flex items-center justify-between gap-2 text-caption text-muted-foreground">
+          <span>{t('credit.card.paid', { percent: shop.paidPercent })}</span>
+          <ChevronRight className="size-4 shrink-0 text-brand rtl:rotate-180" aria-hidden />
+        </span>
+      </button>
+    </li>
+  );
+}
+
+/**
+ * One shop's page: everything this farmer has with this shop, and nothing else.
+ *
+ * What was bought, what is left to repay on each purchase, what has been paid,
+ * and how it ended — the same records the request detail shows, grouped by the
+ * creditor rather than by the purchase, which is the way a farmer carries credit
+ * in their head.
+ */
+function ShopDetail({
+  dealerKey,
+  onOpen,
+}: {
+  dealerKey: MessageKey;
+  onOpen: (id: string) => void;
+}) {
+  const { t, locale } = useLocale();
+  const credit = useCredit();
+
+  const agreements = credit.data.agreements.filter(
+    (agreement) => credit.requestById(agreement.requestId)?.dealerKey === dealerKey,
+  );
+  const open = agreements.filter((agreement) => agreement.closedAt === null);
+  const outstanding = open.reduce((sum, agreement) => sum + credit.outstandingOf(agreement), 0);
+  const payments = agreements
+    .flatMap((agreement) => agreement.payments)
+    .sort((a, b) => b.at - a.at);
+  const settled = credit.data.requests.filter(
+    (request) => request.dealerKey === dealerKey && !isActive(request.status),
+  );
+
+  return (
+    <div className="flex flex-col gap-4">
+      <section className="rounded-lg bg-surface-inverted p-4 text-cream-50">
+        <p className="text-overline text-brand uppercase">{t('credit.agreement.outstanding')}</p>
+        <p className="mt-1 font-serif text-figure lining-nums tabular-nums">
+          {formatMoney(outstanding, locale, t)}
+        </p>
+      </section>
+
+      {open.length > 0 ? (
+        <section>
+          <SectionLabel>{t('credit.shop.products')}</SectionLabel>
+          <ul className="mt-2 space-y-2">
+            {open.map((agreement) => {
+              const request = credit.requestById(agreement.requestId);
+              if (!request) return null;
+              const terms = request.terms.find(
+                (version) => version.version === agreement.termsVersion,
+              );
+              return (
+                <li key={agreement.requestId}>
+                  <button
+                    type="button"
+                    onClick={() => onOpen(request.id)}
+                    className="w-full rounded-md border border-border bg-card p-3.5 text-start"
+                  >
+                    <span className="flex items-baseline justify-between gap-2">
+                      <span className="truncate text-body font-medium">
+                        {t(request.productKey)}
+                      </span>
+                      <span className="shrink-0 text-label tabular-nums">
+                        {formatMoney(credit.outstandingOf(agreement), locale, t)}
+                      </span>
+                    </span>
+                    <span className="mt-1 block text-caption text-muted-foreground">
+                      {terms ? t(terms.dueKey) : ''}
+                      {terms
+                        ? ` · ${formatMoney(agreement.paid, locale, t)} ${t('credit.agreement.paid')}`
+                        : ''}
+                    </span>
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        </section>
+      ) : null}
+
+      <section>
+        <SectionLabel>{t('credit.agreement.payments')}</SectionLabel>
+        {payments.length === 0 ? (
+          <p className="mt-2 text-body-sm text-muted-foreground">
+            {t('credit.agreement.noPayments')}
+          </p>
+        ) : (
+          <ul className="mt-2 space-y-1.5">
+            {payments.map((payment) => (
+              <li
+                key={payment.id}
+                className="flex items-baseline justify-between gap-2 text-body-sm"
+              >
+                <span className="text-muted-foreground">
+                  {t(payment.noteKey)} · {formatDay(new Date(payment.at), locale)}
+                </span>
+                <span className="tabular-nums">{formatMoney(payment.amount, locale, t)}</span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
+      {settled.length > 0 ? (
+        <section>
+          <SectionLabel>{t('credit.shop.history')}</SectionLabel>
+          <ul className="mt-2 space-y-2">
+            {settled.map((request) => (
+              <RequestRow
+                key={request.id}
+                request={request}
+                onOpen={() => onOpen(request.id)}
+              />
+            ))}
+          </ul>
+        </section>
+      ) : null}
+    </div>
   );
 }
 

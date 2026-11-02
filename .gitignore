@@ -44,3 +44,19 @@ artifacts/
 .freebuff/
 
 .vercel
+
+# A Supabase personal access token, pasted in by the owner so the CLI can deploy
+# edge functions from a machine with no interactive terminal. Never committed.
+.supabase-access-token
+
+# Machine-local: the editor's imported conversation snapshots and the Supabase
+# CLI's own state. Neither is project source, and the snapshots are large.
+.cloud-attachments/
+supabase/.temp/
+
+# Agent/editor scratch that is not part of the build
+src/screens/*.bak
+scripts/.tmp-*
+tmp-design-refs.png
+screens.html
+screenshots/gallery.html

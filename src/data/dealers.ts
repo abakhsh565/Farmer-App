@@ -42,7 +42,12 @@ export function areaPoint(areaId: AreaId): GeoPoint {
 }
 
 export function areaNameKey(areaId: AreaId): MessageKey {
-  return AREAS.find((area) => area.id === areaId)?.nameKey ?? 'farmer.village';
+  /* The fallback is the default profile area's own key. It used to be
+     `farmer.village`, a string that read as "this is the farmer's village" —
+     wrong twice over: it named a place rather than an area, and it is no longer
+     a string at all, since a farmer's village is read from their saved location
+     rather than written into the catalog. */
+  return AREAS.find((area) => area.id === areaId)?.nameKey ?? 'area.wazirabad';
 }
 
 /** The largest radius the product allows; the choice inside it is the farmer's. */

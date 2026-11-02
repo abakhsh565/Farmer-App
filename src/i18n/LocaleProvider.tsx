@@ -19,11 +19,37 @@ type LocaleContextValue = {
   setLocale: (locale: Locale) => void;
   toggleLocale: () => void;
   t: (key: MessageKey, values?: Values) => string;
+  /**
+   * The same string in a language the screen is not showing.
+   *
+   * It exists for the read-aloud controls, which speak Urdu whatever the
+   * interface is set to: the words the voice needs are in a *specific* language
+   * rather than in the active one, and a caller that had to reach into the
+   * catalog for them would be the first screen in the app to bypass the locale
+   * provider.
+   */
+  tIn: (locale: Locale, key: MessageKey, values?: Values) => string;
 };
 
 const LocaleContext = createContext<LocaleContextValue | null>(null);
 
 const STORAGE_KEY = 'agri-shop.locale';
+
+/**
+ * One lookup and one substitution, shared by `t` and `tIn` so the two cannot
+ * drift — a key resolved in another language has to fill its placeholders by
+ * exactly the same rule as one resolved in this one.
+ */
+function message(locale: Locale, key: MessageKey, values?: Values): string {
+  // Resolution walks the locale's fallback chain and ends at English, so a
+  // partially translated language degrades to readable text rather than to
+  // a raw message key.
+  const template = resolveMessage(locale, key);
+  if (!values) return template;
+  return template.replace(/\{(\w+)\}/g, (_, name: string) =>
+    name in values ? String(values[name]) : `{${name}}`,
+  );
+}
 
 function readStoredLocale(): Locale {
   try {
@@ -60,18 +86,13 @@ export function LocaleProvider({ children }: { children: ReactNode }) {
     }
   }, [locale, dir]);
 
-  const t = useCallback(
-    (key: MessageKey, values?: Values) => {
-      // Resolution walks the locale's fallback chain and ends at English, so a
-      // partially translated language degrades to readable text rather than to
-      // a raw message key.
-      const template = resolveMessage(locale, key);
-      if (!values) return template;
-      return template.replace(/\{(\w+)\}/g, (_, name: string) =>
-        name in values ? String(values[name]) : `{${name}}`,
-      );
-    },
-    [locale],
+  const t = useCallback((key: MessageKey, values?: Values) => message(locale, key, values), [locale]);
+
+  /* Stable: looking a string up in a fixed language does not depend on which one
+     the screen happens to be showing. */
+  const tIn = useCallback(
+    (target: Locale, key: MessageKey, values?: Values) => message(target, key, values),
+    [],
   );
 
   const value = useMemo<LocaleContextValue>(
@@ -81,8 +102,9 @@ export function LocaleProvider({ children }: { children: ReactNode }) {
       setLocale,
       toggleLocale: () => setLocale((current) => (current === 'en' ? 'ur' : 'en')),
       t,
+      tIn,
     }),
-    [locale, dir, t],
+    [locale, dir, t, tIn],
   );
 
   /*
