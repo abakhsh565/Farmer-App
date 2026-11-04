@@ -2,6 +2,7 @@ import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { App } from '@/App';
+import { completeSignIn } from '@/testing/credential';
 import { markOnboardingComplete } from '@/onboarding/OnboardingFlow';
 
 /**
@@ -25,20 +26,7 @@ beforeEach(() => {
 
 const READY = { timeout: 5000 };
 
-const developmentCode = (): string => {
-  const hint = screen.getByText(/Development build — the code is/).textContent ?? '';
-  const match = hint.match(/(\d{3,8})/);
-  if (!match?.[1]) throw new Error('the development sheet did not show a code');
-  return match[1];
-};
-
-const signIn = async (number: string) => {
-  await userEvent.type(screen.getByLabelText('Mobile number'), number);
-  await userEvent.click(screen.getByRole('button', { name: 'Continue' }));
-  await screen.findByLabelText('Code');
-  await userEvent.type(screen.getByLabelText('Code'), developmentCode());
-  await userEvent.click(screen.getByRole('button', { name: 'Verify' }));
-};
+const signIn = completeSignIn;
 
 /** The first header control on Home is the farmer's own avatar. */
 const openProfile = async () => {
@@ -109,6 +97,8 @@ describe('two farmers on one phone', () => {
     render(<App />);
 
     /* First farmer: the gate turns their first message into an account. */
+    await userEvent.click(screen.getByRole('button', { name: 'Shop' }));
+    await screen.findByRole('heading', { name: 'Shop' }, READY);
     await userEvent.click(
       await screen.findByRole('button', { name: 'Chat with Ali Traders' }, READY),
     );
@@ -127,9 +117,10 @@ describe('two farmers on one phone', () => {
        account's, on the very same screen. */
     await userEvent.click(screen.getByRole('button', { name: 'Log Out' }));
     expect(await screen.findByText('Guest farmer')).toBeInTheDocument();
-    expect(screen.getByText('Not signed in')).toBeInTheDocument();
+    expect(screen.getByText('Tap to sign in')).toBeInTheDocument();
     expect(screen.queryByText('03001110001')).not.toBeInTheDocument();
-    expect(screen.getByText('No credit taken yet')).toBeInTheDocument();
+    expect(screen.getByText('My Credit')).toBeInTheDocument();
+    expect(screen.queryByText('No credit taken yet')).not.toBeInTheDocument();
 
     await userEvent.click(screen.getByRole('button', { name: 'Back' }));
     await openChat();
@@ -140,7 +131,7 @@ describe('two farmers on one phone', () => {
        to see — not a conversation, not a rupee of debt, not a phone number. */
     await openProfile();
     await userEvent.click(
-      await screen.findByRole('button', { name: 'Create an account' }, READY),
+      await screen.findByRole('button', { name: /Tap to sign in/ }, READY),
     );
     await signIn('03002220002');
     expect(await screen.findByText('03002220002')).toBeInTheDocument();
@@ -157,7 +148,7 @@ describe('two farmers on one phone', () => {
     await openProfile();
     await userEvent.click(screen.getByRole('button', { name: 'Log Out' }));
     await userEvent.click(
-      await screen.findByRole('button', { name: 'Create an account' }, READY),
+      await screen.findByRole('button', { name: /Tap to sign in/ }, READY),
     );
     await signIn('03001110001');
     expect(await screen.findByText('Rs. 10,000')).toBeInTheDocument();
@@ -190,8 +181,8 @@ describe('two farmers on one phone', () => {
      * and a village the farmer has not saved. The three old fixtures are gone
      * from the catalog, so none of them can render at all.
      */
-    expect(screen.getByText(/\d+ crops?/)).toBeInTheDocument();
-    expect(screen.getByText('Not saved yet')).toBeInTheDocument();
+    expect(screen.queryByText(/\d+ crops?/)).not.toBeInTheDocument();
+    expect(screen.getAllByRole('button', { name: 'My Crops' })).toHaveLength(2);
     expect(screen.queryByText('8 acres')).not.toBeInTheDocument();
     expect(screen.queryByText('Wazirabad')).not.toBeInTheDocument();
   });
@@ -226,7 +217,7 @@ describe('two farmers on one phone', () => {
 
     await openProfile();
     await userEvent.click(
-      await screen.findByRole('button', { name: 'Create an account' }, READY),
+      await screen.findByRole('button', { name: /Tap to sign in/ }, READY),
     );
     await signIn('03003330003');
 

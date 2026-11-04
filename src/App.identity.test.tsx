@@ -1,10 +1,17 @@
-import { render, screen } from '@testing-library/react';
+import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { App } from '@/App';
-import { createServices, type Services } from '@/services/registry';
+import {
+  clearCode,
+  completeAccount,
+  completeSignIn,
+  continueOtp,
+  developmentCode,
+  enterCode,
+  startSignIn,
+} from '@/testing/credential';
 import { SESSION_STORAGE_KEY } from '@/session/SessionProvider';
-import type { OtpProvider, OtpRequest, OtpVerifyResult } from '@/services/types';
 import { markOnboardingComplete } from '@/onboarding/OnboardingFlow';
 
 /**
@@ -49,26 +56,11 @@ const openCommunity = async () => {
   await screen.findByText(POST1, {}, READY);
 };
 
-const sheet = () => screen.findByText('Create your account');
+const sheet = async () => within(await screen.findByRole('dialog'));
 
-/** The code the development provider issued, read off the sheet it prints it on. */
-const developmentCode = (): string => {
-  const hint = screen.getByText(/Development build — the code is/).textContent ?? '';
-  const match = hint.match(/(\d{3,8})/);
-  if (!match?.[1]) throw new Error('the development sheet did not show a code');
-  return match[1];
-};
-
-const startSignIn = async (number: string) => {
-  await userEvent.type(screen.getByLabelText('Mobile number'), number);
-  await userEvent.click(screen.getByRole('button', { name: 'Continue' }));
-  await screen.findByLabelText('Code');
-};
-
-const completeSignIn = async (number: string) => {
-  await startSignIn(number);
-  await userEvent.type(screen.getByLabelText('Code'), developmentCode());
-  await userEvent.click(screen.getByRole('button', { name: 'Verify' }));
+const keepBrowsing = async () => {
+  const dialog = await sheet();
+  await userEvent.click(dialog.getByRole('button', { name: 'Close' }));
 };
 
 describe('guest-first browsing', () => {
@@ -109,14 +101,14 @@ describe('the identity gate', () => {
      * with the composer gone. Asserting "the text is somewhere" was how the first
      * version of this test managed to pass without publishing anything.
      */
-    expect(await screen.findAllByText('Are the mandi rates good this week?')).toHaveLength(1);
+    expect(await screen.findAllByText('Are the mandi rates good this week?', {}, READY)).toHaveLength(1);
     expect(
       screen.queryByPlaceholderText('What do you want to ask nearby farmers?'),
     ).not.toBeInTheDocument();
 
     /* And the account outlived the sheet, which is what makes it a session. */
     expect(localStorage.getItem(SESSION_STORAGE_KEY)).toContain('"method":"phone"');
-    expect(localStorage.getItem(SESSION_STORAGE_KEY)).toContain('0300 1234567');
+    expect(localStorage.getItem(SESSION_STORAGE_KEY)).toContain('03001234567');
     expect(screen.queryByText('Create your account')).not.toBeInTheDocument();
   });
 
@@ -132,15 +124,16 @@ describe('the identity gate', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Post' }));
     await sheet();
 
-    await userEvent.click(screen.getByRole('radio', { name: 'Email' }));
-    await userEvent.type(screen.getByLabelText('Email'), 'bilal@example.com');
-    await userEvent.click(screen.getByRole('button', { name: 'Continue' }));
+    await startSignIn('bilal@example.com');
 
-    expect(await screen.findByText('We sent a code to bilal@example.com')).toBeInTheDocument();
-    await userEvent.type(screen.getByLabelText('Code'), developmentCode());
-    await userEvent.click(screen.getByRole('button', { name: 'Verify' }));
+    expect(
+      screen.getByText('Enter the 6-digit code we sent to bilal@example.com.'),
+    ).toBeInTheDocument();
+    await enterCode();
+    await continueOtp();
+    await completeAccount();
 
-    expect(await screen.findAllByText('Email question about urea')).toHaveLength(1);
+    expect(await screen.findAllByText('Email question about urea', {}, READY)).toHaveLength(1);
     expect(localStorage.getItem(SESSION_STORAGE_KEY)).toContain('bilal@example.com');
   });
 
@@ -156,15 +149,15 @@ describe('the identity gate', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Post' }));
     await sheet();
 
-    await userEvent.type(screen.getByLabelText('Mobile number'), '0300123');
+    await userEvent.type(screen.getByLabelText('Number or email'), '0300123');
     await userEvent.click(screen.getByRole('button', { name: 'Continue' }));
 
     expect(
-      await screen.findByText('A Pakistani mobile number is 11 digits, like 0300 1234567'),
+      await screen.findByText('Write an 11-digit mobile number or a valid email address.'),
     ).toBeInTheDocument();
-    expect(screen.getByText('Create your account')).toBeInTheDocument();
-    // No code was sent for a number the app already knows is wrong.
-    expect(screen.queryByLabelText('Code')).not.toBeInTheDocument();
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
+    // No code was issued for a number the app already knows is wrong.
+    expect(screen.queryByRole('group', { name: 'OTP verification' })).not.toBeInTheDocument();
     expect(localStorage.getItem(SESSION_STORAGE_KEY)).not.toContain('0300123');
   });
 
@@ -178,86 +171,66 @@ describe('the identity gate', () => {
       'Wrong code question',
     );
     await userEvent.click(screen.getByRole('button', { name: 'Post' }));
-    await startSignIn('0300 1112223');
+    await startSignIn('03001112223');
 
     const right = developmentCode();
     const wrong = right === '000000' ? '999999' : '000000';
-    await userEvent.type(screen.getByLabelText('Code'), wrong);
-    await userEvent.click(screen.getByRole('button', { name: 'Verify' }));
+    await enterCode(wrong);
+    await continueOtp();
 
     expect(
       await screen.findByText('That code is not right. Check it and try again.'),
     ).toBeInTheDocument();
-    expect(screen.queryByText('Create your account')).not.toBeInTheDocument();
+    expect(screen.getByRole('group', { name: 'OTP verification' })).toBeInTheDocument();
     expect(localStorage.getItem(SESSION_STORAGE_KEY) ?? '').not.toContain('"account":{"id"');
 
     // The right code still works, in the same sheet.
-    await userEvent.clear(screen.getByLabelText('Code'));
-    await userEvent.type(screen.getByLabelText('Code'), right);
-    await userEvent.click(screen.getByRole('button', { name: 'Verify' }));
+    await clearCode();
+    await enterCode(right);
+    await continueOtp();
+    await completeAccount();
 
-    expect(await screen.findAllByText('Wrong code question')).toHaveLength(1);
-    expect(localStorage.getItem(SESSION_STORAGE_KEY)).toContain('0300 1112223');
+    expect(await screen.findAllByText('Wrong code question', {}, READY)).toHaveLength(1);
+    expect(localStorage.getItem(SESSION_STORAGE_KEY)).toContain('03001112223');
   });
 
-  it('tells the farmer a code expired instead of calling it wrong', async () => {
-    render(<App services={withOtp(shortLivedOtp)} />);
+  it('shows the fixed development code instead of pretending an SMS was sent', async () => {
+    render(<App />);
     await openCommunity();
 
     await userEvent.click(screen.getByRole('button', { name: 'Write a post' }));
     await userEvent.type(
       await screen.findByPlaceholderText('What do you want to ask nearby farmers?'),
-      'Expired code question',
+      'Development code question',
     );
     await userEvent.click(screen.getByRole('button', { name: 'Post' }));
     await startSignIn('0300 4445556');
 
-    /* The code was valid when it arrived and lapses while the farmer is typing,
-       which is the real shape of this failure. */
-    await userEvent.type(screen.getByLabelText('Code'), '123456');
-    await new Promise((resolve) => setTimeout(resolve, 1_400));
-
-    /*
-     * Who notices the lapse first is a race between the sheet's one-second
-     * countdown and the farmer's tap, and both orders are the product working:
-     * sometimes the screen has already offered a new code by the time the tap
-     * lands, sometimes the tap is what discovers the expiry. Asserting one order
-     * made this test a check on the scheduler; it is a check on the screen now.
-     */
-    const verify = screen.queryByRole('button', { name: 'Verify' });
-    if (verify) await userEvent.click(verify);
-
-    expect(
-      await screen.findByText('That code has expired. Send a new one.'),
-    ).toBeInTheDocument();
-    /* Answered from the clock: a code with no time left does not need a round trip
-       to the provider to be refused, and the farmer should not wait for one. */
-    expect(shortLivedOtp.verifyCalls).toBe(0);
-    /* The only way on is a new code, so the resend is promoted to the primary
-       control rather than leaving a Verify button that cannot succeed. */
-    expect(screen.getByRole('button', { name: /Send a new code/ })).toBeEnabled();
+    /* This build has no SMS gateway, so it names the code it accepts rather than
+       claiming a message was delivered. */
+    expect(screen.getByText('For this build, the code is 123456.')).toBeInTheDocument();
     expect(localStorage.getItem(SESSION_STORAGE_KEY) ?? '').not.toContain('"account":{"id"');
   });
 
-  it('returns to the number when the code could not be sent at all', async () => {
-    render(<App services={withOtp(unreachableOtp)} />);
+  it('lets the farmer correct the contact before creating an account', async () => {
+    render(<App />);
     await openCommunity();
 
     await userEvent.click(screen.getByRole('button', { name: 'Write a post' }));
     await userEvent.type(
       await screen.findByPlaceholderText('What do you want to ask nearby farmers?'),
-      'Unreachable question',
+      'Wrong contact question',
     );
     await userEvent.click(screen.getByRole('button', { name: 'Post' }));
+    await startSignIn('0300 7778889');
 
-    await userEvent.type(screen.getByLabelText('Mobile number'), '0300 7778889');
-    await userEvent.click(screen.getByRole('button', { name: 'Continue' }));
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Not your number or email? Change it' }),
+    );
 
-    expect(await screen.findByText('Could not reach the server. Try again.')).toBeInTheDocument();
-    /* No code was sent, so there is no code box to fill in — the farmer retries
-       the send from where they are. */
-    expect(screen.queryByLabelText('Code')).not.toBeInTheDocument();
-    expect(screen.getByText('Create your account')).toBeInTheDocument();
+    expect(await screen.findByLabelText('Number or email')).toHaveValue('03007778889');
+    expect(screen.queryByRole('group', { name: 'OTP verification' })).not.toBeInTheDocument();
+    expect(localStorage.getItem(SESSION_STORAGE_KEY) ?? '').not.toContain('"account":{"id"');
   });
 
   it('lets the farmer keep browsing, with the draft still in the box', async () => {
@@ -272,8 +245,8 @@ describe('the identity gate', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Post' }));
     await sheet();
 
-    await userEvent.click(screen.getByRole('button', { name: 'Not now — keep browsing' }));
-    expect(screen.queryByText('Create your account')).not.toBeInTheDocument();
+    await keepBrowsing();
+    expect(screen.queryByLabelText('Number or email')).not.toBeInTheDocument();
 
     // No account was created…
     expect(localStorage.getItem(SESSION_STORAGE_KEY) ?? '').not.toContain('"account":{"id"');
@@ -288,8 +261,10 @@ describe('the identity gate', () => {
   it('sends a dealer message only after the sign-in it asked for', async () => {
     render(<App />);
 
-    /* There are no conversations yet: this one starts from the shop's row on
-       Home, and the gate is what turns the first message into an account. */
+    /* There are no conversations yet: this one starts from the shop's row, and
+       the gate is what turns the first message into an account. */
+    await userEvent.click(screen.getByRole('button', { name: 'Shop' }));
+    await screen.findByRole('heading', { name: 'Shop' }, READY);
     await userEvent.click(
       await screen.findByRole('button', { name: 'Chat with Ali Traders' }, READY),
     );
@@ -302,53 +277,11 @@ describe('the identity gate', () => {
       screen.getByText('Dealer messages stay private to your account.'),
     ).toBeInTheDocument();
 
-    await completeSignIn('0300 7654321');
+    await completeSignIn('03007654321');
 
     // Sent: the message is in the thread, and the box it was typed into is empty.
     expect(await screen.findByText('Do you have urea?')).toBeInTheDocument();
     expect((screen.getByPlaceholderText('Type a message') as HTMLInputElement).value).toBe('');
-    expect(localStorage.getItem(SESSION_STORAGE_KEY)).toContain('0300 7654321');
+    expect(localStorage.getItem(SESSION_STORAGE_KEY)).toContain('03007654321');
   });
 });
-
-/* ── providers that misbehave, so the failure screens are reachable ───────── */
-
-function withOtp(otp: OtpProvider): Services {
-  return { ...createServices(), otp };
-}
-
-/**
- * Issues a code that lapses a moment after it arrives, and counts whether it was
- * ever asked to verify anything.
- */
-const shortLivedOtp: OtpProvider & { verifyCalls: number } = {
-  name: 'Short-lived-code provider',
-  status: 'development',
-  verifyCalls: 0,
-  async request(): Promise<OtpRequest> {
-    return {
-      channel: 'phone',
-      destination: '0300 4445556',
-      deliveredVia: 'test',
-      expiresAt: Date.now() + 1_200,
-      resendAfterSeconds: 0,
-      developmentCode: '123456',
-    };
-  },
-  async verify(): Promise<OtpVerifyResult> {
-    this.verifyCalls += 1;
-    return { ok: true };
-  },
-};
-
-/** Cannot be reached at all. */
-const unreachableOtp: OtpProvider = {
-  name: 'Unreachable provider',
-  status: 'failing',
-  async request(): Promise<OtpRequest> {
-    throw new Error('network down');
-  },
-  async verify(): Promise<OtpVerifyResult> {
-    throw new Error('network down');
-  },
-};

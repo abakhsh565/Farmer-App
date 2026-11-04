@@ -171,7 +171,7 @@ describe('a session with no party id yet', () => {
        saved" is not it — that would be a claim about the account, and the account
        cannot be written to yet. */
     await openDataSection();
-    expect(screen.getByText('Saved on this phone')).toBeInTheDocument();
+    expect(screen.getByText('On this phone only')).toBeInTheDocument();
     expect(screen.queryByText('Everything is saved')).not.toBeInTheDocument();
   });
 });

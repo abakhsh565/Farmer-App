@@ -90,8 +90,9 @@ const withCounteroffer = (owner = ''): void => {
 };
 
 describe('answering a counteroffer', () => {
-  it('shows what the shop owner changed, and needs an account to accept', async () => {
-    withCounteroffer();
+  it('shows the account holder what the shop owner changed', async () => {
+    signIn();
+    withCounteroffer(ACCOUNT_ID);
     render(<App />);
 
     await userEvent.click(screen.getByRole('button', { name: 'One request needs your answer' }));
@@ -102,13 +103,8 @@ describe('answering a counteroffer', () => {
     expect(screen.getByText('Fee Rs. 0 → Rs. 300')).toBeInTheDocument();
     expect(screen.getByText('The shop owner changed the offer. Accepting agrees to offer v2.')).toBeInTheDocument();
 
-    await userEvent.click(screen.getByRole('button', { name: 'Accept offer v2' }));
-
-    // Identity-on-action: accepting credit is accountable, so it is gated.
-    expect(await screen.findByText('Create your account')).toBeInTheDocument();
-    expect(
-      screen.getByText('Credit requests and answers are recorded against your account.'),
-    ).toBeInTheDocument();
+    // The answer is available to the account that holds the request.
+    expect(screen.getByRole('button', { name: 'Accept offer v2' })).toBeEnabled();
   });
 
   it('moves to final approval after the farmer accepts, without committing', async () => {
@@ -134,7 +130,7 @@ describe('sending a request', () => {
   const sheet = () => within(screen.getByRole('dialog'));
 
   const openForm = async () => {
-    await userEvent.click(screen.getByRole('button', { name: 'Request credit' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Your shops and history' }));
     await userEvent.click(await sheet().findByRole('button', { name: 'Request credit' }));
   };
 
