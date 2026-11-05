@@ -1,6 +1,6 @@
 name: CI
 
-# Every push and every pull request runs the same five gates a developer runs
+# Every push and every pull request runs the same gates a developer runs
 # locally, in the same order, so "it passed on my machine" is not a sentence
 # anybody has to say. The APK build is deliberately *not* here: it needs a JDK and
 # the Android SDK, it produces a binary nobody downloads from CI, and a red build
@@ -38,6 +38,12 @@ jobs:
       # inlined into a source file.
       - name: Edge Function contracts
         run: npm run lint:functions
+
+      # All five ingestion adapters must route terminal state through the shared
+      # lifecycle helper: context before finalization, no lost provider errors,
+      # no success after a rejected finalization, and accounting on failure.
+      - name: Ingestion lifecycle guard
+        run: npm run check:ingestion-lifecycle
 
       - name: Tests
         run: npm test

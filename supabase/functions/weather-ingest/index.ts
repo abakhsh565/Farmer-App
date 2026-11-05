@@ -10,30 +10,43 @@
  *   · Readings are cached per rounded location cell, so a village shares one
  *     fetch instead of one per farmer.
  *
- * Open-Meteo is keyless, which is why this function needs no vendor secret —
- * only the server key, which every hosted function has.
+ * The scheduled form reads `weather_ingestion_targets()`, which is service-only
+ * because it can reveal village-scale locations. It fetches only cells whose
+ * last current reading is more than 75 minutes old, and it upserts on the unique
+ * event key so a retry corrects a reading instead of duplicating it.
  *
  * Routes, after the function name:
  *
- *   POST /weather-ingest  { lat, lon, days? }   → writes the cell's readings
- *   GET  /weather-ingest?lat=..&lon=..          → same, for a scheduler
+ *   POST /weather-ingest  { lat, lon, days? }       → one cell
+ *   GET  /weather-ingest?lat=..&lon=..              → one cell, for a scheduler
+ *   POST /weather-ingest  { targets: true, limit? } → due farmer cells
+ *   GET  /weather-ingest?targets=true&limit=20      → due farmer cells
+ *
+ * Open-Meteo is keyless, but its free tier is non-commercial. Staging/evaluation
+ * use is covered; commercial deployment needs the provider's paid plan or a
+ * different licensed source. `intel_sources` records that distinction.
  *
  * Failure is *recorded*, not thrown away: a row with `fetch_error` set is how the
  * UI can say "cannot read weather" instead of showing a blank where a number
  * should be, and how `weather_is_usable()` knows to return false.
  */
 
-import { adminClient, clean, fail, json, preflight, readJson } from '../_shared/server.ts';
+import { adminClient, clean, fail, json, preflight, readJson, requireIngestAuth } from '../_shared/server.ts';
+import {
+  addIngestionError,
+  addWriteOutcome,
+  completedStatus,
+  emptyAccount,
+  finishIngestionRun,
+  ingestionFailurePayload,
+  rowsWritten,
+  type IngestionRpc,
+} from '../_shared/ingestion-accounting.ts';
 
 const VENDOR = 'https://api.open-meteo.com/v1/forecast';
 const PROVIDER_CODE = 'open_meteo';
-
-/**
- * Readings are stored per three-decimal cell (~110 m). Coarser than the farm,
- * finer than the district: two neighbouring farmers share a fetch, and a farmer
- * is never shown the weather of a town 30 km away.
- */
 const CELL_DECIMALS = 3;
+const MAX_BATCH = 20;
 
 const CURRENT_FIELDS = [
   'temperature_2m',
@@ -63,7 +76,6 @@ function num(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
-/** WMO code → the app's own vocabulary, kept beside the code in `raw`. */
 const CONDITIONS: Record<number, string> = {
   0: 'Clear sky', 1: 'Mainly clear', 2: 'Partly cloudy', 3: 'Overcast',
   45: 'Fog', 48: 'Depositing rime fog',
@@ -86,8 +98,13 @@ function parseStamp(value: unknown): string | null {
 }
 
 type Reading = Record<string, unknown>;
+type Target = { lat_cell: number; lon_cell: number; due: boolean; farmer_count: number };
 
-async function fetchVendor(lat: number, lon: number, days: number): Promise<Record<string, unknown>> {
+async function fetchVendor(
+  lat: number,
+  lon: number,
+  days: number,
+): Promise<{ body: Record<string, unknown>; sourceUrl: string }> {
   const params = new URLSearchParams({
     latitude: String(lat),
     longitude: String(lon),
@@ -96,14 +113,20 @@ async function fetchVendor(lat: number, lon: number, days: number): Promise<Reco
     daily: DAILY_FIELDS,
     forecast_days: String(days),
   });
-  const response = await fetch(`${VENDOR}?${params.toString()}`);
+  const sourceUrl = `${VENDOR}?${params.toString()}`;
+  const response = await fetch(sourceUrl, { signal: AbortSignal.timeout(30000) });
   if (!response.ok) throw new Error(`Open-Meteo answered ${response.status}.`);
   const body: unknown = await response.json();
   if (!body || typeof body !== 'object') throw new Error('Open-Meteo returned no forecast.');
-  return body as Record<string, unknown>;
+  return { body: body as Record<string, unknown>, sourceUrl };
 }
 
-function currentRow(body: Record<string, unknown>, latCell: number, lonCell: number): Reading {
+function currentRow(
+  body: Record<string, unknown>,
+  latCell: number,
+  lonCell: number,
+  sourceUrl: string,
+): Reading {
   const current = (body.current ?? {}) as Record<string, unknown>;
   const code = num(current.weather_code);
   return {
@@ -121,12 +144,23 @@ function currentRow(body: Record<string, unknown>, latCell: number, lonCell: num
     condition_text: code === null ? null : (CONDITIONS[code] ?? null),
     condition_code: code === null ? null : String(code),
     kind: 'current',
-    raw: current as Record<string, unknown>,
+    raw: {
+      ...(current as Record<string, unknown>),
+      source_url: sourceUrl,
+      data_kind: 'current_weather',
+      units: { temp_c: 'degrees Celsius', precip_mm: 'millimetres', wind_kph: 'kilometres per hour' },
+      retrieved_at: new Date().toISOString(),
+    },
     fetch_error: null,
   };
 }
 
-function dailyRows(body: Record<string, unknown>, latCell: number, lonCell: number): Reading[] {
+function dailyRows(
+  body: Record<string, unknown>,
+  latCell: number,
+  lonCell: number,
+  sourceUrl: string,
+): { rows: Reading[]; seen: number; rejected: number } {
   const daily = (body.daily ?? {}) as Record<string, unknown>;
   const times = Array.isArray(daily.time) ? daily.time : [];
   const maxes = Array.isArray(daily.temperature_2m_max) ? daily.temperature_2m_max : [];
@@ -135,12 +169,19 @@ function dailyRows(body: Record<string, unknown>, latCell: number, lonCell: numb
   const codes = Array.isArray(daily.weather_code) ? daily.weather_code : [];
 
   const rows: Reading[] = [];
+  let rejected = 0;
   for (let index = 0; index < times.length; index += 1) {
     const date = times[index];
-    if (typeof date !== 'string') continue;
+    if (typeof date !== 'string') {
+      rejected += 1;
+      continue;
+    }
     const code = num(codes[index]);
     const from = Date.parse(`${date}T00:00:00Z`);
-    if (!Number.isFinite(from)) continue;
+    if (!Number.isFinite(from)) {
+      rejected += 1;
+      continue;
+    }
     rows.push({
       provider_code: PROVIDER_CODE,
       lat_cell: latCell,
@@ -158,84 +199,282 @@ function dailyRows(body: Record<string, unknown>, latCell: number, lonCell: numb
       kind: 'daily',
       valid_from: new Date(from).toISOString(),
       valid_to: new Date(from + 24 * 60 * 60 * 1000).toISOString(),
-      raw: { temperature_2m_max: maxes[index] ?? null, temperature_2m_min: mins[index] ?? null },
+      raw: {
+        temperature_2m_max: maxes[index] ?? null,
+        temperature_2m_min: mins[index] ?? null,
+        source_url: sourceUrl,
+        data_kind: 'daily_forecast',
+        units: { temp_c: 'degrees Celsius', precip_mm: 'millimetres' },
+        retrieved_at: new Date().toISOString(),
+      },
       fetch_error: null,
     });
   }
-  return rows;
+  return { rows, seen: times.length, rejected };
+}
+
+async function recordReadings(
+  client: ReturnType<typeof adminClient>,
+  rows: Reading[],
+): Promise<unknown> {
+  const { data, error } = await client.rpc('record_weather_readings', { p_rows: rows });
+  if (error) throw new Error(error.message);
+  return data;
+}
+
+async function recordFailure(
+  client: ReturnType<typeof adminClient>,
+  latCell: number,
+  lonCell: number,
+  detail: string,
+): Promise<void> {
+  // A failure row shares the same event key as the reading it could not produce.
+  // It is upserted too, so a retry in the same second updates the reason rather
+  // than stacking duplicate errors.
+  await client.from('weather_readings').upsert({
+    provider_code: PROVIDER_CODE,
+    lat_cell: latCell,
+    lon_cell: lonCell,
+    observed_at: new Date().toISOString(),
+    kind: 'current',
+    fetch_error: detail,
+    raw: {},
+  }, { onConflict: 'provider_code,lat_cell,lon_cell,kind,observed_at' });
 }
 
 Deno.serve(async (req) => {
   const options = preflight(req);
   if (options) return options;
+  const auth = requireIngestAuth(req);
+  if (auth) return auth;
 
   try {
     const url = new URL(req.url);
     const body = req.method === 'POST' ? ((await readJson<Record<string, unknown>>(req)) ?? {}) : {};
+    const days = Math.max(1, Math.min(Number(body.days ?? url.searchParams.get('days') ?? 7) || 7, 16));
+    const wantsTargets =
+      body.targets === true ||
+      body.targets === 'true' ||
+      url.searchParams.get('targets') === 'true';
+    const limit = Math.max(
+      1,
+      Math.min(Number(body.limit ?? url.searchParams.get('limit') ?? MAX_BATCH) || MAX_BATCH, MAX_BATCH),
+    );
+
+    const client = adminClient();
+    const rpc: IngestionRpc = (name, args) => client.rpc(name, args);
+    const { error: recoveryError } = await client.rpc('recover_abandoned_ingestion_runs', {
+      p_limit: 10,
+    });
+    if (recoveryError) {
+      console.error(`[weather-ingest] abandoned-run recovery failed: ${recoveryError.message}`);
+    }
+    const startedAt = new Date().toISOString();
+
+    if (wantsTargets) {
+      const { data, error } = await client.rpc('weather_ingestion_targets', { p_limit: limit });
+      if (error) return fail(error.message, 502);
+      const due = ((data ?? []) as Target[]).filter((target) => target.due);
+      if (due.length === 0) {
+        return json({ ok: true, provider: PROVIDER_CODE, cellsRequested: 0, cellsWritten: 0, failed: 0 });
+      }
+
+      const { data: runRow, error: runError } = await client
+        .from('weather_ingestion_runs')
+        .insert({
+          provider_code: PROVIDER_CODE,
+          started_at: startedAt,
+          status: 'running',
+          cells_requested: due.length,
+        })
+        .select('id')
+        .single();
+      const runId = Number((runRow as { id?: number } | null)?.id);
+      if (runError || !Number.isInteger(runId)) {
+        return json({
+          ok: false,
+          error: 'Could not create the weather ingestion run.',
+          detail: runError?.message ?? 'run id was not returned',
+        }, 502);
+      }
+
+      const account = emptyAccount();
+      let written = 0;
+      let failed = 0;
+      const errors: string[] = [];
+
+      const heartbeat = async () => {
+        const { data, error } = await client.rpc('touch_ingestion_run', {
+          p_kind: 'weather',
+          p_run_id: runId,
+        });
+        if (error || data === false) {
+          throw new Error(
+            `Run lease renewal failed: ${error?.message ?? 'run is no longer running'}`,
+          );
+        }
+      };
+
+      try {
+        await heartbeat();
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : 'run lease renewal failed';
+        addIngestionError(errors, detail);
+        const finished = await finishIngestionRun(
+          'weather-ingest', runId, 'weather', 'failed', account, errors, written, rpc,
+        );
+        if (!finished.ok) {
+          return json(ingestionFailurePayload(runId, account, errors, finished), 500);
+        }
+        return fail(detail, 500);
+      }
+
+      for (const target of due) {
+        const lat = Number(target.lat_cell);
+        const lon = Number(target.lon_cell);
+        const latCell = Number(lat.toFixed(CELL_DECIMALS));
+        const lonCell = Number(lon.toFixed(CELL_DECIMALS));
+        try {
+          const { body, sourceUrl } = await fetchVendor(lat, lon, days);
+          const daily = dailyRows(body, latCell, lonCell, sourceUrl);
+          const rows = [currentRow(body, latCell, lonCell, sourceUrl), ...daily.rows];
+          account.fetched += 1 + daily.seen;
+          account.rejected += daily.rejected;
+          try {
+            addWriteOutcome(account, await recordReadings(client, rows));
+          } catch (error) {
+            account.failed += rows.length;
+            throw error;
+          }
+          written += 1;
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : 'ingestion failed';
+          addIngestionError(errors, detail);
+          failed += 1;
+          try {
+            await recordFailure(client, latCell, lonCell, detail);
+          } catch (markerError) {
+            console.error(
+              `[weather-ingest] failure marker could not be stored for ${latCell},${lonCell}: ${
+                markerError instanceof Error ? markerError.message : 'unknown error'
+              }`,
+            );
+          }
+        }
+      }
+
+      const status = failed === 0
+        ? completedStatus(account)
+        : written > 0 ? 'partial' : 'failed';
+      const finished = await finishIngestionRun(
+        'weather-ingest', runId, 'weather', status, account, errors, written, rpc,
+      );
+      if (!finished.ok) {
+        return json(ingestionFailurePayload(runId, account, errors, finished), 500);
+      }
+
+      return json({
+        ok: status === 'ok',
+        status,
+        provider: PROVIDER_CODE,
+        cellsRequested: due.length,
+        cellsWritten: written,
+        failed,
+        accounting: account,
+        firstError: errors[0] ?? null,
+        processing_errors: errors,
+      }, status === 'ok' ? 200 : status === 'partial' ? 207 : 502);
+    }
 
     const latRaw = body.lat ?? url.searchParams.get('lat');
     const lonRaw = body.lon ?? url.searchParams.get('lon');
-    const days = Math.max(1, Math.min(Number(body.days ?? url.searchParams.get('days') ?? 7) || 7, 16));
-
     const lat = typeof latRaw === 'number' ? latRaw : Number(clean(latRaw, 20));
     const lon = typeof lonRaw === 'number' ? lonRaw : Number(clean(lonRaw, 20));
-    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return fail('lat and lon are required.');
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return fail('lat and lon are required (or targets=true).');
     if (lat < -90 || lat > 90 || lon < -180 || lon > 180) return fail('lat and lon are out of range.');
 
     const latCell = Number(lat.toFixed(CELL_DECIMALS));
     const lonCell = Number(lon.toFixed(CELL_DECIMALS));
 
-    const client = adminClient();
-    const startedAt = new Date().toISOString();
-    const { data: runRow } = await client
+    const { data: runRow, error: runError } = await client
       .from('weather_ingestion_runs')
       .insert({ provider_code: PROVIDER_CODE, started_at: startedAt, status: 'running', cells_requested: 1 })
       .select('id')
       .single();
-    const runId = (runRow as { id?: number } | null)?.id ?? null;
+    const runId = Number((runRow as { id?: number } | null)?.id);
+    if (runError || !Number.isInteger(runId)) {
+      return json({
+        ok: false,
+        error: 'Could not create the weather ingestion run.',
+        detail: runError?.message ?? 'run id was not returned',
+      }, 502);
+    }
 
-    let written = 0;
+    const account = emptyAccount();
+    const errors: string[] = [];
+
+    const heartbeat = async () => {
+      const { data, error } = await client.rpc('touch_ingestion_run', {
+        p_kind: 'weather',
+        p_run_id: runId,
+      });
+      if (error || data === false) {
+        throw new Error(
+          `Run lease renewal failed: ${error?.message ?? 'run is no longer running'}`,
+        );
+      }
+    };
+
     try {
-      const payload = await fetchVendor(lat, lon, days);
-      const rows = [currentRow(payload, latCell, lonCell), ...dailyRows(payload, latCell, lonCell)];
+      await heartbeat();
+      const { body, sourceUrl } = await fetchVendor(lat, lon, days);
+      const daily = dailyRows(body, latCell, lonCell, sourceUrl);
+      const rows = [currentRow(body, latCell, lonCell, sourceUrl), ...daily.rows];
+      account.fetched = 1 + daily.seen;
+      account.rejected = daily.rejected;
+      try {
+        addWriteOutcome(account, await recordReadings(client, rows));
+      } catch (error) {
+        account.failed += rows.length;
+        throw error;
+      }
 
-      const { error } = await client.from('weather_readings').insert(rows);
-      if (error) throw new Error(error.message);
-      written = rows.length;
-
-      if (runId !== null) {
-        await client
-          .from('weather_ingestion_runs')
-          .update({ status: 'ok', finished_at: new Date().toISOString(), cells_written: written })
-          .eq('id', runId);
+      const status = completedStatus(account);
+      const finished = await finishIngestionRun(
+        'weather-ingest', runId, 'weather', status, account, errors, 1, rpc,
+      );
+      if (!finished.ok) {
+        return json(ingestionFailurePayload(runId, account, errors, finished), 500);
       }
 
       return json({
-        ok: true,
+        ok: status === 'ok',
+        status,
         provider: PROVIDER_CODE,
         cell: { lat: latCell, lon: lonCell },
-        readingsWritten: written,
+        readingsFetched: account.fetched,
+        readingsWritten: rowsWritten(account),
+        accounting: account,
+        processing_errors: errors,
       });
     } catch (error) {
       const detail = error instanceof Error ? error.message : 'ingestion failed';
+      try {
+        await recordFailure(client, latCell, lonCell, detail);
+      } catch (markerError) {
+        console.error(
+          `[weather-ingest] failure marker could not be stored for ${latCell},${lonCell}: ${
+            markerError instanceof Error ? markerError.message : 'unknown error'
+          }`,
+        );
+      }
 
-      // The failure is stored as a reading with `fetch_error`, so the app can
-      // report "cannot read weather" for this cell instead of showing nothing.
-      await client.from('weather_readings').insert({
-        provider_code: PROVIDER_CODE,
-        lat_cell: latCell,
-        lon_cell: lonCell,
-        observed_at: new Date().toISOString(),
-        kind: 'current',
-        fetch_error: detail,
-        raw: {},
-      });
-
-      if (runId !== null) {
-        await client
-          .from('weather_ingestion_runs')
-          .update({ status: 'failed', finished_at: new Date().toISOString(), error: detail })
-          .eq('id', runId);
+      addIngestionError(errors, detail);
+      const finished = await finishIngestionRun(
+        'weather-ingest', runId, 'weather', 'failed', account, errors, 0, rpc,
+      );
+      if (!finished.ok) {
+        return json(ingestionFailurePayload(runId, account, errors, finished), 500);
       }
 
       return fail(detail, 502);

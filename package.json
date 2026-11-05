@@ -12,6 +12,7 @@
     "lint": "node scripts/check-design.mjs",
     "lint:migrations": "node scripts/check-migrations.mjs",
     "lint:functions": "node scripts/check-functions.mjs",
+    "check:ingestion-lifecycle": "vitest run src/intelligence/ingestionLifecycle.contract.test.ts",
     "test": "vitest run --passWithNoTests",
     "test:watch": "vitest",
     "test:unit": "vitest run --exclude \"**/App*.test.tsx\" --passWithNoTests",
