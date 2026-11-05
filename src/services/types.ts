@@ -183,11 +183,35 @@ export type AiContext = {
   signalSubjects?: string[];
 };
 
+export type AiKnowledgeTier = 'verified' | 'supplementary' | 'community';
+
 export type AiCitation = {
   kind: 'knowledge' | 'weather' | 'market' | 'crop_fact' | 'scan';
   label: string;
   /** Version of the knowledge entry, when the citation is knowledge. */
   version?: number;
+  /** Stable published-entry identity; never a database id. */
+  slug?: string;
+  /** Publisher or provenance line supplied by the server. */
+  source?: string;
+  sourceUrl?: string;
+  evidenceTier?: AiKnowledgeTier;
+  publishedOn?: string;
+  updatedOn?: string;
+  accessedOn?: string;
+};
+
+export type AiContextCategory = 'crops' | 'location' | 'interests';
+
+export type AiAnswerMetadata = {
+  /** The scoring rules the server used; absent when no context was read. */
+  scoring_version: number | null;
+  /** True when the server read this farmer's own context for the answer. */
+  farmer_context_available: boolean;
+  /** Only the categories actually supplied to the model. */
+  context_categories: AiContextCategory[];
+  /** Published knowledge slugs behind the answer, never database ids. */
+  knowledge_sources: string[];
 };
 
 export type AiAnswer = {
@@ -206,6 +230,16 @@ export type AiAnswer = {
   escalate: boolean;
   /** Anything the answer could not rely on, stated rather than hidden. */
   caveats: string[];
+  /**
+   * `retrieval` means the text is a direct published excerpt, not model prose.
+   * Optional so an older gateway remains a valid response.
+   */
+  generation?: 'model' | 'retrieval';
+  /**
+   * Internal provenance. Optional so an older gateway remains a valid response;
+   * the screens do not render this object.
+   */
+  metadata?: AiAnswerMetadata;
 };
 
 export type AiScanResult = {
