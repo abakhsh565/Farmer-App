@@ -12,6 +12,24 @@ on:
   workflow_dispatch:
 
 jobs:
+  # Keep the ingestion lifecycle guard independent of unrelated failures. If a
+  # UI test or migration lint is red for an unrelated reason, the guard still
+  # reports its own result instead of being skipped behind an earlier step.
+  ingestion-lifecycle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+
+      - run: npm ci
+
+      - name: Ingestion lifecycle guard
+        run: npm run check:ingestion-lifecycle
+
   verify:
     runs-on: ubuntu-latest
     steps:
@@ -38,12 +56,6 @@ jobs:
       # inlined into a source file.
       - name: Edge Function contracts
         run: npm run lint:functions
-
-      # All five ingestion adapters must route terminal state through the shared
-      # lifecycle helper: context before finalization, no lost provider errors,
-      # no success after a rejected finalization, and accounting on failure.
-      - name: Ingestion lifecycle guard
-        run: npm run check:ingestion-lifecycle
 
       - name: Tests
         run: npm test
