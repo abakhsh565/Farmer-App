@@ -14,7 +14,9 @@ import {
   Pencil,
   Sprout,
   Store,
+  SlidersHorizontal,
   SunMoon,
+  ShieldCheck,
   type LucideIcon,
 } from 'lucide-react';
 import { toast } from 'sonner';
@@ -32,6 +34,7 @@ import {
   SheetTrigger,
 } from '@/components/ui/sheet';
 import { useLocale } from '@/i18n/LocaleProvider';
+import { useReviewAccess } from '@/intelligence/useReview';
 import type { Locale } from '@/i18n/catalog';
 import { formatMoney } from '@/i18n/format';
 import { initialsOf } from '@/lib/initials';
@@ -51,10 +54,16 @@ import { useTheme, type Theme } from '@/theme/ThemeProvider';
 export function ProfileScreen({
   onBack,
   onOpenDealers,
+  onOpenInterests,
+  onOpenAlerts,
+  onOpenReview,
   onOpenLocationSearch,
 }: {
   onBack: () => void;
   onOpenDealers: () => void;
+  onOpenInterests: () => void;
+  onOpenAlerts: () => void;
+  onOpenReview: () => void;
   onOpenLocationSearch: () => void;
 }) {
   const { t, locale, setLocale } = useLocale();
@@ -74,6 +83,10 @@ export function ProfileScreen({
    */
   const guest = account === null;
   const [setting, setSetting] = useState<'crops' | 'location' | null>(null);
+  const reviewAccess = useReviewAccess({
+    accountId: account?.id ?? null,
+    enabled: Boolean(account),
+  });
 
   /*
    * These three used to be catalog strings — "Cotton", "8 acres", "Wazirabad" —
@@ -276,7 +289,19 @@ export function ProfileScreen({
           selected={theme}
           onSelect={(next) => setTheme(next as Theme)}
         />
-        <Row icon={Bell} label={t('profile.notifications')} />
+        <Row
+          icon={SlidersHorizontal}
+          label={t('profile.interests')}
+          onClick={guest ? () => prompt('session.why.interests') : onOpenInterests}
+        />
+        <Row
+          icon={Bell}
+          label={t('profile.notifications')}
+          onClick={guest ? () => prompt('session.why.alerts') : onOpenAlerts}
+        />
+        {reviewAccess.canReview || reviewAccess.canManage || reviewAccess.canGrant ? (
+          <Row icon={ShieldCheck} label={t('review.profile')} onClick={onOpenReview} />
+        ) : null}
         <Row icon={HelpCircle} label={t('profile.help')} last />
       </div>
 

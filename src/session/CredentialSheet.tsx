@@ -1,5 +1,5 @@
-import { ArrowLeft, ShieldCheck, TriangleAlert } from 'lucide-react';
-import { useCallback, useEffect, useState } from 'react';
+import { ShieldCheck, TriangleAlert } from 'lucide-react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -12,40 +12,44 @@ import { useSession } from './SessionProvider';
 import { isEmail, isPhone } from './store';
 
 /**
- * The way into the app: who you are, and then the one step that identity implies.
+ * The way into the app: who you are, prove it, then finish the account.
  *
- * There used to be two sheets — a phone/email tab pair with a code step, and this
- * one behind it. The code step asked a second question even when the answer was
- * already known, and it is still gone: whether the contact exists decides the next
- * screen.
+ * Four steps, in the order the reference lays them out:
  *
- *   · The contact exists  → the password for it. Nothing else.
- *   · The contact is new  → a name and a password, and the account is made.
+ *   · contact — one field for a mobile number or an email address
+ *   · otp     — six digits, a resend countdown, and a way to correct the contact
+ *   · create  — a name and a password, for a contact the server has not seen
+ *   · password — the password for a contact it has
+ *
+ * Verification used to be skipped entirely: whether the contact existed decided
+ * the next screen, and no proof was ever asked for. That made "sign in" a claim
+ * rather than a fact. The code is asked for first now, so the account that follows
+ * belongs to somebody who can receive at that number or address.
+ *
+ * ## The code is a placeholder, on purpose
+ *
+ * There is no SMS gateway wired to this build yet, so the code is the fixed
+ * `123456` and it is written on the sheet rather than pretending a message was
+ * sent. That is the honest version of a mock: a screen that says "we sent a code"
+ * and then accepts anything is worse than one that says which code this build
+ * uses. When a real `OtpProvider` is connected, `submitCode` is the one function
+ * that changes — the steps, countdown and errors stay as they are.
+ *
+ * ## The contact field
  *
  * One field, and the rule reads the *characters* rather than waiting for an `@`.
  * Anything made only of digits, spaces, `+`, dashes and brackets is treated as a
  * number — folded into the national form and capped at eleven — and the moment a
  * letter or an `@` appears the value is an address and is left exactly as typed.
  *
- * The field used to ask whether an `@` had arrived yet and delete every other
- * character as a stray digit, so the letters of `ali@shop.com` were erased one by
- * one before the `@` could be reached and the address arrived as `@shop.com` — and
- * because it asked for the numeric keyboard until that `@` existed, a phone had no
- * `@` key to press at all. The keyboard is now the one that can type both.
+ * ## What the client cannot answer
  *
- * The one question the client cannot answer on its own is "does this account
- * exist?". Supabase refuses to tell a client, and trying to infer it from a failed
- * password sign-in would send a returning farmer down the new-account path the
- * moment they mistyped. So `user_exists_by_contact` answers it on the server, and
- * this sheet only presents the answer.
- *
- * Without a backend configured (a development build, or a phone with no server),
- * there is nothing to ask, so the answer is treated as "new" and the account is
- * made on the phone — which is what the app's other development providers already
- * do, and what the note at the bottom of the sheet says.
+ * "Does this account exist?" is asked of the server, after the code has been
+ * verified, because the next screen depends on it. Without a backend there is
+ * nothing to ask, so the answer is "new" and the account is kept on the phone.
  */
 
-type Step = 'contact' | 'password' | 'create';
+type Step = 'contact' | 'otp' | 'password' | 'create';
 
 /** The shortest password Supabase accepts by default; below it, sign-up fails. */
 const MIN_PASSWORD = 6;
@@ -53,7 +57,15 @@ const MIN_PASSWORD = 6;
 /** A number is at most 11 digits here (`0300 1234567`), so the field refuses more. */
 const MAX_PHONE_DIGITS = 11;
 
-/** Ties the field that failed to the sentence explaining it, for screen readers. */
+/** The code this build accepts until an SMS gateway is connected. */
+const PLACEHOLDER_CODE = '123456';
+
+const CODE_LENGTH = 6;
+
+/** The resend clock, in seconds. The reference starts it at one minute. */
+const RESEND_SECONDS = 60;
+
+/** Ties the field or step that failed to the sentence explaining it. */
 const ERROR_ID = 'credential-error';
 
 export function CredentialSheet() {
@@ -62,6 +74,7 @@ export function CredentialSheet() {
 
   const [step, setStep] = useState<Step>('contact');
   const [contact, setContact] = useState('');
+  const [code, setCode] = useState<string[]>(emptyCode);
   const [password, setPassword] = useState('');
   const [name, setName] = useState('');
   const [error, setError] = useState<MessageKey | null>(null);
@@ -70,27 +83,44 @@ export function CredentialSheet() {
    *
    * "Email address is invalid" and "sign-ups are disabled" are not failures the
    * app can classify, and replacing them with "try again" tells a farmer to
-   * repeat a step that cannot succeed. The sentence is shown as-is, the way the
-   * OTP sheet already treats a provider's own message.
+   * repeat a step that cannot succeed. The sentence is shown as-is.
    */
   const [detail, setDetail] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [secondsLeft, setSecondsLeft] = useState(RESEND_SECONDS);
+  const digitRefs = useRef<Array<HTMLInputElement | null>>([]);
 
   /* Every request starts clean: the previous farmer's typed number is not reused. */
   useEffect(() => {
     if (!pendingReason) return;
     setStep('contact');
     setContact('');
+    setCode(emptyCode());
     setPassword('');
     setName('');
     setError(null);
     setDetail(null);
     setBusy(false);
+    setSecondsLeft(RESEND_SECONDS);
   }, [pendingReason]);
+
+  /* The resend clock has to actually tick, one second at a time. */
+  useEffect(() => {
+    if (step !== 'otp' || secondsLeft === 0) return;
+    const timer = window.setTimeout(() => setSecondsLeft((left) => Math.max(0, left - 1)), 1000);
+    return () => window.clearTimeout(timer);
+  }, [step, secondsLeft]);
+
+  /* The first digit is where a farmer starts typing on the code step. */
+  useEffect(() => {
+    if (step !== 'otp') return;
+    const timer = window.setTimeout(() => digitRefs.current[0]?.focus(), 60);
+    return () => window.clearTimeout(timer);
+  }, [step]);
 
   const channel: 'phone' | 'email' = isEmail(contact) ? 'email' : 'phone';
 
-  /*
+  /**
    * One field for two kinds of contact, and the rule reads what is in it.
    *
    * Number side — two spellings of the same subscriber are folded rather than
@@ -104,10 +134,6 @@ export function CredentialSheet() {
    *
    * Address side — nothing is rewritten: an address is typed, not derived, and the
    * only judgement made about it is whether it is one.
-   *
-   * The test is on the *characters*, so a half-typed address survives. Reading it
-   * the other way round — "does it contain an `@` yet" — deleted each letter as it
-   * was typed, and no address could be entered at all.
    */
   const onContactChange = useCallback(
     (raw: string) => {
@@ -124,21 +150,94 @@ export function CredentialSheet() {
     return isPhone(contact) ? null : 'credential.badContact';
   };
 
-  const continueFromContact = useCallback(async () => {
+  /**
+   * The contact is checked for shape here, not for existence.
+   *
+   * Existence is asked after the code, because asking it first would let the
+   * sheet reveal which numbers have accounts without proving anything.
+   */
+  const continueFromContact = () => {
     const problem = validate();
     if (problem) {
       setError(problem);
       return;
     }
+    setError(null);
+    setDetail(null);
+    setCode(emptyCode());
+    setSecondsLeft(RESEND_SECONDS);
+    setStep('otp');
+  };
+
+  const enterDigit = (index: number, raw: string) => {
+    const typed = raw.replace(/[^0-9]/g, '');
+    if (typed === '') {
+      setCode((current) => current.map((digit, at) => (at === index ? '' : digit)));
+      return;
+    }
+
+    setCode((current) => {
+      const next = [...current];
+      for (let at = 0; at < typed.length && index + at < CODE_LENGTH; at += 1) {
+        next[index + at] = typed[at] ?? '';
+      }
+      return next;
+    });
+
+    const nextIndex = Math.min(CODE_LENGTH - 1, index + typed.length);
+    digitRefs.current[nextIndex]?.focus();
+    if (error) setError(null);
+  };
+
+  const onDigitKey = (index: number, key: string) => {
+    if (key === 'Backspace' && code[index] === '' && index > 0) {
+      digitRefs.current[index - 1]?.focus();
+    } else if (key === 'ArrowLeft' && index > 0) {
+      digitRefs.current[index - 1]?.focus();
+    } else if (key === 'ArrowRight' && index < CODE_LENGTH - 1) {
+      digitRefs.current[index + 1]?.focus();
+    }
+  };
+
+  const pasteCode = (text: string) => {
+    const pasted = text.replace(/[^0-9]/g, '').slice(0, CODE_LENGTH);
+    if (pasted === '') return;
+    setCode(Array.from({ length: CODE_LENGTH }, (_, index) => pasted[index] ?? ''));
+    digitRefs.current[Math.min(CODE_LENGTH - 1, pasted.length - 1)]?.focus();
+    if (error) setError(null);
+  };
+
+  const resendCode = () => {
+    setCode(emptyCode());
+    setSecondsLeft(RESEND_SECONDS);
+    setError(null);
+    digitRefs.current[0]?.focus();
+  };
+
+  /**
+   * The code, then the one question only the server can answer.
+   *
+   * This is the function to replace when a real OTP provider is connected: the
+   * placeholder check and the countdown remain the UI's, and the existence check
+   * already happens after verification.
+   */
+  const submitCode = useCallback(async () => {
+    const entered = code.join('');
+    if (entered.length < CODE_LENGTH) {
+      setError('credential.otpIncomplete');
+      return;
+    }
+    if (entered !== PLACEHOLDER_CODE) {
+      setError('credential.otpWrong');
+      return;
+    }
 
     setBusy(true);
     setError(null);
+    setDetail(null);
     try {
       const client = await getSupabaseClient(serviceConfig.supabase);
-      /*
-       * No backend: nothing knows whether the contact exists, so it is treated as
-       * new. The account is then made on the phone, and the note below says so.
-       */
+      /* No backend: nothing knows whether the contact exists, so it is new. */
       if (!client) {
         setStep('create');
         return;
@@ -150,7 +249,7 @@ export function CredentialSheet() {
     } finally {
       setBusy(false);
     }
-  }, [contact, channel]);
+  }, [code, contact]);
 
   const continueWithPassword = useCallback(async () => {
     if (password === '') {
@@ -231,11 +330,6 @@ export function CredentialSheet() {
         password,
       });
       if (refusal || !data.session) {
-        /*
-         * The account was made and the provider still refuses the session: on a
-         * project with confirmation switched on, that is the whole answer, and
-         * "try again" would send the farmer round the same loop forever.
-         */
         setError(
           refusal && isUnconfirmed(refusal.message)
             ? 'credential.confirmRequired'
@@ -269,13 +363,12 @@ export function CredentialSheet() {
     setStep('contact');
   };
 
-  const backToContact = () => {
-    setPassword('');
-    setName('');
-    setError(null);
-    setDetail(null);
-    setStep('contact');
-  };
+  const title =
+    step === 'otp'
+      ? t('credential.otpTitle')
+      : step === 'create'
+        ? t('session.title')
+        : t('credential.signIn');
 
   return (
     <Sheet
@@ -284,30 +377,20 @@ export function CredentialSheet() {
         if (!open) dismiss();
       }}
     >
+      {/* Tall sheets — the contact step with a gate reason, and a phone in
+          landscape — must scroll rather than push their button below the screen. */}
       <SheetContent
         side="bottom"
-        /*
-         * A thumb-sized sheet: wider than the 430px the identity sheet used, and
-         * with the room below the button that a phone with a gesture bar needs.
-         */
-        className="mx-auto w-full max-w-[520px] pb-2"
+        className="mx-auto max-h-[90dvh] w-full max-w-[430px] overflow-y-auto pb-2"
       >
         <SheetHeader>
-          {/* Two steps are sign-in, one is creation, and the title can only say
-              which after the server has answered about the contact. */}
-          <SheetTitle>{t(step === 'create' ? 'session.title' : 'credential.signIn')}</SheetTitle>
+          <SheetTitle>{title}</SheetTitle>
         </SheetHeader>
 
-        <div className="flex flex-col gap-5 px-5 pt-1 pb-10">
-          {/*
-            Why an account is being asked for, in the words of the action that
-            asked. Every gate passes a reason (`session.why.post`, `…credit`,
-            `…report`), and the sheet is the one place that can show it: without
-            this line a farmer tapping "Send report" is shown a sign-in form and
-            no explanation of what it has to do with their field. The sentence is
-            the caller's, so it is correct for every gate without this sheet
-            knowing which action it interrupted.
-          */}
+        <div className="flex flex-col gap-4 px-5 pt-1 pb-10">
+          {/* Why an account is being asked for, in the words of the action that
+              asked. Without it a farmer tapping "Send report" is shown a form and
+              no explanation of what it has to do with their field. */}
           {pendingReason ? (
             <p className="flex gap-2 rounded-md bg-brand-soft px-3 py-2.5 text-body-sm text-brand">
               <ShieldCheck className="size-4 shrink-0" aria-hidden />
@@ -320,11 +403,6 @@ export function CredentialSheet() {
               <Label htmlFor="credential-contact" className="text-label text-muted-foreground">
                 {t('credential.contactLabel')}
               </Label>
-              {/*
-                One field for either, and the keyboard is the one that can type
-                both: `email` carries the `@` a number never needs and the digits
-                an address never needs.
-              */}
               <Input
                 id="credential-contact"
                 type="text"
@@ -333,46 +411,115 @@ export function CredentialSheet() {
                 value={contact}
                 onChange={(event) => onContactChange(event.target.value)}
                 onKeyDown={(event) => {
-                  if (event.key === 'Enter') void continueFromContact();
+                  if (event.key === 'Enter') continueFromContact();
                 }}
                 placeholder={t('credential.contactPlaceholder')}
-                className="mt-3 h-12 px-4"
+                className="mt-2 h-12 rounded-xl px-4"
                 aria-invalid={fieldOf(error) === 'contact'}
                 aria-describedby={error ? ERROR_ID : undefined}
-                readOnly={busy}
               />
             </div>
           ) : null}
 
-          {step === 'password' ? (
-            <p className="text-body-sm text-muted-foreground">
-              {t('credential.passwordPrompt', { contact: contact.trim() })}
-            </p>
+          {step === 'otp' ? (
+            <>
+              <p className="text-body-sm text-muted-foreground">
+                {t('credential.otpSentTo', { destination: contact.trim() })}
+              </p>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setStep('contact');
+                  setCode(emptyCode());
+                  setError(null);
+                  setDetail(null);
+                }}
+                className="-mt-2 self-start rounded-full py-1 text-label text-brand"
+              >
+                {t('credential.otpChange')}
+              </button>
+
+              <div
+                role="group"
+                aria-label={t('credential.otpTitle')}
+                className="grid grid-cols-6 gap-2"
+                onPaste={(event) => {
+                  event.preventDefault();
+                  pasteCode(event.clipboardData.getData('text'));
+                }}
+              >
+                {code.map((digit, index) => (
+                  <input
+                    // eslint-disable-next-line react/no-array-index-key -- one box per digit, fixed count
+                    key={index}
+                    ref={(element) => {
+                      digitRefs.current[index] = element;
+                    }}
+                    type="text"
+                    inputMode="numeric"
+                    autoComplete={index === 0 ? 'one-time-code' : 'off'}
+                    maxLength={1}
+                    value={digit}
+                    aria-label={t('credential.otpDigit', { index: String(index + 1) })}
+                    onChange={(event) => enterDigit(index, event.target.value)}
+                    onKeyDown={(event) => {
+                      onDigitKey(index, event.key);
+                      if (event.key === 'Enter') void submitCode();
+                    }}
+                    className="h-14 w-full min-w-0 rounded-xl border border-border bg-muted text-center text-title focus:border-brand focus:ring-2 focus:ring-brand/30 focus:outline-none"
+                  />
+                ))}
+              </div>
+
+              <div className="flex flex-col items-center gap-0.5">
+                <p className="text-caption tabular-nums text-muted-foreground">
+                  {formatCountdown(secondsLeft)}
+                </p>
+                <button
+                  type="button"
+                  onClick={resendCode}
+                  disabled={secondsLeft > 0}
+                  className="rounded-full py-1 text-body-sm text-muted-foreground disabled:opacity-50"
+                >
+                  {t('credential.otpResend')}
+                </button>
+              </div>
+
+              <p className="text-center text-caption text-muted-foreground">
+                {t('credential.otpHint')}
+              </p>
+            </>
           ) : null}
 
           {step === 'password' ? (
-            <div>
-              <Label htmlFor="credential-password" className="text-label text-muted-foreground">
-                {t('credential.passwordLabel')}
-              </Label>
-              <Input
-                id="credential-password"
-                type="password"
-                autoComplete="current-password"
-                value={password}
-                onChange={(event) => {
-                  setPassword(event.target.value);
-                  if (error) setError(null);
-                }}
-                onKeyDown={(event) => {
-                  if (event.key === 'Enter') void continueWithPassword();
-                }}
-                className="mt-3 h-12 px-4"
-                aria-invalid={fieldOf(error) === 'password'}
-                aria-describedby={error ? ERROR_ID : undefined}
-                readOnly={busy}
-              />
-            </div>
+            <>
+              <p className="text-body-sm text-muted-foreground">
+                {t('credential.passwordPrompt', { contact: contact.trim() })}
+              </p>
+              <div>
+                <Label htmlFor="credential-password" className="text-label text-muted-foreground">
+                  {t('credential.passwordLabel')}
+                </Label>
+                <Input
+                  id="credential-password"
+                  type="password"
+                  autoComplete="current-password"
+                  value={password}
+                  onChange={(event) => {
+                    setPassword(event.target.value);
+                    if (error) setError(null);
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') void continueWithPassword();
+                  }}
+                  className="mt-2 h-12 rounded-xl px-4"
+                  aria-invalid={fieldOf(error) === 'password'}
+                  aria-describedby={error ? ERROR_ID : undefined}
+                  readOnly={busy}
+                />
+              </div>
+            </>
           ) : null}
 
           {step === 'create' ? (
@@ -390,7 +537,7 @@ export function CredentialSheet() {
                   }}
                   placeholder={t('credential.namePlaceholder')}
                   autoComplete="name"
-                  className="mt-3 h-12 px-4"
+                  className="mt-2 h-12 rounded-xl px-4"
                   aria-invalid={fieldOf(error) === 'name'}
                   aria-describedby={error ? ERROR_ID : undefined}
                   readOnly={busy}
@@ -416,7 +563,7 @@ export function CredentialSheet() {
                     if (event.key === 'Enter') void continueWithNewAccount();
                   }}
                   placeholder={t('credential.createPasswordPlaceholder')}
-                  className="mt-3 h-12 px-4"
+                  className="mt-2 h-12 rounded-xl px-4"
                   aria-invalid={fieldOf(error) === 'password'}
                   aria-describedby={error ? ERROR_ID : undefined}
                   readOnly={busy}
@@ -445,40 +592,54 @@ export function CredentialSheet() {
           ) : null}
 
           {step === 'contact' ? (
-            <Button className="mt-7 h-12 rounded-full" onClick={() => void continueFromContact()} disabled={busy}>
+            <Button className="mt-4 h-12 rounded-full" onClick={continueFromContact}>
+              {t('credential.continue')}
+            </Button>
+          ) : null}
+
+          {step === 'otp' ? (
+            <Button
+              className="h-12 rounded-full"
+              onClick={() => void submitCode()}
+              disabled={busy}
+            >
               {busy ? t('credential.checking') : t('credential.continue')}
             </Button>
           ) : null}
 
           {step === 'password' ? (
-            <Button className="mt-7 h-12 rounded-full" onClick={() => void continueWithPassword()} disabled={busy}>
+            <Button
+              className="mt-4 h-12 rounded-full"
+              onClick={() => void continueWithPassword()}
+              disabled={busy}
+            >
               {busy ? t('credential.signingIn') : t('credential.signIn')}
             </Button>
           ) : null}
 
           {step === 'create' ? (
-            <Button className="mt-7 h-12 rounded-full" onClick={() => void continueWithNewAccount()} disabled={busy}>
+            <Button
+              className="mt-4 h-12 rounded-full"
+              onClick={() => void continueWithNewAccount()}
+              disabled={busy}
+            >
               {busy ? t('credential.creating') : t('credential.create')}
             </Button>
-          ) : null}
-
-          {/* Only the steps past the contact have somewhere to go back to; the
-              sheet's own close control is the way out of the first one. */}
-          {step !== 'contact' ? (
-            <button
-              type="button"
-              onClick={backToContact}
-              disabled={busy}
-              className="flex items-center justify-center gap-1.5 rounded-full py-2 text-body-sm text-muted-foreground"
-            >
-              <ArrowLeft className="size-4 rtl:rotate-180" aria-hidden />
-              {t('credential.back')}
-            </button>
           ) : null}
         </div>
       </SheetContent>
     </Sheet>
   );
+}
+
+/** One empty box per digit of the code. */
+function emptyCode(): string[] {
+  return Array.from({ length: CODE_LENGTH }, () => '');
+}
+
+/** `1:00`, then `0:59`, down to `0:00`. */
+function formatCountdown(seconds: number): string {
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
 }
 
 /**
@@ -510,7 +671,7 @@ function fieldOf(error: MessageKey | null): 'contact' | 'name' | 'password' | nu
  * version erased the letters before the `@` could be reached.
  */
 function onlyNumberCharacters(raw: string): boolean {
-  return /^[0-9\s()+.\-\u0660-\u0669\u06f0-\u06f9]*$/.test(raw);
+  return /^[0-9\s()+\-.\u0660-\u0669\u06f0-\u06f9]*$/.test(raw);
 }
 
 /**
@@ -542,7 +703,8 @@ function credentialFor(
  *
  * The function is a security definer in the database because `auth.users` is not
  * readable by a client; the answer comes back as one boolean, and a boolean is all
- * this needs.
+ * this needs. It is asked only after the code, so the sheet cannot be used to
+ * enumerate accounts without receiving a code.
  */
 async function contactExists(client: SupabaseLike, contact: string): Promise<boolean> {
   const value = isEmail(contact) ? contact.trim().toLowerCase() : contact.replace(/[^0-9]/g, '');

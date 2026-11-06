@@ -134,6 +134,12 @@
   --text-display--line-height: 1;
   --text-display--letter-spacing: -0.02em;
 
+  /* The weather hero: the subject of its screen rather than a heading, so it
+     needs a step above display. Additive — no other screen changes. */
+  --text-hero: 5.25rem; /* 84px */
+  --text-hero--line-height: 0.9;
+  --text-hero--letter-spacing: -0.05em;
+
   --text-figure: 1.75rem; /* 28px — money */
   --text-figure--line-height: 1.1;
   --text-figure--letter-spacing: -0.02em;
@@ -363,4 +369,52 @@
     outline-offset: 2px;
   }
 
+}
+
+/* -----------------------------------------------------------------------------
+   4 · WEATHER SKY
+
+   The one full-bleed surface in the product. It is built from the same palette
+   as everything else — clay and cream by day, ink at night — rather than from a
+   photograph of a sky imported from somewhere else, so the weather screen is a
+   member of this design system and not a guest in it.
+
+   The drift is slow on purpose: weather is not a notification, and a background
+   that moves faster than the eye reads is a background that steals the reading.
+   -------------------------------------------------------------------------- */
+.weather-sky {
+  background: radial-gradient(
+    120% 85% at 50% 0%,
+    var(--color-cream-50) 0%,
+    var(--color-clay-100) 34%,
+    var(--color-clay-200) 68%,
+    var(--color-amber-100) 100%
+  );
+  background-size: 100% 145%;
+  background-position: 50% 0%;
+  animation: sky-drift 18s ease-in-out infinite alternate;
+}
+
+.dark .weather-sky {
+  background: radial-gradient(
+    120% 85% at 50% 0%,
+    var(--color-clay-700) 0%,
+    var(--color-clay-800) 55%,
+    var(--color-ink-950) 100%
+  );
+}
+
+@keyframes sky-drift {
+  from {
+    background-position: 50% 0%;
+  }
+  to {
+    background-position: 50% 14%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .weather-sky {
+    animation: none;
+  }
 }

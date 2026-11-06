@@ -63,6 +63,25 @@ jobs:
       - name: Production build
         run: npm run build
 
+  # Recovery and load are disposable-Postgres checks, not staging checks. They
+  # run independently so a failure names the gate that broke instead of hiding
+  # behind a UI test. Both use the same bundled schema the migration lint sees.
+  recovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Backup and restore drill
+        run: bash scripts/verify-recovery.sh
+
+  performance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bounded load and concurrency
+        run: bash scripts/verify-performance.sh
+
   # Vendor contracts drift: a field gets renamed, a unit changes, a code is added.
 # The only way to find out is to ask the real service, which is why this job
 # exists separately from the suite — the suite stays offline and deterministic,

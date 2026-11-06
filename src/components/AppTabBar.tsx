@@ -6,7 +6,7 @@ export type TabKey = 'home' | 'dealers' | 'scan' | 'chat' | 'community';
 
 const TABS: ReadonlyArray<{ key: TabKey; labelKey: MessageKey; Icon: typeof House }> = [
   { key: 'home', labelKey: 'nav.home', Icon: House },
-  { key: 'dealers', labelKey: 'nav.dealers', Icon: Store },
+  { key: 'dealers', labelKey: 'nav.shop', Icon: Store },
   { key: 'scan', labelKey: 'nav.scan', Icon: ScanLine },
   { key: 'chat', labelKey: 'nav.chat', Icon: MessageCircle },
   { key: 'community', labelKey: 'nav.community', Icon: Users },

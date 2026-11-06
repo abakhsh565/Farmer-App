@@ -7,13 +7,13 @@
 --   2. paste this entire file
 --   3. Run. Either every migration applies, or none of them does.
 --
--- 32 migrations, applied in filename order, wrapped in one
+-- 69 migrations, applied in filename order, wrapped in one
 -- transaction on purpose: a chain applied half-way is worse than one that has not
 -- started, because the next attempt then fails on objects that already exist.
 --
 -- After it succeeds, check the advisors (Advisors → Security) for any table
 -- without row level security, and then verify with:
---   select count(*) from pg_tables where schemaname = 'public';   -- 54
+--   select count(*) from pg_tables where schemaname = 'public';   -- 84
 
 begin;
 
@@ -8851,5 +8851,17400 @@ comment on function public.intel_feed(double precision, double precision, double
 -- is a standing invitation, and re-creating the function above silently reset it.
 revoke all on function public.intel_feed(double precision, double precision, double precision, text, text, integer) from public;
 grant execute on function public.intel_feed(double precision, double precision, double precision, text, text, integer) to anon, authenticated, service_role;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261103000100_intelligence_foundation.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Farmer App · migration 0036 · Phase 1 intelligence foundation
+--
+-- One place where "what this farmer cares about" is decided, so every future
+-- surface — home feed, AI answers, product/dealer ranking, notifications — reads
+-- the same state instead of growing its own scoring.
+--
+-- What already existed and is reused rather than duplicated:
+--   · farmer_profiles        — identity + default location
+--   · crop_instances/facts    — confirmed farming context (facts cannot hold guesses)
+--   · crop_inferences         — hypotheses, promoted only by a human act
+--   · behaviour_signals       — raw behaviour, with source/strength/decay
+--   · signal_weight()         — the existing decay curve
+--   · recommendations         — the single canonical advice object
+--
+-- What this migration adds:
+--   · farmer_intelligence_profiles — a small, derived snapshot per farmer
+--   · farmer_interests             — explicit and learned interests, one row per topic
+--   · farmer_preferences           — explicit farmer choices (opaque, versioned values)
+--   · intelligence_config          — versioned weights, readable by the app
+--   · intelligence_rules           — declarative personalization rules (matcher v1)
+--   · intelligence_feedback        — the learning signal, idempotent per action
+--   · record_behaviour_event()     — the only intake, owner derived from the session
+--   · farmer_intelligence_context()— one context object for UI, AI and scoring
+--   · intelligence_recommendation_feed() — transparent scored ranking
+--
+-- Deliberate limits:
+--   · No free text is accepted from clients into behaviour rows; subjects are
+--     slugs. A search query can contain a name, a phone number or a field
+--     boundary, and none of that belongs in an analytics table.
+--   · Weight, confidence and score are always 0..1 so they compose.
+--   · Nothing here writes to crop_facts. Behaviour reorders relevance; it never
+--     becomes a confirmed fact.
+
+-- ---------------------------------------------------------------------------
+-- Derived profile snapshot
+-- ---------------------------------------------------------------------------
+create table public.farmer_intelligence_profiles (
+  farmer_id          uuid primary key references public.farmer_profiles (party_id) on delete cascade,
+  primary_crop_code  text references public.crop_catalog (code),
+  district           text,
+  language           text not null default 'en' check (language in ('en', 'ur')),
+  engagement_level   text not null default 'new'
+                     check (engagement_level in ('new', 'exploring', 'engaged', 'dormant')),
+  interest_summary   jsonb not null default '{}'::jsonb,
+  signals_count      integer not null default 0 check (signals_count >= 0),
+  computed_at        timestamptz,
+  created_at         timestamptz not null default now(),
+  updated_at         timestamptz not null default now()
+);
+
+create trigger farmer_intelligence_profiles_touch
+  before update on public.farmer_intelligence_profiles
+  for each row execute function public.touch_updated_at();
+
+comment on table public.farmer_intelligence_profiles is
+  'A derived snapshot, never the source of truth. Interests and behaviour live in their own tables; this row exists so a screen can read one small object instead of joining the history.';
+
+-- ---------------------------------------------------------------------------
+-- Interests: explicit, learned, or corrected by feedback
+-- ---------------------------------------------------------------------------
+create table public.farmer_interests (
+  id            uuid primary key default gen_random_uuid(),
+  farmer_id     uuid not null references public.farmer_profiles (party_id) on delete cascade,
+  -- Namespaced slug: crop:wheat, product:urea, topic:pest. Keeps every future
+  -- interest type in one namespace without a new table per kind.
+  topic         text not null check (topic ~ '^[a-z]+:[a-z0-9_-]{1,60}$'),
+  crop_code     text references public.crop_catalog (code),
+  weight        numeric not null default 0.3 check (weight >= 0 and weight <= 1),
+  confidence    numeric not null default 0.3 check (confidence >= 0 and confidence <= 1),
+  source        text not null default 'behaviour'
+                check (source in ('explicit', 'behaviour', 'feedback', 'system')),
+  -- An explicit interest is never silently overwritten by learning.
+  pinned        boolean not null default false,
+  dismissed_at  timestamptz,
+  first_seen_at timestamptz not null default now(),
+  last_seen_at  timestamptz not null default now(),
+  updated_at    timestamptz not null default now(),
+  unique (farmer_id, topic)
+);
+
+create index farmer_interests_live_idx
+  on public.farmer_interests (farmer_id, weight desc)
+  where dismissed_at is null;
+
+create trigger farmer_interests_touch
+  before update on public.farmer_interests
+  for each row execute function public.touch_updated_at();
+
+comment on table public.farmer_interests is
+  'One row per farmer per topic. source=explicit and pinned rows are protected from learning; feedback may lower a learned weight but never rewrites a stated preference.';
+
+-- ---------------------------------------------------------------------------
+-- Explicit preferences (farmer-controlled algorithm settings)
+-- ---------------------------------------------------------------------------
+create table public.farmer_preferences (
+  farmer_id  uuid not null references public.farmer_profiles (party_id) on delete cascade,
+  key        text not null check (key ~ '^[a-z][a-z0-9_.]{1,40}$'),
+  -- Small, versioned value. Examples: {"topics":["pest","water"]} or false.
+  value      jsonb not null,
+  updated_at timestamptz not null default now(),
+  primary key (farmer_id, key),
+  constraint farmer_preferences_small check (octet_length(value::text) <= 2048)
+);
+
+create trigger farmer_preferences_touch
+  before update on public.farmer_preferences
+  for each row execute function public.touch_updated_at();
+
+comment on table public.farmer_preferences is
+  'Explicit farmer choices. Learning may not write here: this table is what the farmer said, and the settings screen is its only author.';
+
+-- ---------------------------------------------------------------------------
+-- Configuration: one versioned row per knob
+-- ---------------------------------------------------------------------------
+create table public.intelligence_config (
+  key         text primary key check (key ~ '^[a-z][a-z0-9_]{1,60}$'),
+  value       jsonb not null,
+  version     integer not null default 1 check (version > 0),
+  description text not null,
+  updated_at  timestamptz not null default now()
+);
+
+comment on table public.intelligence_config is
+  'Weights and limits for scoring, versioned so a change can be explained. Readable by the app; written only by a migration or the service role.';
+
+insert into public.intelligence_config (key, value, description) values
+  ('decay_half_life_days', '30'::jsonb,
+   'Half-life used when turning behaviour into an interest weight.'),
+  ('confidence_weight', '0.2'::jsonb,
+   'Share of a recommendation score contributed by the recommendation confidence.'),
+  ('interest_weight', '0.5'::jsonb,
+   'Multiplier applied to a matching interest weight.'),
+  ('max_interest_boost', '0.25'::jsonb,
+   'Ceiling on the total interest contribution, so one enthusiasm cannot dominate the feed.'),
+  ('negative_feedback_penalty', '0.15'::jsonb,
+   'Penalty per not-relevant/dismissed verdict inside the penalty window.'),
+  ('negative_penalty_cap', '0.45'::jsonb,
+   'Ceiling on negative feedback penalty for one recommendation.'),
+  ('negative_window_days', '30'::jsonb,
+   'How long a negative verdict keeps affecting a recommendation.'),
+  ('scoring_version', '1'::jsonb,
+   'Which scoring formula produced a score. Bump when the formula changes.');
+
+-- ---------------------------------------------------------------------------
+-- Rules: declarative, evaluated by matcher v1
+-- ---------------------------------------------------------------------------
+create table public.intelligence_rules (
+  id          uuid primary key default gen_random_uuid(),
+  code        text not null unique check (code ~ '^[a-z][a-z0-9_]{1,60}$'),
+  description text not null,
+  scope       text not null default 'recommendation'
+              check (scope in ('recommendation', 'feed', 'interest')),
+  -- Matcher v1 understands {"match":"primary_crop"} and {"match":"interest"}.
+  -- Unknown conditions are stored but contribute nothing; they are never
+  -- guessed at, and scoring stays explainable.
+  condition   jsonb not null default '{}'::jsonb,
+  weight      numeric not null default 0 check (weight >= -1 and weight <= 1),
+  priority    integer not null default 100,
+  is_active   boolean not null default true,
+  version     integer not null default 1 check (version > 0),
+  created_at  timestamptz not null default now(),
+  updated_at  timestamptz not null default now()
+);
+
+create trigger intelligence_rules_touch
+  before update on public.intelligence_rules
+  for each row execute function public.touch_updated_at();
+
+comment on table public.intelligence_rules is
+  'Personalization rules as data. The matcher is code, the weights are configuration, and an unknown condition is inert rather than interpreted.';
+
+insert into public.intelligence_rules (code, description, scope, condition, weight, priority) values
+  ('primary_crop_match', 'Boost advice about the farmer''s main crop.', 'recommendation',
+   '{"match":"primary_crop"}'::jsonb, 0.15, 10),
+  ('interest_topic_match', 'Boost advice whose kind matches a live interest.', 'recommendation',
+   '{"match":"interest"}'::jsonb, 0.2, 20),
+  ('explicit_preference_boost', 'Boost topics the farmer explicitly asked for.', 'recommendation',
+   '{"match":"preference"}'::jsonb, 0.1, 30),
+  ('negative_feedback_penalty', 'Lower advice the farmer marked not relevant.', 'recommendation',
+   '{"match":"negative_feedback"}'::jsonb, -1, 40);
+
+-- ---------------------------------------------------------------------------
+-- Extend the existing behaviour log, additively
+-- ---------------------------------------------------------------------------
+alter table public.behaviour_signals
+  add column event_key   text,
+  add column session_id  text,
+  add column occurred_at timestamptz,
+  add column context     jsonb not null default '{}'::jsonb;
+
+-- Idempotency: one accepted event per key per farmer. A retried flush after a
+-- timeout therefore records once, not twice.
+create unique index behaviour_signals_event_key_idx
+  on public.behaviour_signals (farmer_id, event_key)
+  where event_key is not null;
+
+create index behaviour_signals_occurred_idx
+  on public.behaviour_signals (farmer_id, occurred_at desc)
+  where occurred_at is not null;
+
+comment on column public.behaviour_signals.event_key is
+  'Client-generated idempotency key. Optional for historical rows; new intake requires one.';
+comment on column public.behaviour_signals.occurred_at is
+  'When the farmer acted, from the device clock. observed_at remains the server arrival time; the two are never conflated.';
+comment on column public.behaviour_signals.context is
+  'Coarse slugs only (screen, crop, stage, topic). No free text, no contact details, no exact coordinates.';
+
+-- ---------------------------------------------------------------------------
+-- Feedback: the learning signal
+-- ---------------------------------------------------------------------------
+create table public.intelligence_feedback (
+  id                uuid primary key default gen_random_uuid(),
+  farmer_id         uuid not null references public.farmer_profiles (party_id) on delete cascade,
+  recommendation_id uuid references public.recommendations (id) on delete cascade,
+  insight_ref       text,
+  verdict           text not null
+                    check (verdict in ('helpful', 'not_relevant', 'acted', 'dismissed', 'saved')),
+  reason            text check (reason is null or length(btrim(reason)) <= 280),
+  context           jsonb not null default '{}'::jsonb,
+  idempotency_key   text,
+  created_at        timestamptz not null default now(),
+  constraint intelligence_feedback_context_small check (octet_length(context::text) <= 2048)
+);
+
+create unique index intelligence_feedback_idempotency_idx
+  on public.intelligence_feedback (farmer_id, idempotency_key)
+  where idempotency_key is not null;
+
+create index intelligence_feedback_farmer_idx
+  on public.intelligence_feedback (farmer_id, created_at desc);
+
+comment on table public.intelligence_feedback is
+  'A farmer''s verdict on one piece of advice. Feedback is evidence for ranking, never a rewrite of the advice itself.';
+
+-- ---------------------------------------------------------------------------
+-- RLS
+-- ---------------------------------------------------------------------------
+alter table public.farmer_intelligence_profiles enable row level security;
+alter table public.farmer_interests enable row level security;
+alter table public.farmer_preferences enable row level security;
+alter table public.intelligence_config enable row level security;
+alter table public.intelligence_rules enable row level security;
+alter table public.intelligence_feedback enable row level security;
+
+create policy farmer_intelligence_profiles_own on public.farmer_intelligence_profiles
+  for select to authenticated
+  using (farmer_id = public.current_farmer_id() or public.has_capability('admin'));
+
+create policy farmer_interests_own on public.farmer_interests
+  for select to authenticated
+  using (farmer_id = public.current_farmer_id() or public.has_capability('admin'));
+
+create policy farmer_preferences_own on public.farmer_preferences
+  for select to authenticated
+  using (farmer_id = public.current_farmer_id() or public.has_capability('admin'));
+
+create policy intelligence_feedback_own on public.intelligence_feedback
+  for select to authenticated
+  using (farmer_id = public.current_farmer_id() or public.has_capability('admin'));
+
+create policy intelligence_config_read on public.intelligence_config
+  for select to authenticated using (true);
+
+create policy intelligence_rules_read on public.intelligence_rules
+  for select to authenticated using (is_active);
+
+-- Writes are RPC-only. A client that could set its own interest weight could
+-- rank its own feed, which is the one thing this layer must not allow.
+revoke insert, update, delete on public.farmer_intelligence_profiles from authenticated;
+revoke insert, update, delete on public.farmer_interests from authenticated;
+revoke insert, update, delete on public.farmer_preferences from authenticated;
+revoke insert, update, delete on public.intelligence_config from authenticated;
+revoke insert, update, delete on public.intelligence_rules from authenticated;
+revoke insert, update, delete on public.intelligence_feedback from authenticated;
+
+-- ---------------------------------------------------------------------------
+-- Intake: the only route for behaviour
+-- ---------------------------------------------------------------------------
+create or replace function public.record_behaviour_event(
+  p_event_key    text,
+  p_signal_type  text,
+  p_source       text,
+  p_subject      text default null,
+  p_crop_id      uuid default null,
+  p_crop_code    text default null,
+  p_strength     public.signal_strength default 'moderate',
+  p_weight_hint  numeric default null,
+  p_context      jsonb default '{}'::jsonb,
+  p_occurred_at  timestamptz default now(),
+  p_session_id   text default null
+)
+returns bigint
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_farmer  uuid := public.current_farmer_id();
+  v_key     text;
+  v_id      bigint;
+  v_types   constant text[] := array[
+    'screen_view','search','product_view','dealer_view','insight_open','insight_act',
+    'insight_dismiss','scan_start','scan_result','chat_open','community_read',
+    'notification_open','preference_set','feedback'
+  ];
+begin
+  if v_farmer is null then
+    raise exception 'Behaviour is recorded for an identified farmer only.'
+      using errcode = 'insufficient_privilege';
+  end if;
+
+  if p_signal_type is null or not (p_signal_type = any (v_types)) then
+    raise exception 'Unknown signal type: %', coalesce(p_signal_type, '(null)')
+      using errcode = 'check_violation';
+  end if;
+
+  if p_source is null or p_source not in
+     ('ui_interaction','search','scan','chat','community_read','notification_open') then
+    raise exception 'Unknown signal source: %', coalesce(p_source, '(null)')
+      using errcode = 'check_violation';
+  end if;
+
+  if p_context is not null and octet_length(p_context::text) > 2048 then
+    raise exception 'Behaviour context is too large; send slugs, not documents.'
+      using errcode = 'check_violation';
+  end if;
+
+  if p_occurred_at < now() - interval '90 days' or p_occurred_at > now() + interval '5 minutes' then
+    raise exception 'Event time is outside the accepted window.'
+      using errcode = 'check_violation';
+  end if;
+
+  v_key := nullif(btrim(p_event_key), '');
+  if v_key is null or length(v_key) > 100 then
+    raise exception 'An event key of at most 100 characters is required.'
+      using errcode = 'check_violation';
+  end if;
+
+  -- A client may name a subject only as a slug. Free text is refused here rather
+  -- than cleaned later: a query can carry a name or a phone number.
+  if p_subject is not null and p_subject !~ '^[a-z0-9][a-z0-9:_-]{0,79}$' then
+    raise exception 'Subject must be a lowercase slug.'
+      using errcode = 'check_violation';
+  end if;
+
+  if p_weight_hint is not null and (p_weight_hint < 0 or p_weight_hint > 1) then
+    raise exception 'Weight hint must be between 0 and 1.' using errcode = 'check_violation';
+  end if;
+
+  insert into public.behaviour_signals (
+    farmer_id, signal_type, crop_id, crop_code, subject, strength, source,
+    weight_hint, detail, observed_at, event_key, session_id, occurred_at, context
+  ) values (
+    v_farmer, p_signal_type, p_crop_id, p_crop_code, p_subject, p_strength, p_source,
+    p_weight_hint, '{}'::jsonb, now(), v_key,
+    nullif(btrim(p_session_id), ''), p_occurred_at, coalesce(p_context, '{}'::jsonb)
+  )
+  on conflict (farmer_id, event_key) where event_key is not null do nothing
+  returning id into v_id;
+
+  if v_id is null then
+    select id into v_id from public.behaviour_signals
+     where farmer_id = v_farmer and event_key = v_key;
+  end if;
+
+  return v_id;
+end;
+$$;
+
+comment on function public.record_behaviour_event(text, text, text, text, uuid, text, public.signal_strength, numeric, jsonb, timestamptz, text) is
+  'The only behaviour intake. Owner comes from the session, never the body; keys make retries idempotent; subjects are slugs and context is size-capped.';
+
+-- ---------------------------------------------------------------------------
+-- Explicit interest (farmer-controlled)
+-- ---------------------------------------------------------------------------
+create or replace function public.upsert_farmer_interest(
+  p_topic     text,
+  p_weight    numeric default 0.7,
+  p_crop_code text default null,
+  p_pinned    boolean default true
+)
+returns public.farmer_interests
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_farmer uuid := public.current_farmer_id();
+  v_row    public.farmer_interests;
+begin
+  if v_farmer is null then
+    raise exception 'An identified farmer is required.' using errcode = 'insufficient_privilege';
+  end if;
+
+  if p_topic is null or p_topic !~ '^[a-z]+:[a-z0-9_-]{1,60}$' then
+    raise exception 'Interest topic must be a namespaced slug.' using errcode = 'check_violation';
+  end if;
+
+  insert into public.farmer_interests (farmer_id, topic, crop_code, weight, confidence, source, pinned)
+  values (v_farmer, p_topic, p_crop_code, least(1, greatest(0, coalesce(p_weight, 0.7))), 1, 'explicit', coalesce(p_pinned, true))
+  on conflict (farmer_id, topic) do update
+    set weight      = least(1, greatest(0, coalesce(p_weight, 0.7))),
+        crop_code   = coalesce(excluded.crop_code, public.farmer_interests.crop_code),
+        source      = 'explicit',
+        confidence  = 1,
+        pinned      = coalesce(p_pinned, true),
+        dismissed_at = null,
+        updated_at  = now()
+  returning * into v_row;
+
+  return v_row;
+end;
+$$;
+
+comment on function public.upsert_farmer_interest(text, numeric, text, boolean) is
+  'An explicit interest. Learning may not overwrite it while pinned; unpinning is how a farmer lets the algorithm take over again.';
+
+-- ---------------------------------------------------------------------------
+-- Feedback intake + immediate interest adjustment
+-- ---------------------------------------------------------------------------
+create or replace function public.record_intelligence_feedback(
+  p_idempotency_key  text,
+  p_verdict          text,
+  p_recommendation_id uuid default null,
+  p_insight_ref      text default null,
+  p_reason           text default null,
+  p_context          jsonb default '{}'::jsonb
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_farmer   uuid := public.current_farmer_id();
+  v_id       uuid;
+  v_crop     uuid;
+  v_crop_code text;
+  v_kind     text;
+  v_topic    text;
+  v_delta    numeric;
+  v_source   text;
+begin
+  if v_farmer is null then
+    raise exception 'Feedback requires an identified farmer.' using errcode = 'insufficient_privilege';
+  end if;
+
+  if p_verdict is null or p_verdict not in ('helpful','not_relevant','acted','dismissed','saved') then
+    raise exception 'Unknown feedback verdict.' using errcode = 'check_violation';
+  end if;
+
+  if p_context is not null and octet_length(p_context::text) > 2048 then
+    raise exception 'Feedback context is too large.' using errcode = 'check_violation';
+  end if;
+
+  if p_recommendation_id is not null then
+    select r.crop_id, r.kind into v_crop, v_kind
+      from public.recommendations r
+     where r.id = p_recommendation_id and r.farmer_id = v_farmer;
+    if not found then
+      raise exception 'That recommendation does not belong to this farmer.'
+        using errcode = 'insufficient_privilege';
+    end if;
+  end if;
+
+  insert into public.intelligence_feedback (
+    farmer_id, recommendation_id, insight_ref, verdict, reason, context, idempotency_key
+  ) values (
+    v_farmer, p_recommendation_id, nullif(btrim(p_insight_ref), ''), p_verdict,
+    nullif(btrim(p_reason), ''), coalesce(p_context, '{}'::jsonb),
+    nullif(btrim(p_idempotency_key), '')
+  )
+  on conflict (farmer_id, idempotency_key) where idempotency_key is not null do nothing
+  returning id into v_id;
+
+  if v_id is null then
+    select id into v_id from public.intelligence_feedback
+     where farmer_id = v_farmer
+       and idempotency_key = nullif(btrim(p_idempotency_key), '');
+    return v_id;
+  end if;
+
+  -- Turn the verdict into a small, clamped interest movement. Positive verdicts
+  -- raise the topic; negative ones lower a *learned* weight and leave an explicit
+  -- preference alone.
+  if p_verdict in ('helpful','acted','saved') then
+    v_delta := 0.15; v_source := 'feedback';
+  else
+    v_delta := -0.15; v_source := 'feedback';
+  end if;
+
+  if v_crop is not null then
+    select ci.crop_code into v_crop_code from public.crop_instances ci where ci.id = v_crop;
+  end if;
+
+  v_topic := case
+    when v_crop_code is not null then 'crop:' || v_crop_code
+    when v_kind is not null then 'topic:' || v_kind
+    else null
+  end;
+
+  if v_topic is not null then
+    insert into public.farmer_interests (farmer_id, topic, crop_code, weight, confidence, source)
+    values (v_farmer, v_topic, v_crop_code, least(1, greatest(0, 0.3 + v_delta)), 0.4, v_source)
+    on conflict (farmer_id, topic) do update
+      set weight = case
+            when public.farmer_interests.pinned
+              or public.farmer_interests.source = 'explicit'
+            then public.farmer_interests.weight
+            else least(1, greatest(0, public.farmer_interests.weight + v_delta))
+          end,
+          last_seen_at = now(),
+          updated_at   = now();
+  end if;
+
+  perform public.write_audit(
+    'intelligence.feedback', 'intelligence_feedback', v_id, null, null, p_verdict,
+    jsonb_build_object('recommendation_id', p_recommendation_id, 'topic', v_topic)
+  );
+
+  return v_id;
+end;
+$$;
+
+comment on function public.record_intelligence_feedback(text, text, uuid, text, text, jsonb) is
+  'Records one verdict idempotently and applies a clamped interest movement. Explicit/pinned interests are never moved by feedback.';
+
+-- ---------------------------------------------------------------------------
+-- Learning: behaviour → interests, decayed by the existing signal_weight()
+-- ---------------------------------------------------------------------------
+create or replace function public.refresh_farmer_interests(p_days integer default 90)
+returns integer
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_farmer    uuid;
+  v_halflife numeric;
+  v_count     integer := 0;
+  v_since     timestamptz := now() - make_interval(days => greatest(1, least(coalesce(p_days, 90), 365)));
+begin
+  select coalesce((value #>> '{}')::numeric, 30)
+    into v_halflife
+    from public.intelligence_config where key = 'decay_half_life_days';
+
+  v_halflife := coalesce(v_halflife, 30);
+
+  for v_farmer in
+    select distinct s.farmer_id
+      from public.behaviour_signals s
+     where s.occurred_at is not null
+       and coalesce(s.occurred_at, s.observed_at) > v_since
+  loop
+    insert into public.farmer_interests (farmer_id, topic, crop_code, weight, confidence, source, last_seen_at)
+    select
+      v_farmer,
+      t.topic,
+      max(t.crop_code),
+      sum(t.w) / (1 + sum(t.w)),
+      least(1, sum(t.w) / 3),
+      'behaviour',
+      now()
+    from (
+      select
+        case
+          when s.subject is not null and s.subject like '%:%' then s.subject
+          when s.subject is not null then 'topic:' || s.subject
+          else 'crop:' || s.crop_code
+        end as topic,
+        s.crop_code,
+        coalesce(s.weight_hint, 1.0)
+          * public.signal_weight(coalesce(s.occurred_at, s.observed_at), s.strength)
+          * exp(-ln(2) * extract(epoch from (now() - coalesce(s.occurred_at, s.observed_at))) / 86400 / v_halflife) as w
+      from public.behaviour_signals s
+      where s.farmer_id = v_farmer
+        and coalesce(s.occurred_at, s.observed_at) > v_since
+        and (s.subject is not null or s.crop_code is not null)
+    ) t
+    where t.topic ~ '^[a-z]+:[a-z0-9_-]{1,60}$'
+    group by t.topic
+    on conflict (farmer_id, topic) do update
+      set weight      = case
+                          when public.farmer_interests.pinned
+                            or public.farmer_interests.source = 'explicit'
+                          then public.farmer_interests.weight
+                          else excluded.weight
+                        end,
+          confidence  = excluded.confidence,
+          source      = case
+                          when public.farmer_interests.pinned
+                            or public.farmer_interests.source = 'explicit'
+                          then public.farmer_interests.source
+                          else 'behaviour'
+                        end,
+          last_seen_at = now(),
+          updated_at   = now()
+      where public.farmer_interests.dismissed_at is null;
+
+    insert into public.farmer_intelligence_profiles (
+      farmer_id, signals_count, engagement_level, computed_at, interest_summary
+    )
+    select
+      v_farmer,
+      count(*),
+      case
+        when max(coalesce(s.occurred_at, s.observed_at)) < now() - interval '30 days' then 'dormant'
+        when count(*) < 5 then 'exploring'
+        else 'engaged'
+      end,
+      now(),
+      coalesce((
+        select jsonb_object_agg(i.topic, round(i.weight, 3))
+          from public.farmer_interests i
+         where i.farmer_id = v_farmer and i.dismissed_at is null
+      ), '{}'::jsonb)
+    from public.behaviour_signals s
+    where s.farmer_id = v_farmer
+    on conflict (farmer_id) do update
+      set signals_count    = excluded.signals_count,
+          engagement_level = excluded.engagement_level,
+          computed_at      = excluded.computed_at,
+          interest_summary = excluded.interest_summary,
+          updated_at       = now();
+
+    v_count := v_count + 1;
+  end loop;
+
+  return v_count;
+end;
+$$;
+
+comment on function public.refresh_farmer_interests(integer) is
+  'Derives interest weights from decayed behaviour and refreshes the snapshot. Explicit and pinned interests keep their weight; dismissed topics are not resurrected.';
+
+-- ---------------------------------------------------------------------------
+-- Context: one object for UI, AI and scoring
+-- ---------------------------------------------------------------------------
+create or replace function public.farmer_intelligence_context(p_farmer_id uuid default null)
+returns jsonb
+language plpgsql
+stable
+security invoker
+set search_path = public, pg_temp
+as $$
+declare
+  v_farmer uuid := coalesce(p_farmer_id, public.current_farmer_id());
+  v_profile public.farmer_intelligence_profiles;
+begin
+  if v_farmer is null then
+    raise exception 'An identified farmer is required.' using errcode = 'insufficient_privilege';
+  end if;
+
+  if p_farmer_id is not null
+     and p_farmer_id <> public.current_farmer_id()
+     and not public.has_capability('admin') then
+    raise exception 'A farmer may read only their own context.' using errcode = 'insufficient_privilege';
+  end if;
+
+  select * into v_profile from public.farmer_intelligence_profiles where farmer_id = v_farmer;
+
+  return jsonb_build_object(
+    'farmer_id', v_farmer,
+    'language', coalesce(
+      (select value #>> '{}' from public.farmer_preferences where farmer_id = v_farmer and key = 'language'),
+      v_profile.language,
+      'en'
+    ),
+    'district', v_profile.district,
+    'engagement_level', coalesce(v_profile.engagement_level, 'new'),
+    'primary_crop', (
+      select jsonb_build_object('crop_id', ci.id, 'crop_code', ci.crop_code, 'stage', ci.stage)
+        from public.crop_instances ci
+       where ci.farmer_id = v_farmer and ci.is_primary and ci.closed_at is null
+       limit 1
+    ),
+    'crops', coalesce((
+      select jsonb_agg(jsonb_build_object(
+        'crop_id', ci.id, 'crop_code', ci.crop_code, 'stage', ci.stage, 'primary', ci.is_primary
+      ) order by ci.is_primary desc, ci.created_at)
+        from public.crop_instances ci
+       where ci.farmer_id = v_farmer and ci.closed_at is null
+    ), '[]'::jsonb),
+    'location', (
+      select jsonb_build_object('label', fp.default_location_label, 'area_id', fp.default_area_id)
+        from public.farmer_profiles fp where fp.party_id = v_farmer
+    ),
+    'interests', coalesce((
+      select jsonb_agg(jsonb_build_object('topic', i.topic, 'weight', round(i.weight, 3))
+                       order by i.weight desc)
+        from (
+          select topic, weight from public.farmer_interests
+           where farmer_id = v_farmer and dismissed_at is null
+           order by weight desc limit 10
+        ) i
+    ), '[]'::jsonb),
+    'preferences', coalesce((
+      select jsonb_object_agg(p.key, p.value)
+        from public.farmer_preferences p where p.farmer_id = v_farmer
+    ), '{}'::jsonb),
+    'recent_signals', (
+      select count(*) from public.behaviour_signals s
+       where s.farmer_id = v_farmer
+         and coalesce(s.occurred_at, s.observed_at) > now() - interval '30 days'
+    ),
+    'scoring_version', coalesce(
+      (select (value #>> '{}')::integer from public.intelligence_config where key = 'scoring_version'),
+      1
+    )
+  );
+end;
+$$;
+
+comment on function public.farmer_intelligence_context(uuid) is
+  'The shared context object: crops, main crop, location label, top interests, preferences and signal counts. Never coordinates or contact details.';
+
+-- ---------------------------------------------------------------------------
+-- Ranked feed: transparent scoring over the canonical recommendation rows
+-- ---------------------------------------------------------------------------
+create or replace function public.intelligence_recommendation_feed(p_limit integer default 20)
+returns table (
+  recommendation_id uuid,
+  crop_id           uuid,
+  kind              text,
+  title             text,
+  body              text,
+  source            public.recommendation_source,
+  confidence        numeric,
+  priority          integer,
+  score             numeric,
+  components        jsonb,
+  valid_until       timestamptz
+)
+language sql
+stable
+security invoker
+set search_path = public, pg_temp
+as $$
+  with mine as (
+    select public.current_farmer_id() as farmer_id
+  ),
+  cfg as (
+    select
+      coalesce(max(case when key = 'confidence_weight' then (value #>> '{}')::numeric end), 0.2) as confidence_weight,
+      coalesce(max(case when key = 'interest_weight' then (value #>> '{}')::numeric end), 0.5) as interest_weight,
+      coalesce(max(case when key = 'max_interest_boost' then (value #>> '{}')::numeric end), 0.25) as max_interest_boost,
+      coalesce(max(case when key = 'negative_feedback_penalty' then (value #>> '{}')::numeric end), 0.15) as negative_feedback_penalty,
+      coalesce(max(case when key = 'negative_penalty_cap' then (value #>> '{}')::numeric end), 0.45) as negative_penalty_cap,
+      coalesce(max(case when key = 'negative_window_days' then (value #>> '{}')::integer end), 30) as negative_window_days
+    from public.intelligence_config
+  ),
+  rule as (
+    select code, weight from public.intelligence_rules where is_active
+  ),
+  live as (
+    select r.id, r.crop_id, r.kind, r.title, r.body, r.source, r.confidence,
+           r.priority, r.valid_until, r.created_at,
+           coalesce(ci.is_primary, false) as is_primary,
+           ci.crop_code
+      from public.recommendations r
+      left join public.crop_instances ci on ci.id = r.crop_id
+     where r.farmer_id = (select farmer_id from mine)
+       and r.withdrawn_at is null
+       and (r.valid_until is null or r.valid_until > now())
+  ),
+  interest as (
+    select coalesce(sum(i.weight), 0) as weight
+      from public.farmer_interests i
+     where i.farmer_id = (select farmer_id from mine)
+       and i.dismissed_at is null
+  ),
+  negative as (
+    select f.recommendation_id, count(*)::numeric as n
+      from public.intelligence_feedback f, cfg c
+     where f.farmer_id = (select farmer_id from mine)
+       and f.verdict in ('not_relevant', 'dismissed')
+       and f.created_at > now() - make_interval(days => c.negative_window_days)
+     group by f.recommendation_id
+  ),
+  scored as (
+    select
+      l.*,
+      c.confidence_weight,
+      c.interest_weight,
+      c.max_interest_boost,
+      c.negative_feedback_penalty,
+      c.negative_penalty_cap,
+      coalesce((select weight from rule where code = 'primary_crop_match'), 0) as primary_weight,
+      coalesce((select weight from rule where code = 'negative_feedback_penalty'), -1) as negative_rule,
+      coalesce(n.n, 0) as negative_count,
+      -- The matching interest is the strongest live interest on this crop or kind.
+      greatest(
+        coalesce((select i.weight from public.farmer_interests i
+                   where i.farmer_id = (select farmer_id from mine)
+                     and i.dismissed_at is null
+                     and i.topic = 'crop:' || coalesce(l.crop_code, '')
+                   order by i.weight desc limit 1), 0),
+        coalesce((select i.weight from public.farmer_interests i
+                   where i.farmer_id = (select farmer_id from mine)
+                     and i.dismissed_at is null
+                     and i.topic = 'topic:' || l.kind
+                   order by i.weight desc limit 1), 0)
+      ) as matched_interest
+    from live l
+    cross join cfg c
+    left join negative n on n.recommendation_id = l.id
+  )
+  select
+    s.id,
+    s.crop_id,
+    s.kind,
+    s.title,
+    s.body,
+    s.source,
+    s.confidence,
+    s.priority,
+    round(greatest(0, least(1,
+      ((100 - least(s.priority, 100))::numeric / 100) * 0.4
+      + coalesce(s.confidence, 0.5) * s.confidence_weight
+      + least(s.max_interest_boost, s.interest_weight * s.matched_interest)
+      + case when s.is_primary then s.primary_weight else 0 end
+      + case when s.negative_count > 0
+             then -1 * least(s.negative_penalty_cap, s.negative_count * s.negative_feedback_penalty)
+             else 0 end
+    )), 4) as score,
+    jsonb_build_object(
+      'base_priority', round(((100 - least(s.priority, 100))::numeric / 100) * 0.4, 4),
+      'confidence', round(coalesce(s.confidence, 0.5) * s.confidence_weight, 4),
+      'interest', round(least(s.max_interest_boost, s.interest_weight * s.matched_interest), 4),
+      'primary_crop', case when s.is_primary then s.primary_weight else 0 end,
+      'negative_feedback', round(
+        -1 * least(s.negative_penalty_cap, s.negative_count * s.negative_feedback_penalty), 4
+      )
+    ) as components,
+    s.valid_until
+  from scored s
+  order by score desc, s.priority, s.created_at desc
+  limit greatest(1, least(coalesce(p_limit, 20), 100));
+$$;
+
+comment on function public.intelligence_recommendation_feed(integer) is
+  'Ranks the existing canonical recommendations. Returns score components so a ranking can be explained; it never re-derives advice text and never invents rows.';
+
+-- ---------------------------------------------------------------------------
+-- Maintenance entrypoint
+-- ---------------------------------------------------------------------------
+create or replace function public.job_refresh_farmer_intelligence(p_days integer default 90)
+returns integer
+language sql
+security definer
+set search_path = public, pg_temp
+as $$
+  select public.refresh_farmer_interests(p_days);
+$$;
+
+comment on function public.job_refresh_farmer_intelligence(integer) is
+  'Scheduled wrapper so the learning step can be run by a cron job without granting the scheduler anything else.';
+
+-- ---------------------------------------------------------------------------
+-- Execution grants
+-- ---------------------------------------------------------------------------
+grant execute on function public.record_behaviour_event(text, text, text, text, uuid, text, public.signal_strength, numeric, jsonb, timestamptz, text) to authenticated;
+grant execute on function public.upsert_farmer_interest(text, numeric, text, boolean) to authenticated;
+grant execute on function public.record_intelligence_feedback(text, text, uuid, text, text, jsonb) to authenticated;
+grant execute on function public.farmer_intelligence_context(uuid) to authenticated;
+grant execute on function public.intelligence_recommendation_feed(integer) to authenticated;
+revoke execute on function public.refresh_farmer_interests(integer) from public, authenticated, anon;
+revoke execute on function public.job_refresh_farmer_intelligence(integer) from public, authenticated, anon;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261103000200_intelligence_function_grants.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Farmer App · migration 0037 · intelligence function execution grants
+--
+-- Found by executing the Phase 1 verification against the Farmer project:
+-- PostgreSQL grants EXECUTE to PUBLIC by default, so revoking from
+-- `authenticated` alone left every new RPC callable by `anon`. Each function
+-- already raises when current_farmer_id() is null, so no row leaked — but a
+-- runtime guard is not an authorisation boundary, and "fails safely" is not the
+-- same as "not callable". This migration makes the grant match the policy.
+--
+-- refresh_farmer_interests and job_refresh_farmer_intelligence are already
+-- revoked from PUBLIC in migration 0036; they are repeated here so the boundary
+-- is stated in one place and survives a future CREATE OR REPLACE.
+
+revoke execute on function public.record_behaviour_event(
+  text, text, text, text, uuid, text, public.signal_strength, numeric, jsonb, timestamptz, text
+) from public, anon;
+
+revoke execute on function public.upsert_farmer_interest(text, numeric, text, boolean)
+  from public, anon;
+
+revoke execute on function public.record_intelligence_feedback(text, text, uuid, text, text, jsonb)
+  from public, anon;
+
+revoke execute on function public.farmer_intelligence_context(uuid) from public, anon;
+
+revoke execute on function public.intelligence_recommendation_feed(integer) from public, anon;
+
+revoke execute on function public.refresh_farmer_interests(integer) from public, anon;
+
+revoke execute on function public.job_refresh_farmer_intelligence(integer) from public, anon;
+
+grant execute on function public.record_behaviour_event(
+  text, text, text, text, uuid, text, public.signal_strength, numeric, jsonb, timestamptz, text
+) to authenticated;
+
+grant execute on function public.upsert_farmer_interest(text, numeric, text, boolean)
+  to authenticated;
+
+grant execute on function public.record_intelligence_feedback(text, text, uuid, text, text, jsonb)
+  to authenticated;
+
+grant execute on function public.farmer_intelligence_context(uuid) to authenticated;
+
+grant execute on function public.intelligence_recommendation_feed(integer) to authenticated;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261103000300_interest_settings.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Phase 2B: farmer-facing interest settings.
+--
+-- The foundation exposed and wrote interests, but not in a shape a settings
+-- screen could trust: the context omitted provenance and pin state, and there was
+-- no operation that unpinned without also rewriting the learned weight. This
+-- migration adds the missing read and mutation contract.
+--
+-- Semantics:
+--   · pinned is the protection. An explicit unpinned interest keeps its
+--     provenance (source = explicit) but its weight may learn again.
+--   · pinning changes only pinned/updated_at; it never rewrites weight or source.
+--   · removal is a soft dismissal; no interest row is deleted.
+--   · every function derives the farmer from the session, never from a parameter.
+create or replace function public.record_intelligence_feedback(
+  p_idempotency_key  text,
+  p_verdict          text,
+  p_recommendation_id uuid default null,
+  p_insight_ref      text default null,
+  p_reason           text default null,
+  p_context          jsonb default '{}'::jsonb
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_farmer   uuid := public.current_farmer_id();
+  v_id       uuid;
+  v_crop     uuid;
+  v_crop_code text;
+  v_kind     text;
+  v_topic    text;
+  v_delta    numeric;
+  v_source   text;
+begin
+  if v_farmer is null then
+    raise exception 'Feedback requires an identified farmer.' using errcode = 'insufficient_privilege';
+  end if;
+
+  if p_verdict is null or p_verdict not in ('helpful','not_relevant','acted','dismissed','saved') then
+    raise exception 'Unknown feedback verdict.' using errcode = 'check_violation';
+  end if;
+
+  if p_context is not null and octet_length(p_context::text) > 2048 then
+    raise exception 'Feedback context is too large.' using errcode = 'check_violation';
+  end if;
+
+  if p_recommendation_id is not null then
+    select r.crop_id, r.kind into v_crop, v_kind
+      from public.recommendations r
+     where r.id = p_recommendation_id and r.farmer_id = v_farmer;
+    if not found then
+      raise exception 'That recommendation does not belong to this farmer.'
+        using errcode = 'insufficient_privilege';
+    end if;
+  end if;
+
+  insert into public.intelligence_feedback (
+    farmer_id, recommendation_id, insight_ref, verdict, reason, context, idempotency_key
+  ) values (
+    v_farmer, p_recommendation_id, nullif(btrim(p_insight_ref), ''), p_verdict,
+    nullif(btrim(p_reason), ''), coalesce(p_context, '{}'::jsonb),
+    nullif(btrim(p_idempotency_key), '')
+  )
+  on conflict (farmer_id, idempotency_key) where idempotency_key is not null do nothing
+  returning id into v_id;
+
+  if v_id is null then
+    select id into v_id from public.intelligence_feedback
+     where farmer_id = v_farmer
+       and idempotency_key = nullif(btrim(p_idempotency_key), '');
+    return v_id;
+  end if;
+
+  -- Turn the verdict into a small, clamped interest movement. Positive verdicts
+  -- raise the topic; negative ones lower a *learned* weight and leave an explicit
+  -- preference alone.
+  if p_verdict in ('helpful','acted','saved') then
+    v_delta := 0.15; v_source := 'feedback';
+  else
+    v_delta := -0.15; v_source := 'feedback';
+  end if;
+
+  if v_crop is not null then
+    select ci.crop_code into v_crop_code from public.crop_instances ci where ci.id = v_crop;
+  end if;
+
+  v_topic := case
+    when v_crop_code is not null then 'crop:' || v_crop_code
+    when v_kind is not null then 'topic:' || v_kind
+    else null
+  end;
+
+  if v_topic is not null then
+    insert into public.farmer_interests (farmer_id, topic, crop_code, weight, confidence, source)
+    values (v_farmer, v_topic, v_crop_code, least(1, greatest(0, 0.3 + v_delta)), 0.4, v_source)
+    on conflict (farmer_id, topic) do update
+      set weight = case
+            when public.farmer_interests.pinned
+            then public.farmer_interests.weight
+            else least(1, greatest(0, public.farmer_interests.weight + v_delta))
+          end,
+          last_seen_at = now(),
+          updated_at   = now();
+  end if;
+
+  perform public.write_audit(
+    'intelligence.feedback', 'intelligence_feedback', v_id, null, null, p_verdict,
+    jsonb_build_object('recommendation_id', p_recommendation_id, 'topic', v_topic)
+  );
+
+  return v_id;
+end;
+$$;
+
+comment on function public.record_intelligence_feedback(text, text, uuid, text, text, jsonb) is
+  'Records one verdict idempotently and applies a clamped interest movement. Pinned interests are never moved; unpinned explicit interests keep their provenance but learn again.';
+
+create or replace function public.refresh_farmer_interests(p_days integer default 90)
+returns integer
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_farmer    uuid;
+  v_halflife numeric;
+  v_count     integer := 0;
+  v_since     timestamptz := now() - make_interval(days => greatest(1, least(coalesce(p_days, 90), 365)));
+begin
+  select coalesce((value #>> '{}')::numeric, 30)
+    into v_halflife
+    from public.intelligence_config where key = 'decay_half_life_days';
+
+  v_halflife := coalesce(v_halflife, 30);
+
+  for v_farmer in
+    select distinct s.farmer_id
+      from public.behaviour_signals s
+     where s.occurred_at is not null
+       and coalesce(s.occurred_at, s.observed_at) > v_since
+  loop
+    insert into public.farmer_interests (farmer_id, topic, crop_code, weight, confidence, source, last_seen_at)
+    select
+      v_farmer,
+      t.topic,
+      max(t.crop_code),
+      sum(t.w) / (1 + sum(t.w)),
+      least(1, sum(t.w) / 3),
+      'behaviour',
+      now()
+    from (
+      select
+        case
+          when s.subject is not null and s.subject like '%:%' then s.subject
+          when s.subject is not null then 'topic:' || s.subject
+          else 'crop:' || s.crop_code
+        end as topic,
+        s.crop_code,
+        coalesce(s.weight_hint, 1.0)
+          * public.signal_weight(coalesce(s.occurred_at, s.observed_at), s.strength)
+          * exp(-ln(2) * extract(epoch from (now() - coalesce(s.occurred_at, s.observed_at))) / 86400 / v_halflife) as w
+      from public.behaviour_signals s
+      where s.farmer_id = v_farmer
+        and coalesce(s.occurred_at, s.observed_at) > v_since
+        and (s.subject is not null or s.crop_code is not null)
+    ) t
+    where t.topic ~ '^[a-z]+:[a-z0-9_-]{1,60}$'
+    group by t.topic
+    on conflict (farmer_id, topic) do update
+      set weight      = case
+                          when public.farmer_interests.pinned
+                          then public.farmer_interests.weight
+                          else excluded.weight
+                        end,
+          confidence  = excluded.confidence,
+          source      = case
+                          when public.farmer_interests.pinned
+                            or public.farmer_interests.source = 'explicit'
+                          then public.farmer_interests.source
+                          else 'behaviour'
+                        end,
+          last_seen_at = now(),
+          updated_at   = now()
+      where public.farmer_interests.dismissed_at is null;
+
+    insert into public.farmer_intelligence_profiles (
+      farmer_id, signals_count, engagement_level, computed_at, interest_summary
+    )
+    select
+      v_farmer,
+      count(*),
+      case
+        when max(coalesce(s.occurred_at, s.observed_at)) < now() - interval '30 days' then 'dormant'
+        when count(*) < 5 then 'exploring'
+        else 'engaged'
+      end,
+      now(),
+      coalesce((
+        select jsonb_object_agg(i.topic, round(i.weight, 3))
+          from public.farmer_interests i
+         where i.farmer_id = v_farmer and i.dismissed_at is null
+      ), '{}'::jsonb)
+    from public.behaviour_signals s
+    where s.farmer_id = v_farmer
+    on conflict (farmer_id) do update
+      set signals_count    = excluded.signals_count,
+          engagement_level = excluded.engagement_level,
+          computed_at      = excluded.computed_at,
+          interest_summary = excluded.interest_summary,
+          updated_at       = now();
+
+    v_count := v_count + 1;
+  end loop;
+
+  return v_count;
+end;
+$$;
+
+comment on function public.refresh_farmer_interests(integer) is
+  'Derives interest weights from decayed behaviour and refreshes the snapshot. Pinned interests keep their weight; dismissed topics are not resurrected.';
+
+create or replace function public.farmer_intelligence_context(p_farmer_id uuid default null)
+returns jsonb
+language plpgsql
+stable
+security invoker
+set search_path = public, pg_temp
+as $$
+declare
+  v_farmer uuid := coalesce(p_farmer_id, public.current_farmer_id());
+  v_profile public.farmer_intelligence_profiles;
+begin
+  if v_farmer is null then
+    raise exception 'An identified farmer is required.' using errcode = 'insufficient_privilege';
+  end if;
+
+  if p_farmer_id is not null
+     and p_farmer_id <> public.current_farmer_id()
+     and not public.has_capability('admin') then
+    raise exception 'A farmer may read only their own context.' using errcode = 'insufficient_privilege';
+  end if;
+
+  select * into v_profile from public.farmer_intelligence_profiles where farmer_id = v_farmer;
+
+  return jsonb_build_object(
+    'farmer_id', v_farmer,
+    'language', coalesce(
+      (select value #>> '{}' from public.farmer_preferences where farmer_id = v_farmer and key = 'language'),
+      v_profile.language,
+      'en'
+    ),
+    'district', v_profile.district,
+    'engagement_level', coalesce(v_profile.engagement_level, 'new'),
+    'primary_crop', (
+      select jsonb_build_object('crop_id', ci.id, 'crop_code', ci.crop_code, 'stage', ci.stage)
+        from public.crop_instances ci
+       where ci.farmer_id = v_farmer and ci.is_primary and ci.closed_at is null
+       limit 1
+    ),
+    'crops', coalesce((
+      select jsonb_agg(jsonb_build_object(
+        'crop_id', ci.id, 'crop_code', ci.crop_code, 'stage', ci.stage, 'primary', ci.is_primary
+      ) order by ci.is_primary desc, ci.created_at)
+        from public.crop_instances ci
+       where ci.farmer_id = v_farmer and ci.closed_at is null
+    ), '[]'::jsonb),
+    'location', (
+      select jsonb_build_object('label', fp.default_location_label, 'area_id', fp.default_area_id)
+        from public.farmer_profiles fp where fp.party_id = v_farmer
+    ),
+    'interests', coalesce((
+      select jsonb_agg(jsonb_build_object(
+        'topic', i.topic,
+        'weight', round(i.weight, 3),
+        'source', i.source,
+        'pinned', i.pinned,
+        'crop_code', i.crop_code
+      ) order by i.pinned desc, i.weight desc)
+        from (
+          select topic, weight, source, pinned, crop_code from public.farmer_interests
+           where farmer_id = v_farmer and dismissed_at is null
+           order by pinned desc, weight desc limit 10
+        ) i
+    ), '[]'::jsonb),
+    'preferences', coalesce((
+      select jsonb_object_agg(p.key, p.value)
+        from public.farmer_preferences p where p.farmer_id = v_farmer
+    ), '{}'::jsonb),
+    'recent_signals', (
+      select count(*) from public.behaviour_signals s
+       where s.farmer_id = v_farmer
+         and coalesce(s.occurred_at, s.observed_at) > now() - interval '30 days'
+    ),
+    'scoring_version', coalesce(
+      (select (value #>> '{}')::integer from public.intelligence_config where key = 'scoring_version'),
+      1
+    )
+  );
+end;
+$$;
+
+comment on function public.farmer_intelligence_context(uuid) is
+  'The shared context object: crops, main crop, location label, top interests with provenance and pin state, preferences and signal counts. Never coordinates or contact details.';
+
+-- All non-dismissed interests, for the settings screen. The context deliberately
+-- stays small (top 10) for the AI gateway; this read is the farmer's full list.
+create or replace function public.farmer_interest_settings()
+returns table (
+  topic       text,
+  crop_code   text,
+  weight      numeric,
+  confidence  numeric,
+  source      text,
+  pinned      boolean,
+  updated_at  timestamptz
+)
+language sql
+stable
+security invoker
+set search_path = public, pg_temp
+as $$
+  select i.topic, i.crop_code, i.weight, i.confidence, i.source, i.pinned, i.updated_at
+    from public.farmer_interests i
+   where i.farmer_id = public.current_farmer_id()
+     and i.dismissed_at is null
+   order by i.pinned desc, i.weight desc, i.topic;
+$$;
+
+comment on function public.farmer_interest_settings() is
+  'The current farmer''s full interest list, including provenance and pin state. Own rows only; no weight arithmetic in the client.';
+
+create or replace function public.set_farmer_interest_pin(
+  p_topic  text,
+  p_pinned boolean
+)
+returns public.farmer_interests
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_farmer uuid := public.current_farmer_id();
+  v_row    public.farmer_interests;
+begin
+  if v_farmer is null then
+    raise exception 'An identified farmer is required.' using errcode = 'insufficient_privilege';
+  end if;
+  if p_topic is null or p_topic !~ '^[a-z]+:[a-z0-9_-]{1,60}$' then
+    raise exception 'Interest topic must be a namespaced slug.' using errcode = 'check_violation';
+  end if;
+  if p_pinned is null then
+    raise exception 'A pin state is required.' using errcode = 'check_violation';
+  end if;
+
+  update public.farmer_interests
+     set pinned = p_pinned,
+         updated_at = now()
+   where farmer_id = v_farmer
+     and topic = p_topic
+     and dismissed_at is null
+  returning * into v_row;
+
+  if not found then
+    raise exception 'Interest not found.' using errcode = 'no_data_found';
+  end if;
+
+  return v_row;
+end;
+$$;
+
+comment on function public.set_farmer_interest_pin(text, boolean) is
+  'Pins or unpins one of the current farmer''s interests. Never rewrites weight or source; unpinning lets the algorithm learn again.';
+
+create or replace function public.dismiss_farmer_interest(p_topic text)
+returns boolean
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_farmer uuid := public.current_farmer_id();
+  v_row    public.farmer_interests;
+begin
+  if v_farmer is null then
+    raise exception 'An identified farmer is required.' using errcode = 'insufficient_privilege';
+  end if;
+  if p_topic is null or p_topic !~ '^[a-z]+:[a-z0-9_-]{1,60}$' then
+    raise exception 'Interest topic must be a namespaced slug.' using errcode = 'check_violation';
+  end if;
+
+  update public.farmer_interests
+     set dismissed_at = now(),
+         updated_at = now()
+   where farmer_id = v_farmer
+     and topic = p_topic
+     and dismissed_at is null
+  returning * into v_row;
+
+  if not found then
+    raise exception 'Interest not found.' using errcode = 'no_data_found';
+  end if;
+
+  return true;
+end;
+$$;
+
+comment on function public.dismiss_farmer_interest(text) is
+  'Soft-removes one of the current farmer''s interests. The row is retained for learning history; no delete is exposed.';
+
+revoke execute on function public.farmer_interest_settings() from public, anon;
+revoke execute on function public.set_farmer_interest_pin(text, boolean) from public, anon;
+revoke execute on function public.dismiss_farmer_interest(text) from public, anon;
+
+grant execute on function public.farmer_interest_settings() to authenticated;
+grant execute on function public.set_farmer_interest_pin(text, boolean) to authenticated;
+grant execute on function public.dismiss_farmer_interest(text) to authenticated;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261103000400_knowledge_engine.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Phase 3 · Agricultural Knowledge Engine
+--
+-- The existing knowledge tables already had authored bilingual entries,
+-- versioning, provenance and a keyword search RPC. This migration adds the
+-- parts a source-grounded assistant still lacked:
+--
+--   * a source registry with a checkable publisher/reference and date fields;
+--   * explicit evidence tiers, so supplementary editorial notes and community
+--     observations can never be mistaken for official guidance;
+--   * crop/problem/symptom/region classification for deterministic retrieval;
+--   * a retrieval RPC that handles natural-language questions, searches Urdu
+--     content, and returns the source metadata the UI must show.
+--
+-- No vector column is populated and no embedding provider is called. Keyword
+-- retrieval is the implemented path and remains disclosed.
+
+-- ---------------------------------------------------------------------------
+-- Source registry
+-- ---------------------------------------------------------------------------
+
+create table public.agri_knowledge_sources (
+  code                text primary key,
+  name                text not null,
+  publisher           text,
+  url                 text check (url is null or url ~ '^https://'),
+  source_type         text not null check (source_type in (
+                        'official_extension', 'regulator', 'university',
+                        'supplementary', 'editorial', 'community'
+                      )),
+  coverage            text,
+  verification_status text not null default 'candidate' check (verification_status in (
+                        'verified', 'supplementary', 'community', 'candidate'
+                      )),
+  reviewed_at         timestamptz,
+  notes               text,
+  is_active           boolean not null default true,
+  created_at          timestamptz not null default now()
+);
+
+comment on table public.agri_knowledge_sources is
+  'The publishers behind published knowledge. A URL is recorded only when it was checked; an empty URL is an honest unknown, not a claim that no source exists.';
+
+insert into public.agri_knowledge_sources
+  (code, name, publisher, url, source_type, coverage, verification_status, reviewed_at, notes)
+values
+  (
+    'app_editorial',
+    'Farmer App editorial notes',
+    'Farmer App',
+    null,
+    'editorial',
+    'Punjab field crops; supplementary summaries',
+    'supplementary',
+    now(),
+    'Seeded editorial summaries. They are useful context but are not official guidance; primary extension references are pending.'
+  ),
+  (
+    'punjab_agri',
+    'Punjab Agriculture Department',
+    'Agriculture Department, Government of the Punjab',
+    'https://agripunjab.gov.pk/pw_economic',
+    'official_extension',
+    'Punjab; pest economic thresholds and crop advisory material',
+    'verified',
+    now(),
+    'Official Punjab Government page checked 2026-11-03. It publishes economic threshold levels by pest.'
+  ),
+  (
+    'uaf',
+    'University of Agriculture Faisalabad',
+    'University of Agriculture, Faisalabad',
+    'https://uaf.edu.pk/',
+    'university',
+    'Punjab; agronomy and crop protection research',
+    'candidate',
+    null,
+    'Institution is credible; no specific publication is cited until a checkable paper or extension note is selected.'
+  ),
+  (
+    'dpp',
+    'Department of Plant Protection',
+    'Government of Pakistan',
+    null,
+    'regulator',
+    'Pakistan; pesticide registration and label requirements',
+    'candidate',
+    null,
+    'Authoritative for pesticide registration, but no stable public reference was confirmed from this environment. Never treat a product name as approval without a label check.'
+  ),
+  (
+    'cabi_plantwise',
+    'CABI PlantwisePlus Knowledge Bank',
+    'CABI',
+    'https://plantwiseplusknowledgebank.org/',
+    'supplementary',
+    'Global; pest and disease factsheets, including Pakistan crops',
+    'candidate',
+    null,
+    'Supplementary reference only. CABI material is not a substitute for a Pakistan label or a local extension recommendation.'
+  )
+on conflict (code) do nothing;
+
+-- ---------------------------------------------------------------------------
+-- Classification and source attachment on the existing entries
+-- ---------------------------------------------------------------------------
+
+alter table public.agri_knowledge_entries
+  add column if not exists problem_type text not null default 'other',
+  add column if not exists symptoms text[] not null default '{}'::text[],
+  add column if not exists regions text[] not null default '{Punjab}'::text[],
+  add column if not exists source_code text references public.agri_knowledge_sources (code),
+  add column if not exists source_url text,
+  add column if not exists source_published_on date,
+  add column if not exists source_updated_on date,
+  add column if not exists source_accessed_on date,
+  add column if not exists evidence_tier text not null default 'supplementary';
+
+alter table public.agri_knowledge_entries
+  add constraint agri_knowledge_problem_type_check
+    check (problem_type in ('pest', 'disease', 'weed', 'disorder', 'agronomy', 'safety', 'nutrition', 'water', 'other')),
+  add constraint agri_knowledge_evidence_tier_check
+    check (evidence_tier in ('verified', 'supplementary', 'community')),
+  add constraint agri_knowledge_verified_has_source
+    check (
+      evidence_tier <> 'verified'
+      or (source_code is not null and source_url is not null and source_accessed_on is not null)
+    ),
+  add constraint agri_knowledge_source_url_https
+    check (source_url is null or source_url ~ '^https://');
+
+comment on column public.agri_knowledge_entries.evidence_tier is
+  'verified = checked against a named primary source; supplementary = useful editorial context; community = an observation, never official guidance.';
+comment on column public.agri_knowledge_entries.regions is
+  'Geographic applicability. Punjab is the default for this corpus; an empty array means the author did not state a region.';
+
+update public.agri_knowledge_entries
+   set problem_type = case topic
+     when 'pest' then 'pest'
+     when 'disease' then 'disease'
+     when 'weed' then 'weed'
+     when 'safety' then 'safety'
+     when 'nutrition' then 'nutrition'
+     when 'irrigation' then 'water'
+     when 'agronomy' then 'agronomy'
+     else 'other'
+   end,
+       source_code = coalesce(source_code, 'app_editorial'),
+       source_accessed_on = coalesce(source_accessed_on, current_date),
+       regions = case when cardinality(regions) = 0 then '{Punjab}'::text[] else regions end
+ where true;
+
+update public.agri_knowledge_entries
+   set symptoms = case slug
+     when 'cotton-pink-bollworm' then '{holes in bolls, rosette flowers, pink larvae inside bolls}'::text[]
+     when 'cotton-whitefly' then '{white insects under leaves, honeydew, sooty mould}'::text[]
+     when 'wheat-yellow-rust' then '{yellow stripes on leaves, powdery yellow spores}'::text[]
+     when 'irrigation-timing' then '{dry soil, wilting at crown root initiation}'::text[]
+     else symptoms
+   end
+ where slug in ('cotton-pink-bollworm', 'cotton-whitefly', 'wheat-yellow-rust', 'irrigation-timing');
+
+update public.agri_knowledge_entries
+   set provenance = 'Farmer App editorial summary; primary extension source pending'
+ where source_code = 'app_editorial'
+   and provenance = 'Extension bulletin, reviewed';
+
+-- One checked primary-source entry demonstrates the verified tier without
+-- upgrading the seven editorial summaries by assertion. The threshold is taken
+-- from the Punjab Agriculture Department's published economic-threshold page.
+insert into public.agri_knowledge_entries (
+  slug, version, title_en, title_ur, body_en, body_ur, body_local,
+  crop_code, topic, provenance, is_published, problem_type, symptoms, regions,
+  source_code, source_url, source_accessed_on, evidence_tier
+)
+values (
+  'cotton-pink-bollworm-etl', 1,
+  'Pink bollworm economic threshold',
+  'گلابی سنڈی کی معاشی حد',
+  'Punjab Agriculture Department guidance puts the economic threshold for pink bollworm at 5 larvae per 100 bolls. Count larvae inside bolls before deciding to spray; do not spray on a calendar alone.',
+  'محکمہ زراعت پنجاب کی رہنمائی کے مطابق گلابی سنڈی کی معاشی حد 100 ڈوڈوں میں 5 سنڈیاں ہیں۔ سپرے کا فیصلہ کرنے سے پہلے ڈوڈوں کے اندر سنڈیاں گنیں؛ صرف کیلنڈر پر سپرے نہ کریں۔',
+  '{}'::jsonb,
+  'cotton', 'pest',
+  'Punjab Agriculture Department, Economic Threshold Levels of Insect Pests (accessed 2026-11-03)',
+  true, 'pest',
+  '{holes in bolls, pink larvae inside bolls}',
+  '{Punjab}',
+  'punjab_agri', 'https://agripunjab.gov.pk/pw_economic', current_date, 'verified'
+)
+on conflict (slug, version) do nothing;
+
+insert into public.agri_knowledge_index (entry_id, crop_code, content)
+select e.id, e.crop_code,
+       e.title_en || ' ' || e.body_en || ' ' || e.title_ur || ' ' || e.body_ur || ' ' || array_to_string(e.symptoms, ' ')
+  from public.agri_knowledge_entries e
+ where e.is_published
+   and not exists (select 1 from public.agri_knowledge_index i where i.entry_id = e.id);
+
+-- ---------------------------------------------------------------------------
+-- Retrieval
+-- ---------------------------------------------------------------------------
+
+-- The previous function required every term in a websearch query to match.
+-- "How do I control pink bollworm in cotton?" therefore retrieved nothing even
+-- though the corpus covered it. The replacement keeps the strict query first,
+-- then broadens to OR terms only when needed. Ranking still prefers crop match,
+-- verified sources and the strict hit.
+drop function if exists public.ai_knowledge_search(text, text, integer);
+
+create or replace function public.ai_knowledge_search(
+  p_query    text,
+  p_crop     text default null,
+  p_district text default null,
+  p_limit    integer default 4
+)
+returns table (
+  id                  uuid,
+  slug                text,
+  version             integer,
+  title_en            text,
+  title_ur            text,
+  body_en             text,
+  body_ur             text,
+  topic               text,
+  problem_type        text,
+  symptoms            text[],
+  regions             text[],
+  crop_code           text,
+  provenance          text,
+  evidence_tier       text,
+  source_code         text,
+  source_name         text,
+  source_url          text,
+  source_published_on date,
+  source_updated_on   date,
+  source_accessed_on  date,
+  score               double precision,
+  used_embedding      boolean
+)
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+  with q as (
+    select
+      websearch_to_tsquery('simple', left(coalesce(nullif(btrim(p_query), ''), 'crop'), 500)) as strict,
+      websearch_to_tsquery(
+        'simple',
+        regexp_replace(left(coalesce(nullif(btrim(p_query), ''), 'crop'), 500), '[[:space:]]+', ' OR ', 'g')
+      ) as broad
+  ),
+  documents as (
+    select e.*,
+           to_tsvector(
+             'simple',
+             coalesce(e.title_en, '') || ' ' || coalesce(e.title_ur, '') || ' ' ||
+             coalesce(e.body_en, '') || ' ' || coalesce(e.body_ur, '') || ' ' ||
+             coalesce(e.topic, '') || ' ' || coalesce(e.problem_type, '') || ' ' ||
+             coalesce(array_to_string(e.symptoms, ' '), '') || ' ' || coalesce(e.slug, '')
+           ) as document
+      from public.agri_knowledge_entries e
+     where e.is_published
+  )
+  select
+    e.id, e.slug, e.version, e.title_en, e.title_ur, e.body_en, e.body_ur,
+    e.topic, e.problem_type, e.symptoms, e.regions, e.crop_code, e.provenance,
+    e.evidence_tier, e.source_code, s.name, e.source_url,
+    e.source_published_on, e.source_updated_on, e.source_accessed_on,
+    least(
+      1.0,
+      ts_rank(e.document, q.strict) * 8
+      + ts_rank(e.document, q.broad) * 3
+      + case e.evidence_tier when 'verified' then 0.12 when 'supplementary' then 0.05 else 0 end
+    )::double precision as score,
+    false as used_embedding
+  from documents e
+  cross join q
+  left join public.agri_knowledge_sources s on s.code = e.source_code
+  where
+    (
+      e.document @@ q.strict
+      or e.document @@ q.broad
+      or e.title_en ilike '%' || left(btrim(p_query), 80) || '%'
+      or e.title_ur ilike '%' || left(btrim(p_query), 80) || '%'
+      or e.slug ilike '%' || left(btrim(p_query), 80) || '%'
+    )
+  order by
+    (p_crop is not null and e.crop_code = p_crop) desc,
+    case e.evidence_tier when 'verified' then 3 when 'supplementary' then 2 else 1 end desc,
+    score desc,
+    e.version desc
+  limit greatest(1, least(coalesce(p_limit, 4), 8));
+$$;
+
+comment on function public.ai_knowledge_search(text, text, text, integer) is
+  'Published, source-labelled knowledge only. Strict full-text match first, then a bounded OR fallback for natural-language questions; crop match and evidence tier rank above raw score.';
+
+revoke execute on function public.ai_knowledge_search(text, text, text, integer)
+  from public, anon, authenticated;
+grant execute on function public.ai_knowledge_search(text, text, text, integer)
+  to service_role;
+
+alter table public.agri_knowledge_sources enable row level security;
+revoke all on public.agri_knowledge_sources from anon, authenticated;
+grant select on public.agri_knowledge_sources to service_role;
+
+comment on table public.agri_knowledge_sources is
+  'Source registry used by the AI gateway. The gateway alone reads it; clients receive only the labelled citation fields in an answer.';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261103000500_knowledge_retrieval_fix.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Phase 3 · retrieval relevance correction
+--
+-- The first broad-OR query treated every English function word as evidence, so
+-- "Who won the cricket match?" matched entries merely because they contained
+-- "the" or "in". This correction strips a bounded English stopword list before
+-- building the broad query. The strict query uses the same content terms, which
+-- keeps a phrase such as "pink bollworm cotton" precise while still allowing a
+-- natural question to fall back to OR terms.
+--
+-- `NULLS LAST` is also deliberate: a crop-less entry has a NULL crop-bonus
+-- expression, and PostgreSQL's DESC default puts NULLs first. That made general
+-- safety entries outrank the selected crop.
+
+create or replace function public.ai_knowledge_search(
+  p_query    text,
+  p_crop     text default null,
+  p_district text default null,
+  p_limit    integer default 4
+)
+returns table (
+  id                  uuid,
+  slug                text,
+  version             integer,
+  title_en            text,
+  title_ur            text,
+  body_en             text,
+  body_ur             text,
+  topic               text,
+  problem_type        text,
+  symptoms            text[],
+  regions             text[],
+  crop_code           text,
+  provenance          text,
+  evidence_tier       text,
+  source_code         text,
+  source_name         text,
+  source_url          text,
+  source_published_on date,
+  source_updated_on   date,
+  source_accessed_on  date,
+  score               double precision,
+  used_embedding      boolean
+)
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+  with content as (
+    select regexp_replace(
+      lower(left(coalesce(nullif(btrim(p_query), ''), ''), 500)),
+      '\m(how|what|when|where|why|who|which|do|does|did|i|we|you|they|he|she|it|the|a|an|and|or|in|on|of|to|for|from|at|by|with|about|as|is|are|was|were|be|been|being|can|could|should|would|will|shall|may|might|must|please|tell|me|my|our|your|their|his|her|its|this|that|these|those|there|if|after|before|more|most|much|many|any|all|not|no|so|than|then|also|just|very|but|into|over|under|use|using|has|have|had)\M',
+      ' ', 'gi'
+    ) as terms
+  ),
+  q as (
+    select
+      websearch_to_tsquery('simple', nullif(btrim(content.terms), '')) as strict,
+      websearch_to_tsquery(
+        'simple',
+        nullif(regexp_replace(btrim(content.terms), '[[:space:]]+', ' OR ', 'g'), '')
+      ) as broad
+      from content
+  ),
+  documents as (
+    select e.*,
+           to_tsvector(
+             'simple',
+             coalesce(e.title_en, '') || ' ' || coalesce(e.title_ur, '') || ' ' ||
+             coalesce(e.body_en, '') || ' ' || coalesce(e.body_ur, '') || ' ' ||
+             coalesce(e.topic, '') || ' ' || coalesce(e.problem_type, '') || ' ' ||
+             coalesce(array_to_string(e.symptoms, ' '), '') || ' ' || coalesce(e.slug, '')
+           ) as document
+      from public.agri_knowledge_entries e
+     where e.is_published
+  )
+  select
+    e.id, e.slug, e.version, e.title_en, e.title_ur, e.body_en, e.body_ur,
+    e.topic, e.problem_type, e.symptoms, e.regions, e.crop_code, e.provenance,
+    e.evidence_tier, e.source_code, s.name, e.source_url,
+    e.source_published_on, e.source_updated_on, e.source_accessed_on,
+    least(
+      1.0,
+      ts_rank(e.document, q.strict) * 8
+      + ts_rank(e.document, q.broad) * 3
+      + case e.evidence_tier when 'verified' then 0.12 when 'supplementary' then 0.05 else 0 end
+    )::double precision as score,
+    false as used_embedding
+  from documents e
+  cross join q
+  left join public.agri_knowledge_sources s on s.code = e.source_code
+  where
+    (
+      e.document @@ q.strict
+      or e.document @@ q.broad
+      or e.title_en ilike '%' || left(btrim(p_query), 80) || '%'
+      or e.title_ur ilike '%' || left(btrim(p_query), 80) || '%'
+      or e.slug ilike '%' || left(btrim(p_query), 80) || '%'
+    )
+  order by
+    (p_crop is not null and e.crop_code = p_crop) desc nulls last,
+    case e.evidence_tier when 'verified' then 3 when 'supplementary' then 2 else 1 end desc,
+    score desc,
+    e.version desc
+  limit greatest(1, least(coalesce(p_limit, 4), 8));
+$$;
+
+comment on function public.ai_knowledge_search(text, text, text, integer) is
+  'Published, source-labelled knowledge only. Natural-language stopwords are excluded before the bounded OR fallback; selected-crop matches rank first with NULLS LAST.';
+
+revoke execute on function public.ai_knowledge_search(text, text, text, integer)
+  from public, anon, authenticated;
+grant execute on function public.ai_knowledge_search(text, text, text, integer)
+  to service_role;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261103000600_knowledge_write_lock.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Phase 3 · knowledge write lock
+--
+-- The knowledge tables are read by clients but authored only by the service
+-- role. The blanket grant migration historically left INSERT/UPDATE/DELETE on
+-- `agri_knowledge_entries` with `authenticated`; RLS denied those operations
+-- because no write policy existed, but an unused write grant is not a boundary
+-- worth keeping. Make the grant agree with the policy: clients may read
+-- published entries, and may not write knowledge or source metadata at all.
+
+revoke insert, update, delete on public.agri_knowledge_entries from anon, authenticated;
+revoke insert, update, delete on public.agri_knowledge_index from anon, authenticated;
+revoke all on public.agri_knowledge_sources from anon, authenticated;
+
+comment on table public.agri_knowledge_entries is
+  'Published agricultural knowledge. Clients read published rows under RLS; only the service role may author or revise entries.';
+
+comment on table public.agri_knowledge_index is
+  'Retrieval projection for the AI gateway. Clients have no read or write grant; the gateway uses the service role.';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261103000700_recommendation_engine.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Phase 4 · Personalized recommendation engine
+--
+-- The foundation already had the canonical recommendation object and a scored
+-- feed. This migration supplies the missing producer and the missing context
+-- bridge:
+--
+--   * the app's local crop list is synchronized into the existing crop_instances;
+--   * published, evidence-tiered knowledge becomes recommendation rows, with
+--     English/Urdu copy, a traceable reason and source metadata;
+--   * only verified and supplementary knowledge can become advice — community
+--     observations are never promoted to authoritative guidance;
+--   * the ranked feed adds stage, crop, regional, evidence, recency and feedback
+--     components to the existing score, and suppresses dismissed/irrelevant rows;
+--   * a per-farmer cooldown prevents every feed read from recomputing.
+--
+-- Nothing here duplicates recommendations, crops, knowledge or scoring. The
+-- existing `recommendations`, `emit_recommendation()`, `crop_instances`,
+-- `agri_knowledge_entries`, `intelligence_recommendation_feed()` and feedback
+-- RPCs remain the one system.
+
+-- ---------------------------------------------------------------------------
+-- Metadata the canonical object needs to explain itself
+-- ---------------------------------------------------------------------------
+alter table public.recommendations
+  add column title_ur      text,
+  add column body_ur       text,
+  add column action_label_ur text,
+  add column evidence_tier text
+    check (evidence_tier is null or evidence_tier in ('verified', 'supplementary', 'community')),
+  add column source_url    text
+    check (source_url is null or source_url ~ '^https://'),
+  add column reason_code   text,
+  add column reason_context jsonb not null default '{}'::jsonb,
+  add column rule_version  integer;
+
+comment on column public.recommendations.evidence_tier is
+  'The published knowledge tier behind this advice. Community rows are not eligible for generation.';
+comment on column public.recommendations.reason_code is
+  'Why this row was generated, as a stable code for the UI to translate.';
+comment on column public.recommendations.reason_context is
+  'Bounded slugs (crop, stage, topic, region) supporting the reason. No farmer identity or free text.';
+comment on column public.recommendations.rule_version is
+  'Generator/scoring version at emission time, so an old recommendation is explainable.';
+
+-- `app_synced` lets the app replace its own crop context without closing crops
+-- created by an agronomist, dealer or import.
+alter table public.crop_instances
+  add column app_synced boolean not null default false;
+
+create index crop_instances_app_synced_idx
+  on public.crop_instances (farmer_id, crop_code)
+  where app_synced and closed_at is null;
+
+comment on column public.crop_instances.app_synced is
+  'True when this open instance was synchronized from the farmer app. The sync RPC closes only its own stale rows.';
+
+alter table public.farmer_intelligence_profiles
+  add column recommendations_refreshed_at timestamptz;
+
+comment on column public.farmer_intelligence_profiles.recommendations_refreshed_at is
+  'Last time the recommendation producer ran for this farmer. Bounds repeated recomputation.';
+
+-- ---------------------------------------------------------------------------
+-- Tunables and rules
+-- ---------------------------------------------------------------------------
+insert into public.intelligence_config (key, value, description) values
+  ('scoring_version', '2'::jsonb,
+   'Version of the Phase 4 ranking formula.'),
+  ('recommendation_rule_version', '1'::jsonb,
+   'Version of the knowledge-to-recommendation generator.'),
+  ('max_recommendations_per_farmer', '12'::jsonb,
+   'Hard cap on generated live recommendations per farmer.'),
+  ('recommendation_ttl_days', '21'::jsonb,
+   'Default validity window for a generated knowledge recommendation.'),
+  ('recommendation_refresh_minutes', '15'::jsonb,
+   'Minimum time between authenticated feed refreshes for one farmer.'),
+  ('helpful_feedback_boost', '0.05'::jsonb,
+   'Ranking boost for each helpful verdict in the feedback window.'),
+  ('helpful_boost_cap', '0.10'::jsonb,
+   'Maximum helpful-feedback contribution to one recommendation.'),
+  ('max_interest_boost', '0.25'::jsonb,
+   'Ceiling on the total interest contribution, so one enthusiasm cannot dominate the feed.')
+on conflict (key) do update
+  set value = excluded.value,
+      version = public.intelligence_config.version + 1,
+      description = excluded.description,
+      updated_at = now();
+
+insert into public.intelligence_rules (code, description, scope, condition, weight, priority) values
+  ('crop_stage_match', 'Boost advice whose stage rule matches the crop''s current stage.', 'recommendation',
+   '{"match":"crop_stage"}'::jsonb, 0.10, 15),
+  ('verified_source', 'Boost advice from a verified source over supplementary material.', 'recommendation',
+   '{"match":"verified_source"}'::jsonb, 0.12, 25),
+  ('helpful_feedback', 'Boost advice this farmer previously marked helpful.', 'recommendation',
+   '{"match":"helpful_feedback"}'::jsonb, 0.05, 35)
+on conflict (code) do update
+  set description = excluded.description,
+      scope = excluded.scope,
+      condition = excluded.condition,
+      weight = excluded.weight,
+      priority = excluded.priority,
+      is_active = true,
+      version = public.intelligence_rules.version + 1,
+      updated_at = now();
+
+-- ---------------------------------------------------------------------------
+-- Crop context synchronization
+-- ---------------------------------------------------------------------------
+-- The farmer app's crop document is local-first. This RPC is the one validated
+-- bridge into the canonical server crop table, so recommendation generation sees
+-- the same crops the farmer sees. It accepts only catalog codes and enum stages,
+-- derives the owner from the JWT, and closes only rows it previously created.
+create or replace function public.sync_my_crops(p_crops jsonb default '[]'::jsonb)
+returns integer
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_farmer         uuid := public.current_farmer_id();
+  v_item           jsonb;
+  v_code           text;
+  v_stage_text     text;
+  v_stage          public.crop_stage;
+  v_primary        boolean;
+  v_primary_code   text;
+  v_current_primary text;
+  v_id             uuid;
+  v_row            public.crop_instances;
+  v_codes          text[] := '{}'::text[];
+  v_changed        boolean := false;
+  v_count          integer := 0;
+begin
+  if v_farmer is null then
+    raise exception 'An identified farmer is required.' using errcode = 'insufficient_privilege';
+  end if;
+
+  if p_crops is null or jsonb_typeof(p_crops) <> 'array' then
+    raise exception 'Crop context must be a JSON array.' using errcode = 'check_violation';
+  end if;
+
+  if jsonb_array_length(p_crops) > 12 then
+    raise exception 'At most 12 active crops may be synchronized.' using errcode = 'check_violation';
+  end if;
+
+  -- Stage corrections are validated by the existing trigger. The sync path gives
+  -- it an explicit reason, so a correction is traceable to the app's update.
+  perform set_config('app.stage_correction_reason', 'active crop list synchronized from the app', true);
+
+  -- Capture this before the loop clears primary flags while updating rows. Reading
+  -- it afterwards would always produce NULL and falsely invalidate the cache.
+  select crop_code into v_current_primary
+    from public.crop_instances
+   where farmer_id = v_farmer
+     and closed_at is null
+     and is_primary
+   limit 1;
+
+  for v_item in select value from jsonb_array_elements(p_crops) loop
+    if jsonb_typeof(v_item) <> 'object' then
+      raise exception 'Each crop must be an object.' using errcode = 'check_violation';
+    end if;
+
+    v_code := nullif(btrim(v_item->>'crop_code'), '');
+    if v_code is null or v_code !~ '^[a-z][a-z0-9_]{1,40}$'
+       or not exists (select 1 from public.crop_catalog c where c.code = v_code and c.is_active) then
+      raise exception 'Unknown crop code: %', coalesce(v_code, '(null)') using errcode = 'check_violation';
+    end if;
+
+    if v_code = any (v_codes) then
+      raise exception 'Crop % appears more than once in the context.', v_code using errcode = 'check_violation';
+    end if;
+    v_codes := array_append(v_codes, v_code);
+
+    v_stage_text := coalesce(nullif(btrim(v_item->>'stage'), ''), 'planned');
+    if v_stage_text not in
+       ('planned','sown','germinating','vegetative','flowering','fruiting','maturity','harvested','failed') then
+      raise exception 'Unknown crop stage: %', v_stage_text using errcode = 'check_violation';
+    end if;
+    v_stage := v_stage_text::public.crop_stage;
+
+    v_primary := case
+      when jsonb_typeof(v_item->'primary') = 'boolean' then (v_item->>'primary')::boolean
+      else false
+    end;
+    if v_primary then
+      if v_primary_code is not null then
+        raise exception 'Only one crop may be primary.' using errcode = 'check_violation';
+      end if;
+      v_primary_code := v_code;
+    end if;
+
+    select * into v_row
+      from public.crop_instances
+     where farmer_id = v_farmer
+       and crop_code = v_code
+       and closed_at is null
+     order by created_at, id
+     limit 1;
+
+    if found then
+      if v_row.stage is distinct from v_stage or not v_row.app_synced then
+        v_changed := true;
+      end if;
+      update public.crop_instances
+         set stage = v_stage,
+             app_synced = true,
+             is_primary = false
+       where id = v_row.id;
+    else
+      insert into public.crop_instances (farmer_id, crop_code, stage, is_primary, app_synced)
+      values (v_farmer, v_code, v_stage, false, true)
+      returning * into v_row;
+      v_changed := true;
+    end if;
+
+    v_count := v_count + 1;
+  end loop;
+
+  -- Close only app-owned crops that disappeared from the local list. A crop
+  -- entered by an agronomist/import is never closed by this path.
+  if exists (
+    select 1 from public.crop_instances c
+     where c.farmer_id = v_farmer
+       and c.app_synced
+       and c.closed_at is null
+       and not (c.crop_code = any (v_codes))
+  ) then
+    v_changed := true;
+    update public.crop_instances
+       set closed_at = now(), is_primary = false
+     where farmer_id = v_farmer
+       and app_synced
+       and closed_at is null
+       and not (crop_code = any (v_codes));
+  end if;
+
+  if v_primary_code is null and array_length(v_codes, 1) is not null then
+    v_primary_code := v_codes[1];
+  end if;
+
+  if v_current_primary is distinct from v_primary_code then
+    v_changed := true;
+  end if;
+
+  if array_length(v_codes, 1) is not null then
+    update public.crop_instances
+       set is_primary = false
+     where farmer_id = v_farmer
+       and closed_at is null
+       and is_primary;
+
+    update public.crop_instances
+       set is_primary = true
+     where farmer_id = v_farmer
+       and crop_code = v_primary_code
+       and closed_at is null;
+  end if;
+
+  insert into public.farmer_intelligence_profiles (
+    farmer_id, primary_crop_code, recommendations_refreshed_at
+  ) values (
+    v_farmer, v_primary_code, null
+  )
+  on conflict (farmer_id) do update
+    set primary_crop_code = excluded.primary_crop_code,
+        recommendations_refreshed_at = case
+          when v_changed then null
+          else public.farmer_intelligence_profiles.recommendations_refreshed_at
+        end,
+        updated_at = now();
+
+  return v_count;
+end;
+$$;
+
+comment on function public.sync_my_crops(jsonb) is
+  'Validated, JWT-owned synchronization of the app crop list into the canonical crop table. Closes only app-owned stale rows and can invalidate the recommendation cache.';
+
+-- ---------------------------------------------------------------------------
+-- Generator: published knowledge + live weather -> canonical recommendations
+-- ---------------------------------------------------------------------------
+create or replace function public.refresh_farmer_recommendations(p_farmer_id uuid)
+returns integer
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_ttl         integer := 21;
+  v_rule        integer := 1;
+  v_max         integer := 12;
+  v_count       integer := 0;
+  v_weather     record;
+  v_weather_body text;
+  v_weather_body_ur text;
+begin
+  if p_farmer_id is null then
+    raise exception 'A farmer is required.' using errcode = 'invalid_parameter_value';
+  end if;
+
+  select coalesce((value #>> '{}')::integer, 21) into v_ttl
+    from public.intelligence_config where key = 'recommendation_ttl_days';
+  select coalesce((value #>> '{}')::integer, 1) into v_rule
+    from public.intelligence_config where key = 'recommendation_rule_version';
+  select coalesce((value #>> '{}')::integer, 12) into v_max
+    from public.intelligence_config where key = 'max_recommendations_per_farmer';
+
+  with crops as (
+    select c.id, c.crop_code, c.stage, c.is_primary
+      from public.crop_instances c
+     where c.farmer_id = p_farmer_id
+       and c.closed_at is null
+  ),
+  profile as (
+    select f.district, f.primary_crop_code
+      from public.farmer_intelligence_profiles f
+     where f.farmer_id = p_farmer_id
+  ),
+  crop_matches as (
+    select
+      c.id as crop_id,
+      c.crop_code,
+      c.stage::text as stage,
+      c.is_primary,
+      e.id as entry_id,
+      e.slug,
+      e.version,
+      e.title_en,
+      e.title_ur,
+      e.body_en,
+      e.body_ur,
+      e.topic,
+      e.problem_type,
+      e.evidence_tier,
+      e.source_code,
+      e.source_url,
+      e.provenance,
+      (e.applies_to_stages is not null and c.stage = any (e.applies_to_stages)) as stage_match,
+      coalesce(i.weight, 0) as interest_weight,
+      coalesce(i.pinned, false) as interest_pinned,
+      (
+        e.regions is null
+        or cardinality(e.regions) = 0
+        or 'Punjab' = any (e.regions)
+        or exists (
+          select 1 from profile p
+           where p.district is not null and p.district = any (e.regions)
+        )
+      ) as region_match
+    from crops c
+    join public.agri_knowledge_entries e
+      on e.crop_code = c.crop_code
+     and e.is_published
+     and e.evidence_tier in ('verified', 'supplementary')
+     and (e.applies_to_stages is null or c.stage = any (e.applies_to_stages))
+    left join lateral (
+      select max(fi.weight) as weight, bool_or(fi.pinned) as pinned
+        from public.farmer_interests fi
+       where fi.farmer_id = p_farmer_id
+         and fi.dismissed_at is null
+         and (
+           fi.topic = 'crop:' || c.crop_code
+           or fi.topic = 'topic:' || e.topic
+         )
+    ) i on true
+  ),
+  general_matches as (
+    select
+      null::uuid as crop_id,
+      null::text as crop_code,
+      null::text as stage,
+      false as is_primary,
+      e.id as entry_id,
+      e.slug,
+      e.version,
+      e.title_en,
+      e.title_ur,
+      e.body_en,
+      e.body_ur,
+      e.topic,
+      e.problem_type,
+      e.evidence_tier,
+      e.source_code,
+      e.source_url,
+      e.provenance,
+      false as stage_match,
+      coalesce(i.weight, 0) as interest_weight,
+      coalesce(i.pinned, false) as interest_pinned,
+      (
+        e.regions is null
+        or cardinality(e.regions) = 0
+        or 'Punjab' = any (e.regions)
+        or exists (
+          select 1 from profile p
+           where p.district is not null and p.district = any (e.regions)
+        )
+      ) as region_match
+    from public.agri_knowledge_entries e
+    left join lateral (
+      select max(fi.weight) as weight, bool_or(fi.pinned) as pinned
+        from public.farmer_interests fi
+       where fi.farmer_id = p_farmer_id
+         and fi.dismissed_at is null
+         and fi.topic = 'topic:' || e.topic
+    ) i on true
+    where e.crop_code is null
+      and e.is_published
+      and e.evidence_tier in ('verified', 'supplementary')
+      and i.weight is not null
+  ),
+  matches as (
+    select * from crop_matches
+    union all
+    select * from general_matches
+  ),
+  shaped as (
+    select
+      m.*,
+      case
+        when m.topic = 'pest' or m.problem_type = 'pest' then 'pest'
+        when m.topic = 'disease' or m.problem_type = 'disease' then 'disease'
+        when m.topic in ('weather', 'rain') then 'weather'
+        when m.topic = 'market' then 'market'
+        when m.topic in ('irrigation', 'water', 'nutrition', 'agronomy') then 'crop_stage'
+        else 'general'
+      end as kind,
+      case
+        when m.interest_pinned then 'pinned_interest'
+        when m.stage_match then 'crop_stage'
+        when m.crop_id is not null then 'crop'
+        else 'interest'
+      end as reason_code,
+      case
+        when m.evidence_tier = 'verified' then 0.95
+        else 0.65
+      end as confidence,
+      case
+        when m.evidence_tier = 'verified' then 10
+        else 25
+      end
+      + case
+          when m.topic in ('pest', 'disease') then 0
+          when m.topic in ('irrigation', 'water', 'nutrition', 'agronomy') then 5
+          else 15
+        end as priority
+    from matches m
+  )
+  insert into public.recommendations (
+    farmer_id, crop_id, kind, title, title_ur, body, body_ur,
+    action_label, action_label_ur, action_kind, action_ref,
+    source, source_ref, source_label, source_url,
+    confidence, knowledge_version, valid_until, priority, dedupe_key,
+    evidence_tier, reason_code, reason_context, rule_version
+  )
+  select
+    p_farmer_id,
+    s.crop_id,
+    s.kind,
+    s.title_en,
+    s.title_ur,
+    s.body_en,
+    s.body_ur,
+    case s.kind
+      when 'pest' then 'Scan the crop'
+      when 'disease' then 'Scan the crop'
+      when 'weather' then 'Check weather'
+      else 'Open crop'
+    end,
+    case s.kind
+      when 'pest' then 'فصل اسکین کریں'
+      when 'disease' then 'فصل اسکین کریں'
+      when 'weather' then 'موسم دیکھیں'
+      else 'فصل کھولیں'
+    end,
+    case s.kind
+      when 'pest' then 'open_scan'
+      when 'disease' then 'open_scan'
+      when 'weather' then 'open_weather'
+      else 'open_crop'
+    end,
+    s.slug,
+    'knowledge_base'::public.recommendation_source,
+    s.slug,
+    coalesce(src.publisher, src.name, s.provenance, 'Farmer App editorial notes'),
+    coalesce(s.source_url, src.url),
+    s.confidence,
+    s.version,
+    now() + make_interval(days => greatest(1, least(v_ttl, 90))),
+    s.priority,
+    'rec:knowledge:' || s.slug || ':v' || s.version || ':' || coalesce(s.crop_code, 'general'),
+    s.evidence_tier,
+    s.reason_code,
+    jsonb_strip_nulls(jsonb_build_object(
+      'crop_code', s.crop_code,
+      'stage', s.stage,
+      'topic', s.topic,
+      'region_match', s.region_match
+    )),
+    v_rule
+  from shaped s
+  left join public.agri_knowledge_sources src on src.code = s.source_code
+  order by s.priority, s.slug
+  limit greatest(1, least(v_max, 30))
+  on conflict (farmer_id, dedupe_key) where withdrawn_at is null do update
+    set crop_id = excluded.crop_id,
+        kind = excluded.kind,
+        title = excluded.title,
+        title_ur = excluded.title_ur,
+        body = excluded.body,
+        body_ur = excluded.body_ur,
+        action_label = excluded.action_label,
+        action_label_ur = excluded.action_label_ur,
+        action_kind = excluded.action_kind,
+        action_ref = excluded.action_ref,
+        source_label = excluded.source_label,
+        source_url = excluded.source_url,
+        confidence = excluded.confidence,
+        knowledge_version = excluded.knowledge_version,
+        valid_until = excluded.valid_until,
+        priority = excluded.priority,
+        evidence_tier = excluded.evidence_tier,
+        reason_code = excluded.reason_code,
+        reason_context = excluded.reason_context,
+        rule_version = excluded.rule_version;
+
+  get diagnostics v_count = row_count;
+
+  -- Weather advice is grounded in the existing, freshness-gated weather read.
+  -- If there is no usable reading for the farmer's saved coordinates, no weather
+  -- recommendation is invented.
+  select w.* into v_weather
+    from public.farmer_profiles fp
+    cross join lateral public.latest_weather(fp.default_lat, fp.default_lon) w
+   where fp.default_lat is not null
+     and fp.default_lon is not null
+     and fp.party_id = p_farmer_id
+     and w.is_usable
+   order by w.observed_at desc
+   limit 1;
+
+  if found and v_weather.is_usable then
+    v_weather_body := concat_ws(
+      ' ',
+      'Current reading:',
+      case when v_weather.temp_c is not null then round(v_weather.temp_c)::text || '°C.' else null end,
+      case when v_weather.humidity_pct is not null then 'Humidity ' || v_weather.humidity_pct || '%.' else null end,
+      case when v_weather.wind_kph is not null then 'Wind ' || round(v_weather.wind_kph)::text || ' km/h.' else null end,
+      'Check the weather card before spraying or irrigating.'
+    );
+    v_weather_body_ur := concat_ws(
+      ' ',
+      'موجودہ پڑھائی:',
+      case when v_weather.temp_c is not null then round(v_weather.temp_c)::text || ' ڈگری۔' else null end,
+      case when v_weather.humidity_pct is not null then 'نمی ' || v_weather.humidity_pct || '٪۔' else null end,
+      case when v_weather.wind_kph is not null then 'ہوا ' || round(v_weather.wind_kph)::text || ' کلومیٹر فی گھنٹہ۔' else null end,
+      'سپرے یا آبپاشی سے پہلے موسم کا کارڈ دیکھیں۔'
+    );
+
+    insert into public.recommendations (
+      farmer_id, kind, title, title_ur, body, body_ur, action_label, action_label_ur,
+      action_kind, source, source_ref, source_label, confidence, valid_until, priority,
+      dedupe_key, reason_code, reason_context, rule_version
+    ) values (
+      p_farmer_id,
+      'weather',
+      'Check the weather before field work',
+      'کھیت کے کام سے پہلے موسم دیکھیں',
+      v_weather_body,
+      v_weather_body_ur,
+      'Check weather',
+      'موسم دیکھیں',
+      'open_weather',
+      'weather',
+      'weather:' || v_weather.provider_code,
+      v_weather.provider_name,
+      0.85,
+      now() + interval '6 hours',
+      5,
+      'rec:weather:' || v_weather.provider_code || ':' || to_char(v_weather.observed_at, 'YYYYMMDD'),
+      'weather_now',
+      jsonb_build_object('observed_at', v_weather.observed_at, 'freshness', v_weather.freshness),
+      v_rule
+    )
+    on conflict (farmer_id, dedupe_key) where withdrawn_at is null do update
+      set title = excluded.title,
+          title_ur = excluded.title_ur,
+          body = excluded.body,
+          body_ur = excluded.body_ur,
+          source_label = excluded.source_label,
+          confidence = excluded.confidence,
+          valid_until = excluded.valid_until,
+          reason_context = excluded.reason_context,
+          rule_version = excluded.rule_version;
+
+    v_count := v_count + 1;
+  end if;
+
+  return v_count;
+end;
+$$;
+
+comment on function public.refresh_farmer_recommendations(uuid) is
+  'Generates canonical recommendations from published evidence-tiered knowledge and a fresh weather reading. It never creates community/unsourced advice and is service-role only.';
+
+-- ---------------------------------------------------------------------------
+-- Authenticated preparation: sync + bounded refresh
+-- ---------------------------------------------------------------------------
+create or replace function public.prepare_my_recommendations(p_crops jsonb default '[]'::jsonb)
+returns integer
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_farmer    uuid := public.current_farmer_id();
+  v_minutes   integer := 15;
+  v_last      timestamptz;
+  v_count     integer := 0;
+begin
+  if v_farmer is null then
+    raise exception 'An identified farmer is required.' using errcode = 'insufficient_privilege';
+  end if;
+
+  perform public.sync_my_crops(p_crops);
+
+  select coalesce((value #>> '{}')::integer, 15) into v_minutes
+    from public.intelligence_config where key = 'recommendation_refresh_minutes';
+  select recommendations_refreshed_at into v_last
+    from public.farmer_intelligence_profiles
+   where farmer_id = v_farmer;
+
+  if v_last is not null and v_last > now() - make_interval(mins => greatest(1, least(v_minutes, 360))) then
+    return 0;
+  end if;
+
+  v_count := public.refresh_farmer_recommendations(v_farmer);
+
+  update public.farmer_intelligence_profiles
+     set recommendations_refreshed_at = now()
+   where farmer_id = v_farmer;
+
+  return v_count;
+end;
+$$;
+
+comment on function public.prepare_my_recommendations(jsonb) is
+  'The authenticated feed preparation seam: syncs the caller''s crop list, then refreshes recommendations at most once per configured cooldown.';
+
+-- Service-only batch wrapper for a scheduler. It is deliberately not granted to
+-- clients; the authenticated path is prepare_my_recommendations().
+create or replace function public.job_refresh_all_recommendations()
+returns integer
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_farmer uuid;
+  v_count integer := 0;
+  v_total integer := 0;
+begin
+  for v_farmer in
+    select distinct f.party_id
+      from public.farmer_profiles f
+     where exists (select 1 from public.crop_instances c where c.farmer_id = f.party_id and c.closed_at is null)
+        or exists (select 1 from public.farmer_interests i where i.farmer_id = f.party_id and i.dismissed_at is null)
+  loop
+    v_count := public.refresh_farmer_recommendations(v_farmer);
+    v_total := v_total + v_count;
+    update public.farmer_intelligence_profiles
+       set recommendations_refreshed_at = now()
+     where farmer_id = v_farmer;
+  end loop;
+  return v_total;
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- Ranked feed v2
+-- ---------------------------------------------------------------------------
+drop function if exists public.intelligence_recommendation_feed(integer);
+
+create function public.intelligence_recommendation_feed(p_limit integer default 20)
+returns table (
+  recommendation_id uuid,
+  crop_id           uuid,
+  crop_code         text,
+  kind              text,
+  title             text,
+  title_ur          text,
+  body              text,
+  body_ur           text,
+  source            public.recommendation_source,
+  source_label      text,
+  source_url        text,
+  evidence_tier     text,
+  confidence        numeric,
+  priority          integer,
+  score             numeric,
+  components        jsonb,
+  reason_code       text,
+  reason_context    jsonb,
+  rule_version      integer,
+  valid_until       timestamptz,
+  created_at        timestamptz
+)
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+  with mine as (
+    select public.current_farmer_id() as farmer_id
+  ),
+  cfg as (
+    select
+      coalesce(max(case when key = 'confidence_weight' then (value #>> '{}')::numeric end), 0.15) as confidence_weight,
+      coalesce(max(case when key = 'interest_weight' then (value #>> '{}')::numeric end), 0.5) as interest_weight,
+      coalesce(max(case when key = 'max_interest_boost' then (value #>> '{}')::numeric end), 0.25) as max_interest_boost,
+      coalesce(max(case when key = 'negative_feedback_penalty' then (value #>> '{}')::numeric end), 0.15) as negative_feedback_penalty,
+      coalesce(max(case when key = 'negative_penalty_cap' then (value #>> '{}')::numeric end), 0.45) as negative_penalty_cap,
+      coalesce(max(case when key = 'negative_window_days' then (value #>> '{}')::integer end), 30) as negative_window_days,
+      coalesce(max(case when key = 'helpful_feedback_boost' then (value #>> '{}')::numeric end), 0.05) as helpful_feedback_boost,
+      coalesce(max(case when key = 'helpful_boost_cap' then (value #>> '{}')::numeric end), 0.10) as helpful_boost_cap,
+      coalesce(max(case when key = 'scoring_version' then (value #>> '{}')::integer end), 2) as scoring_version
+    from public.intelligence_config
+  ),
+  rule as (
+    select code, weight from public.intelligence_rules where is_active
+  ),
+  live as (
+    select
+      r.id, r.crop_id, ci.crop_code, r.kind, r.title, r.title_ur, r.body, r.body_ur,
+      r.source, r.source_label, r.source_url, r.evidence_tier, r.confidence, r.priority,
+      r.valid_until, r.created_at, r.dedupe_key, r.source_ref, r.reason_code, r.reason_context, r.rule_version,
+      coalesce(ci.is_primary, false) as is_primary,
+      coalesce((r.reason_context->>'region_match')::boolean, false) as region_match
+    from public.recommendations r
+    left join public.crop_instances ci on ci.id = r.crop_id
+    where r.farmer_id = (select farmer_id from mine)
+      and r.withdrawn_at is null
+      and (r.valid_until is null or r.valid_until > now())
+      and (r.crop_id is null or ci.closed_at is null)
+      and not exists (
+        select 1 from public.intelligence_feedback f
+         where f.recommendation_id = r.id
+           and f.farmer_id = (select farmer_id from mine)
+           and f.verdict = 'dismissed'
+           and f.created_at > now() - interval '90 days'
+      )
+      and (
+        select count(*) from public.intelligence_feedback f, cfg c
+         where f.recommendation_id = r.id
+           and f.farmer_id = (select farmer_id from mine)
+           and f.verdict = 'not_relevant'
+           and f.created_at > now() - make_interval(days => c.negative_window_days)
+      ) < 2
+  ),
+  negative as (
+    select f.recommendation_id, count(*)::numeric as n
+      from public.intelligence_feedback f, cfg c
+     where f.farmer_id = (select farmer_id from mine)
+       and f.verdict in ('not_relevant', 'dismissed')
+       and f.created_at > now() - make_interval(days => c.negative_window_days)
+     group by f.recommendation_id
+  ),
+  helpful as (
+    select f.recommendation_id, count(*)::numeric as n
+      from public.intelligence_feedback f, cfg c
+     where f.farmer_id = (select farmer_id from mine)
+       and f.verdict in ('helpful', 'acted', 'saved')
+       and f.created_at > now() - make_interval(days => c.negative_window_days)
+     group by f.recommendation_id
+  ),
+  scored as (
+    select
+      l.*,
+      c.confidence_weight, c.interest_weight, c.max_interest_boost,
+      c.negative_feedback_penalty, c.negative_penalty_cap,
+      c.helpful_feedback_boost, c.helpful_boost_cap, c.scoring_version,
+      coalesce((select weight from rule where code = 'primary_crop_match'), 0.10) as primary_weight,
+      coalesce((select weight from rule where code = 'crop_stage_match'), 0.10) as stage_weight,
+      coalesce((select weight from rule where code = 'verified_source'), 0.12) as verified_weight,
+      coalesce(n.n, 0) as negative_count,
+      coalesce(h.n, 0) as helpful_count,
+      greatest(
+        coalesce((
+          select i.weight from public.farmer_interests i
+           where i.farmer_id = (select farmer_id from mine)
+             and i.dismissed_at is null
+             and i.topic = 'crop:' || coalesce(l.crop_code, '')
+           order by i.weight desc limit 1
+        ), 0),
+        coalesce((
+          select i.weight from public.farmer_interests i
+           where i.farmer_id = (select farmer_id from mine)
+             and i.dismissed_at is null
+             and i.topic = 'topic:' || l.kind
+           order by i.weight desc limit 1
+        ), 0),
+        coalesce((
+          select i.weight from public.farmer_interests i
+           where i.farmer_id = (select farmer_id from mine)
+             and i.dismissed_at is null
+             and i.topic = 'topic:' || coalesce(l.reason_context->>'topic', '')
+           order by i.weight desc limit 1
+        ), 0)
+      ) as matched_interest,
+      exists (
+        select 1 from public.farmer_interests i
+         where i.farmer_id = (select farmer_id from mine)
+           and i.dismissed_at is null
+           and i.pinned
+           and (
+             i.topic = 'crop:' || coalesce(l.crop_code, '')
+             or i.topic = 'topic:' || l.kind
+             or i.topic = 'topic:' || coalesce(l.reason_context->>'topic', '')
+           )
+      ) as pinned_interest,
+      case
+        when l.evidence_tier = 'verified'
+          then coalesce((select weight from rule where code = 'verified_source'), 0.12)
+        when l.evidence_tier = 'supplementary'
+          then coalesce((select weight from rule where code = 'verified_source'), 0.12) * 0.5
+        when l.evidence_tier = 'community' then 0
+        else coalesce((select weight from rule where code = 'verified_source'), 0.12) * 0.25
+      end as evidence_boost
+    from live l
+    cross join cfg c
+    left join negative n on n.recommendation_id = l.id
+    left join helpful h on h.recommendation_id = l.id
+  ),
+  ranked as (
+    select
+      s.*,
+      round(greatest(0, least(1,
+        ((100 - least(s.priority, 100))::numeric / 100) * 0.20
+        + coalesce(s.confidence, 0.5) * s.confidence_weight
+        + least(s.max_interest_boost, s.interest_weight * s.matched_interest)
+        + case when s.is_primary then s.primary_weight else 0 end
+        + case when s.crop_id is not null then 0.08 else 0 end
+        + case when s.reason_code = 'crop_stage' then s.stage_weight else 0 end
+        + s.evidence_boost
+        + case when s.region_match then 0.04 else 0 end
+        + greatest(0, 1 - extract(epoch from (now() - s.created_at)) / 86400 / 14) * 0.04
+        + case when s.pinned_interest then 0.08 else 0 end
+        + least(s.helpful_boost_cap, s.helpful_count * s.helpful_feedback_boost)
+        - least(s.negative_penalty_cap, s.negative_count * s.negative_feedback_penalty)
+      )), 4) as score,
+      jsonb_build_object(
+        'base_priority', round(((100 - least(s.priority, 100))::numeric / 100) * 0.20, 4),
+        'confidence', round(coalesce(s.confidence, 0.5) * s.confidence_weight, 4),
+        'interest', round(least(s.max_interest_boost, s.interest_weight * s.matched_interest), 4),
+        'primary_crop', case when s.is_primary then s.primary_weight else 0 end,
+        'crop_match', case when s.crop_id is not null then 0.08 else 0 end,
+        'stage_match', case when s.reason_code = 'crop_stage' then s.stage_weight else 0 end,
+        'evidence', round(s.evidence_boost, 4),
+        'region', case when s.region_match then 0.04 else 0 end,
+        'recency', round(greatest(0, 1 - extract(epoch from (now() - s.created_at)) / 86400 / 14) * 0.04, 4),
+        'pinned_interest', case when s.pinned_interest then 0.08 else 0 end,
+        'helpful_feedback', round(least(s.helpful_boost_cap, s.helpful_count * s.helpful_feedback_boost), 4),
+        'negative_feedback', round(-1 * least(s.negative_penalty_cap, s.negative_count * s.negative_feedback_penalty), 4),
+        'matched_interest', round(s.matched_interest, 4),
+        'rule_version', s.rule_version,
+        'scoring_version', s.scoring_version
+      ) as components,
+      row_number() over (
+        partition by coalesce(s.crop_id, s.id), coalesce(s.source_ref, s.dedupe_key)
+        order by s.created_at desc
+      ) as duplicate_rank
+    from scored s
+  )
+  select
+    r.id,
+    r.crop_id,
+    r.crop_code,
+    r.kind,
+    r.title,
+    r.title_ur,
+    r.body,
+    r.body_ur,
+    r.source,
+    r.source_label,
+    r.source_url,
+    r.evidence_tier,
+    r.confidence,
+    r.priority,
+    r.score,
+    r.components,
+    r.reason_code,
+    r.reason_context,
+    r.rule_version,
+    r.valid_until,
+    r.created_at
+  from ranked r
+  where r.duplicate_rank = 1
+  order by r.score desc, r.priority, r.created_at desc
+  limit greatest(1, least(coalesce(p_limit, 20), 50));
+$$;
+
+comment on function public.intelligence_recommendation_feed(integer) is
+  'Ranks canonical recommendations with crop, stage, interest, evidence, region, recency and feedback components. Suppresses dismissed and repeatedly irrelevant rows; never invents advice.';
+
+-- ---------------------------------------------------------------------------
+-- Grants
+-- ---------------------------------------------------------------------------
+revoke execute on function public.sync_my_crops(jsonb) from public, anon;
+grant execute on function public.sync_my_crops(jsonb) to authenticated;
+
+revoke execute on function public.prepare_my_recommendations(jsonb) from public, anon;
+grant execute on function public.prepare_my_recommendations(jsonb) to authenticated;
+
+revoke execute on function public.refresh_farmer_recommendations(uuid) from public, anon, authenticated;
+grant execute on function public.refresh_farmer_recommendations(uuid) to service_role;
+
+revoke execute on function public.job_refresh_all_recommendations() from public, anon, authenticated;
+grant execute on function public.job_refresh_all_recommendations() to service_role;
+
+revoke execute on function public.intelligence_recommendation_feed(integer) from public, anon;
+grant execute on function public.intelligence_recommendation_feed(integer) to authenticated;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261103000800_recommendation_refresh_cooldown.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Phase 4 fix · recommendation refresh cooldown
+--
+-- Migration 007 captured the previous primary crop after the synchronization
+-- loop had already cleared every is_primary flag. The result was NULL, so each
+-- prepare call looked like a crop change, invalidated the cooldown and reran the
+-- generator. This replacement captures the prior primary before updating crops;
+-- a no-op sync now leaves recommendations_refreshed_at intact.
+
+create or replace function public.sync_my_crops(p_crops jsonb default '[]'::jsonb)
+returns integer
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_farmer         uuid := public.current_farmer_id();
+  v_item           jsonb;
+  v_code           text;
+  v_stage_text     text;
+  v_stage          public.crop_stage;
+  v_primary        boolean;
+  v_primary_code   text;
+  v_current_primary text;
+  v_id             uuid;
+  v_row            public.crop_instances;
+  v_codes          text[] := '{}'::text[];
+  v_changed        boolean := false;
+  v_count          integer := 0;
+begin
+  if v_farmer is null then
+    raise exception 'An identified farmer is required.' using errcode = 'insufficient_privilege';
+  end if;
+
+  if p_crops is null or jsonb_typeof(p_crops) <> 'array' then
+    raise exception 'Crop context must be a JSON array.' using errcode = 'check_violation';
+  end if;
+
+  if jsonb_array_length(p_crops) > 12 then
+    raise exception 'At most 12 active crops may be synchronized.' using errcode = 'check_violation';
+  end if;
+
+  -- Stage corrections are validated by the existing trigger. The sync path gives
+  -- it an explicit reason, so a correction is traceable to the app's update.
+  perform set_config('app.stage_correction_reason', 'active crop list synchronized from the app', true);
+
+  -- Capture this before the loop clears primary flags while updating rows. Reading
+  -- it afterwards would always produce NULL and falsely invalidate the cache.
+  select crop_code into v_current_primary
+    from public.crop_instances
+   where farmer_id = v_farmer
+     and closed_at is null
+     and is_primary
+   limit 1;
+
+  for v_item in select value from jsonb_array_elements(p_crops) loop
+    if jsonb_typeof(v_item) <> 'object' then
+      raise exception 'Each crop must be an object.' using errcode = 'check_violation';
+    end if;
+
+    v_code := nullif(btrim(v_item->>'crop_code'), '');
+    if v_code is null or v_code !~ '^[a-z][a-z0-9_]{1,40}$'
+       or not exists (select 1 from public.crop_catalog c where c.code = v_code and c.is_active) then
+      raise exception 'Unknown crop code: %', coalesce(v_code, '(null)') using errcode = 'check_violation';
+    end if;
+
+    if v_code = any (v_codes) then
+      raise exception 'Crop % appears more than once in the context.', v_code using errcode = 'check_violation';
+    end if;
+    v_codes := array_append(v_codes, v_code);
+
+    v_stage_text := coalesce(nullif(btrim(v_item->>'stage'), ''), 'planned');
+    if v_stage_text not in
+       ('planned','sown','germinating','vegetative','flowering','fruiting','maturity','harvested','failed') then
+      raise exception 'Unknown crop stage: %', v_stage_text using errcode = 'check_violation';
+    end if;
+    v_stage := v_stage_text::public.crop_stage;
+
+    v_primary := case
+      when jsonb_typeof(v_item->'primary') = 'boolean' then (v_item->>'primary')::boolean
+      else false
+    end;
+    if v_primary then
+      if v_primary_code is not null then
+        raise exception 'Only one crop may be primary.' using errcode = 'check_violation';
+      end if;
+      v_primary_code := v_code;
+    end if;
+
+    select * into v_row
+      from public.crop_instances
+     where farmer_id = v_farmer
+       and crop_code = v_code
+       and closed_at is null
+     order by created_at, id
+     limit 1;
+
+    if found then
+      if v_row.stage is distinct from v_stage or not v_row.app_synced then
+        v_changed := true;
+      end if;
+      update public.crop_instances
+         set stage = v_stage,
+             app_synced = true,
+             is_primary = false
+       where id = v_row.id;
+    else
+      insert into public.crop_instances (farmer_id, crop_code, stage, is_primary, app_synced)
+      values (v_farmer, v_code, v_stage, false, true)
+      returning * into v_row;
+      v_changed := true;
+    end if;
+
+    v_count := v_count + 1;
+  end loop;
+
+  -- Close only app-owned crops that disappeared from the local list. A crop
+  -- entered by an agronomist/import is never closed by this path.
+  if exists (
+    select 1 from public.crop_instances c
+     where c.farmer_id = v_farmer
+       and c.app_synced
+       and c.closed_at is null
+       and not (c.crop_code = any (v_codes))
+  ) then
+    v_changed := true;
+    update public.crop_instances
+       set closed_at = now(), is_primary = false
+     where farmer_id = v_farmer
+       and app_synced
+       and closed_at is null
+       and not (crop_code = any (v_codes));
+  end if;
+
+  if v_primary_code is null and array_length(v_codes, 1) is not null then
+    v_primary_code := v_codes[1];
+  end if;
+
+  if v_current_primary is distinct from v_primary_code then
+    v_changed := true;
+  end if;
+
+  if array_length(v_codes, 1) is not null then
+    update public.crop_instances
+       set is_primary = false
+     where farmer_id = v_farmer
+       and closed_at is null
+       and is_primary;
+
+    update public.crop_instances
+       set is_primary = true
+     where farmer_id = v_farmer
+       and crop_code = v_primary_code
+       and closed_at is null;
+  end if;
+
+  insert into public.farmer_intelligence_profiles (
+    farmer_id, primary_crop_code, recommendations_refreshed_at
+  ) values (
+    v_farmer, v_primary_code, null
+  )
+  on conflict (farmer_id) do update
+    set primary_crop_code = excluded.primary_crop_code,
+        recommendations_refreshed_at = case
+          when v_changed then null
+          else public.farmer_intelligence_profiles.recommendations_refreshed_at
+        end,
+        updated_at = now();
+
+  return v_count;
+end;
+$$;
+
+comment on function public.sync_my_crops(jsonb) is
+  'Validated, JWT-owned synchronization of the app crop list into the canonical crop table. Closes only app-owned stale rows and invalidates recommendations only on a real change.';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261103000900_proactive_alerts.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Phase 5 · Proactive crop intelligence and alerts
+--
+-- This migration deliberately does not create a second advice object. An alert
+-- is a canonical `recommendations` row with an `alert_level`; its announcement is
+-- the existing pointer-only `notification_events` row. Home, the bell and the
+-- alert feed all read the same recommendation.
+--
+-- Two alert sources are implemented:
+--
+--   1. A direct severe-weather observation from `weather_readings`. The rule is
+--      a WMO condition code, not an invented agronomic threshold, and the copy
+--      says it is an observation rather than a pest or disease forecast.
+--   2. A time-bound, admin-curated rule that cites a published verified
+--      knowledge entry and a crop/stage. No static knowledge entry is promoted
+--      to an alert merely because it exists.
+--
+-- The later `agri_advisories`/forecast-risk chain is not applied in the staging
+-- database, so this migration cannot depend on it. When those tables are applied
+-- they can add rules without changing the canonical alert shape.
+--
+-- The generator is service-only and idempotent. The client can only read its own
+-- alert feed and mark/dismiss its own announcement. Alert delivery remains
+-- in-app: no push sender is configured, and the preference API reports that
+-- honestly instead of pretending a device token means delivered push.
+
+-- ---------------------------------------------------------------------------
+-- The canonical recommendation gains alert metadata
+-- ---------------------------------------------------------------------------
+alter table public.recommendations
+  add column alert_level text
+    check (alert_level is null or alert_level in ('info', 'watch', 'urgent')),
+  add column alert_at timestamptz,
+  add column alert_rule_code text;
+
+alter table public.recommendations
+  add constraint recommendations_alert_complete check (
+    (alert_level is null and alert_at is null and alert_rule_code is null)
+    or (alert_level is not null and alert_at is not null and alert_rule_code is not null)
+  );
+
+create index recommendations_alert_idx
+  on public.recommendations (farmer_id, alert_at desc)
+  where alert_level is not null and withdrawn_at is null;
+
+comment on column public.recommendations.alert_level is
+  'Non-null means this canonical recommendation is an alert. There is no separate alert table; Home, the inbox and the detail view all reference this row.';
+comment on column public.recommendations.alert_at is
+  'When the alert was raised. Kept separate from created_at so an older recommendation promoted by a time-bound rule can still be explained.';
+comment on column public.recommendations.alert_rule_code is
+  'The configurable alert rule that raised this row. The rule and its version remain readable for audit.';
+
+alter table public.farmer_intelligence_profiles
+  add column alerts_refreshed_at timestamptz;
+
+comment on column public.farmer_intelligence_profiles.alerts_refreshed_at is
+  'Last time the alert producer ran for this farmer. Bounds repeated generation independently of the recommendation refresh.';
+
+-- ---------------------------------------------------------------------------
+-- Alert rules: code, source, level and bounded delivery
+-- ---------------------------------------------------------------------------
+create table public.alert_rules (
+  code               text primary key check (code ~ '^[a-z][a-z0-9_-]{1,60}$'),
+  source_kind        text not null check (source_kind in ('weather_observation', 'knowledge')),
+  level              text not null check (level in ('info', 'watch', 'urgent')),
+  category           text not null check (category in ('weather', 'pest', 'disease', 'crop_stage')),
+  crop_code          text references public.crop_catalog (code),
+  stage              public.crop_stage,
+  knowledge_entry_id uuid references public.agri_knowledge_entries (id) on delete cascade,
+  -- For weather_observation, condition_codes is a JSON array of WMO codes.
+  -- For knowledge, it is {} and the rule's crop/stage/window is the condition.
+  condition          jsonb not null default '{}'::jsonb,
+  title_en           text,
+  title_ur           text,
+  body_en            text,
+  body_ur            text,
+  priority           integer not null default 20 check (priority between 1 and 100),
+  valid_for_minutes  integer not null default 90 check (valid_for_minutes between 15 and 10080),
+  cooldown_minutes   integer not null default 180 check (cooldown_minutes between 15 and 10080),
+  daily_cap          integer not null default 2 check (daily_cap between 1 and 10),
+  starts_at          timestamptz,
+  ends_at            timestamptz,
+  is_active          boolean not null default false,
+  version            integer not null default 1 check (version > 0),
+  created_at         timestamptz not null default now(),
+  updated_at         timestamptz not null default now(),
+  constraint alert_rules_shape check (
+    (
+      source_kind = 'weather_observation'
+      and knowledge_entry_id is null
+      and crop_code is null
+      and stage is null
+      and starts_at is null
+      and ends_at is null
+      and title_en is not null
+      and title_ur is not null
+      and body_en is not null
+      and body_ur is not null
+      and condition ? 'condition_codes'
+      and jsonb_typeof(condition->'condition_codes') = 'array'
+    )
+    or
+    (
+      source_kind = 'knowledge'
+      and knowledge_entry_id is not null
+      and stage is not null
+      and starts_at is not null
+      and ends_at is not null
+      and ends_at > starts_at
+    )
+  )
+);
+
+create trigger alert_rules_touch
+  before update on public.alert_rules
+  for each row execute function public.touch_updated_at();
+
+comment on table public.alert_rules is
+  'Configurable alert causes. Weather rules use a direct WMO condition code; knowledge rules are time-bound campaigns that must cite a published entry and a crop stage. Inert until active.';
+
+insert into public.alert_rules (
+  code, source_kind, level, category, condition, title_en, title_ur,
+  body_en, body_ur, priority, valid_for_minutes, cooldown_minutes, daily_cap,
+  is_active, version
+) values
+  (
+    'weather-thunderstorm', 'weather_observation', 'urgent', 'weather',
+    '{"condition_codes":[95,96,99]}'::jsonb,
+    'Thunderstorm reported near your farm',
+    'آپ کے کھیت کے قریب آندھی اور گرج کی اطلاع',
+    'The weather service reported %s at %s for your saved area. Avoid spraying now and check low areas for standing water. This is an observed weather warning, not a pest or disease forecast.',
+    'موسم کی خدمت نے آپ کے محفوظ علاقے کے لیے %s کی اطلاع %s پر دی ہے۔ ابھی سپرے نہ کریں اور نشیبی حصوں میں پانی جمع ہونے کی جانچ کریں۔ یہ موسم کا مشاہدہ ہے، کیڑے یا بیماری کی پیش گوئی نہیں۔',
+    1, 90, 180, 3, true, 1
+  ),
+  (
+    'weather-heavy-rain', 'weather_observation', 'watch', 'weather',
+    '{"condition_codes":[65,67,82]}'::jsonb,
+    'Heavy rain reported near your farm',
+    'آپ کے کھیت کے قریب تیز بارش کی اطلاع',
+    'The weather service reported %s at %s for your saved area. Avoid spraying now and check low areas for standing water. This is an observed weather warning, not a pest or disease forecast.',
+    'موسم کی خدمت نے آپ کے محفوظ علاقے کے لیے %s کی اطلاع %s پر دی ہے۔ ابھی سپرے نہ کریں اور نشیبی حصوں میں پانی جمع ہونے کی جانچ کریں۔ یہ موسم کا مشاہدہ ہے، کیڑے یا بیماری کی پیش گوئی نہیں۔',
+    5, 180, 240, 2, true, 1
+  ),
+  (
+    'weather-heavy-snow', 'weather_observation', 'watch', 'weather',
+    '{"condition_codes":[75,86]}'::jsonb,
+    'Heavy snow reported near your farm',
+    'آپ کے کھیت کے قریب بھاری برف باری کی اطلاع',
+    'The weather service reported %s at %s for your saved area. Check the crop and avoid field work until conditions improve. This is an observed weather warning, not a pest or disease forecast.',
+    'موسم کی خدمت نے آپ کے محفوظ علاقے کے لیے %s کی اطلاع %s پر دی ہے۔ فصل دیکھیں اور حالات بہتر ہونے تک کھیت کا کام روکیں۔ یہ موسم کا مشاہدہ ہے، کیڑے یا بیماری کی پیش گوئی نہیں۔',
+    5, 180, 360, 1, true, 1
+  )
+on conflict (code) do nothing;
+
+alter table public.alert_rules enable row level security;
+
+create policy alert_rules_read on public.alert_rules
+  for select to authenticated
+  using (is_active or public.has_capability('admin'));
+
+grant select on public.alert_rules to authenticated;
+revoke insert, update, delete on public.alert_rules from anon, authenticated;
+
+-- ---------------------------------------------------------------------------
+-- Configuration
+-- ---------------------------------------------------------------------------
+insert into public.intelligence_config (key, value, description) values
+  ('alert_rule_version', '1'::jsonb,
+   'Version of the Phase 5 alert producer.'),
+  ('alert_refresh_minutes', '15'::jsonb,
+   'Minimum time between alert production attempts for one farmer.'),
+  ('alert_max_per_farmer', '3'::jsonb,
+   'Hard ceiling on live alerts for one farmer.'),
+  ('alert_push_available', 'false'::jsonb,
+   'Whether a push sender is configured. The app reports this honestly and does not claim push delivery while false.')
+on conflict (key) do update
+  set value = excluded.value,
+      version = public.intelligence_config.version + 1,
+      description = excluded.description,
+      updated_at = now();
+
+-- ---------------------------------------------------------------------------
+-- Preferences: one explicit alerts object in the existing preferences table
+-- ---------------------------------------------------------------------------
+create or replace function public.farmer_alert_preferences()
+returns jsonb
+language plpgsql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_farmer uuid := public.current_farmer_id();
+  v_value jsonb;
+  v_push_available boolean := false;
+begin
+  if v_farmer is null then
+    raise exception 'Alert preferences require an identified farmer.'
+      using errcode = 'insufficient_privilege';
+  end if;
+
+  select value into v_value
+    from public.farmer_preferences
+   where farmer_id = v_farmer and key = 'alerts';
+
+  if v_value is null or jsonb_typeof(v_value) <> 'object' then
+    v_value := '{}'::jsonb;
+  end if;
+
+  select coalesce((value #>> '{}')::boolean, false)
+    into v_push_available
+    from public.intelligence_config
+   where key = 'alert_push_available';
+
+  return jsonb_build_object(
+    'in_app', coalesce((v_value->>'in_app')::boolean, true),
+    'push', coalesce((v_value->>'push')::boolean, false),
+    'categories', coalesce(v_value->'categories',
+      '["weather","pest","disease","crop_stage"]'::jsonb),
+    'consent_version', coalesce((v_value->>'consent_version')::integer, 0),
+    'consent_at', v_value->'consent_at',
+    'push_available', coalesce(v_push_available, false)
+  );
+end;
+$$;
+
+comment on function public.farmer_alert_preferences() is
+  'The caller''s own alert choices. Defaults are explicit in the response; push is reported unavailable unless a sender is configured.';
+
+create or replace function public.set_farmer_alert_preferences(
+  p_in_app        boolean,
+  p_push          boolean default false,
+  p_categories    text[] default array['weather','pest','disease','crop_stage']::text[],
+  p_consent_version integer default 0
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_farmer uuid := public.current_farmer_id();
+  v_categories text[];
+  v_existing jsonb;
+  v_push_available boolean := false;
+  v_consent_at timestamptz;
+begin
+  if v_farmer is null then
+    raise exception 'Alert preferences require an identified farmer.'
+      using errcode = 'insufficient_privilege';
+  end if;
+
+  select coalesce(array(
+    select distinct trim(value)
+      from unnest(coalesce(p_categories, array['weather','pest','disease','crop_stage']::text[])) value
+     where trim(value) <> ''
+  ), array[]::text[])
+    into v_categories;
+
+  if exists (
+    select 1 from unnest(v_categories) value
+     where value not in ('weather', 'pest', 'disease', 'crop_stage')
+  ) then
+    raise exception 'Unknown alert category.' using errcode = 'check_violation';
+  end if;
+
+  if coalesce(p_in_app, true) and cardinality(v_categories) = 0 then
+    raise exception 'Choose at least one alert category while in-app alerts are on.'
+      using errcode = 'check_violation';
+  end if;
+
+  select coalesce((value #>> '{}')::boolean, false)
+    into v_push_available
+    from public.intelligence_config
+   where key = 'alert_push_available';
+
+  if p_push and not coalesce(v_push_available, false) then
+    raise exception 'Push delivery is not configured in this build.'
+      using errcode = 'check_violation';
+  end if;
+
+  if p_push and coalesce(p_consent_version, 0) < 1 then
+    raise exception 'Push alerts require explicit consent.' using errcode = 'check_violation';
+  end if;
+
+  select value into v_existing
+    from public.farmer_preferences
+   where farmer_id = v_farmer and key = 'alerts';
+  if v_existing is not null and jsonb_typeof(v_existing) = 'object' then
+    v_consent_at := nullif(v_existing->>'consent_at', '')::timestamptz;
+  end if;
+  if coalesce(p_consent_version, 0) > 0 then
+    v_consent_at := coalesce(v_consent_at, now());
+  end if;
+
+  insert into public.farmer_preferences (farmer_id, key, value)
+  values (
+    v_farmer,
+    'alerts',
+    jsonb_build_object(
+      'in_app', coalesce(p_in_app, true),
+      'push', coalesce(p_push, false),
+      'categories', to_jsonb(v_categories),
+      'consent_version', greatest(0, coalesce(p_consent_version, 0)),
+      'consent_at', v_consent_at
+    )
+  )
+  on conflict (farmer_id, key) do update
+    set value = excluded.value,
+        updated_at = now();
+
+  update public.farmer_intelligence_profiles
+     set alerts_refreshed_at = null,
+         updated_at = now()
+   where farmer_id = v_farmer;
+
+  perform public.write_audit(
+    'alerts.preferences_updated', 'farmer_preferences', v_farmer, 'alerts',
+    null, null,
+    jsonb_build_object(
+      'in_app', coalesce(p_in_app, true),
+      'push', coalesce(p_push, false),
+      'categories', v_categories
+    )
+  );
+
+  return public.farmer_alert_preferences();
+end;
+$$;
+
+comment on function public.set_farmer_alert_preferences(boolean, boolean, text[], integer) is
+  'Writes the caller''s alert choices to the existing preferences table. Rejects unknown categories and any push opt-in while no sender is configured.';
+
+-- ---------------------------------------------------------------------------
+-- Generation
+-- ---------------------------------------------------------------------------
+create or replace function public.refresh_farmer_alerts(p_farmer_id uuid)
+returns integer
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_pair       uuid;
+  v_pref       jsonb := '{}'::jsonb;
+  v_in_app     boolean := true;
+  v_push       boolean := false;
+  v_categories text[];
+  v_lat        double precision;
+  v_lon        double precision;
+  v_area       text;
+  v_crop       record;
+  v_weather    record;
+  v_rule       public.alert_rules%rowtype;
+  v_match      record;
+  v_rec        uuid;
+  v_count      integer := 0;
+  v_live       integer := 0;
+  v_max        integer := 3;
+  v_refresh    integer := 15;
+  v_rule_ver   integer := 1;
+  v_last       timestamptz;
+  v_code       integer;
+  v_dedupe     text;
+  v_body_en    text;
+  v_body_ur    text;
+  v_title_en   text;
+  v_title_ur   text;
+  v_kind       text;
+  v_source_url text;
+  v_source_label text;
+  v_valid_until timestamptz;
+begin
+  if p_farmer_id is null then
+    raise exception 'A farmer is required.' using errcode = 'invalid_parameter_value';
+  end if;
+
+  perform pg_advisory_xact_lock(hashtextextended('alerts:' || p_farmer_id::text, 0));
+
+  select coalesce((value #>> '{}')::integer, 3) into v_max
+    from public.intelligence_config where key = 'alert_max_per_farmer';
+  select coalesce((value #>> '{}')::integer, 15) into v_refresh
+    from public.intelligence_config where key = 'alert_refresh_minutes';
+  select coalesce((value #>> '{}')::integer, 1) into v_rule_ver
+    from public.intelligence_config where key = 'alert_rule_version';
+
+  select value into v_pref
+    from public.farmer_preferences
+   where farmer_id = p_farmer_id and key = 'alerts';
+  if v_pref is null or jsonb_typeof(v_pref) <> 'object' then
+    v_pref := '{}'::jsonb;
+  end if;
+
+  v_in_app := coalesce((v_pref->>'in_app')::boolean, true);
+  v_push := coalesce((v_pref->>'push')::boolean, false);
+  if not v_in_app and not v_push then
+    return 0;
+  end if;
+
+  if jsonb_typeof(v_pref->'categories') = 'array' then
+    select coalesce(array_agg(value), array[]::text[])
+      into v_categories
+      from jsonb_array_elements_text(v_pref->'categories') value
+     where value in ('weather', 'pest', 'disease', 'crop_stage');
+  else
+    v_categories := array['weather', 'pest', 'disease', 'crop_stage']::text[];
+  end if;
+  if cardinality(v_categories) = 0 then
+    return 0;
+  end if;
+
+  select default_lat, default_lon, default_location_label
+    into v_lat, v_lon, v_area
+    from public.farmer_profiles
+   where party_id = p_farmer_id;
+
+  if v_lat is null or v_lon is null then
+    return 0;
+  end if;
+
+  select id, crop_code, stage
+    into v_crop
+    from public.crop_instances
+   where farmer_id = p_farmer_id and closed_at is null
+   order by is_primary desc, created_at
+   limit 1;
+
+  if not found then
+    return 0;
+  end if;
+
+  select alerts_refreshed_at into v_last
+    from public.farmer_intelligence_profiles
+   where farmer_id = p_farmer_id;
+  if v_last is not null and v_last > now() - make_interval(mins => greatest(1, least(v_refresh, 360))) then
+    return 0;
+  end if;
+
+  -- Retire this farmer's expired alerts before counting the live cap. A stale
+  -- row must not keep a new observation out through the unique dedupe index.
+  update public.recommendations
+     set withdrawn_at = now(),
+         withdraw_reason = 'alert validity window passed'
+   where farmer_id = p_farmer_id
+     and alert_level is not null
+     and withdrawn_at is null
+     and valid_until is not null
+     and valid_until <= now();
+
+  select count(*) into v_live
+    from public.recommendations
+   where farmer_id = p_farmer_id
+     and alert_level is not null
+     and withdrawn_at is null
+     and (valid_until is null or valid_until > now());
+
+  -- Direct observed weather. This is a WMO condition, not an inferred pest
+  -- outbreak and not a threshold claimed to be agronomic advice.
+  select w.*, wr.condition_code
+    into v_weather
+    from public.farmer_profiles fp
+    cross join lateral public.latest_weather(fp.default_lat, fp.default_lon) w
+    join public.weather_readings wr
+      on wr.provider_code = w.provider_code
+     and wr.observed_at = w.observed_at
+     and wr.lat_cell = round(fp.default_lat::numeric, 3)
+     and wr.lon_cell = round(fp.default_lon::numeric, 3)
+   where fp.party_id = p_farmer_id
+     and w.is_usable
+     and wr.condition_code ~ '^[0-9]{1,3}$'
+   order by wr.observed_at desc
+   limit 1;
+
+  if found and v_live < v_max then
+    v_code := v_weather.condition_code::integer;
+
+    select * into v_rule
+      from public.alert_rules r
+     where r.is_active
+       and r.source_kind = 'weather_observation'
+       and r.category = any (v_categories)
+       and exists (
+         select 1
+           from jsonb_array_elements_text(r.condition->'condition_codes') elem
+          where elem::integer = v_code
+       )
+     order by r.priority
+     limit 1;
+
+    if found then
+      v_dedupe := 'alert:weather:' || v_rule.code || ':' || v_weather.provider_code || ':'
+        || v_code::text || ':' || to_char(v_weather.observed_at at time zone 'Asia/Karachi', 'YYYYMMDDHH24');
+
+      if not exists (
+        select 1 from public.recommendations r
+         where r.farmer_id = p_farmer_id
+           and r.alert_rule_code = v_rule.code
+           and r.withdrawn_at is null
+           and (r.valid_until is null or r.valid_until > now())
+      ) and not exists (
+        select 1 from public.recommendations r
+         where r.farmer_id = p_farmer_id
+           and r.alert_rule_code = v_rule.code
+           and r.alert_at > now() - make_interval(mins => v_rule.cooldown_minutes)
+      ) and (
+        select count(*) from public.recommendations r
+         where r.farmer_id = p_farmer_id
+           and r.alert_rule_code = v_rule.code
+           and r.alert_at > now() - interval '24 hours'
+      ) < v_rule.daily_cap then
+        v_title_en := v_rule.title_en;
+        v_title_ur := v_rule.title_ur;
+        v_body_en := format(v_rule.body_en, coalesce(v_weather.condition_text, 'Weather'), to_char(v_weather.observed_at at time zone 'Asia/Karachi', 'DD/MM HH24:MI'));
+        v_body_ur := format(v_rule.body_ur, coalesce(v_weather.condition_text, 'موسم'), to_char(v_weather.observed_at at time zone 'Asia/Karachi', 'DD/MM HH24:MI'));
+        v_valid_until := now() + make_interval(mins => v_rule.valid_for_minutes);
+
+        v_rec := null;
+        insert into public.recommendations (
+          farmer_id, crop_id, kind, title, title_ur, body, body_ur,
+          action_label, action_label_ur, action_kind,
+          source, source_ref, source_label, source_url,
+          confidence, valid_until, priority, dedupe_key,
+          evidence_tier, reason_code, reason_context, rule_version,
+          alert_level, alert_at, alert_rule_code
+        ) values (
+          p_farmer_id, v_crop.id, 'weather', v_title_en, v_title_ur, v_body_en, v_body_ur,
+          'Check weather', 'موسم دیکھیں', 'open_weather',
+          'weather', 'weather:' || v_weather.provider_code, v_weather.provider_name, null,
+          0.95, v_valid_until, v_rule.priority, v_dedupe,
+          null, 'weather_observation',
+          jsonb_strip_nulls(jsonb_build_object(
+            'crop_code', v_crop.crop_code,
+            'stage', v_crop.stage,
+            'condition_code', v_code,
+            'observed_at', v_weather.observed_at,
+            'area_label', left(coalesce(v_area, ''), 120)
+          )),
+          v_rule_ver, v_rule.level, now(), v_rule.code
+        )
+        on conflict (farmer_id, dedupe_key) where withdrawn_at is null do nothing
+        returning id into v_rec;
+
+        if v_rec is not null then
+          v_count := v_count + 1;
+          v_live := v_live + 1;
+          if v_in_app then
+            insert into public.notification_events (
+              party_id, kind, recommendation_id, delivered_channels
+            ) values (
+              p_farmer_id, 'weather_alert', v_rec, array['in_app']::text[]
+            )
+            on conflict do nothing;
+          end if;
+          perform public.write_audit(
+            'alert.generated', 'recommendations', v_rec, v_rule.code,
+            null, v_rule.level,
+            jsonb_build_object('source', 'weather_observation', 'condition_code', v_code)
+          );
+        end if;
+      end if;
+    end if;
+  end if;
+
+  -- Time-bound, reviewed knowledge campaigns. This loop can only see a rule a
+  -- reviewer created with a start and end; a published entry alone never fires.
+  if v_live < v_max then
+    for v_match in
+      select
+        r.code as rule_code,
+        r.level,
+        r.category,
+        r.priority,
+        r.valid_for_minutes,
+        r.cooldown_minutes,
+        r.daily_cap,
+        r.ends_at,
+        r.version as rule_version,
+        e.slug,
+        e.version as entry_version,
+        e.title_en,
+        e.title_ur,
+        e.body_en,
+        e.body_ur,
+        e.topic,
+        e.problem_type,
+        e.evidence_tier,
+        e.regions,
+        c.id as crop_id,
+        c.crop_code,
+        c.stage,
+        e.source_url as entry_source_url,
+        src.publisher,
+        src.name as source_name,
+        src.url as source_url
+      from public.alert_rules r
+      join public.agri_knowledge_entries e on e.id = r.knowledge_entry_id
+      join public.crop_instances c
+        on c.farmer_id = p_farmer_id
+       and c.closed_at is null
+       and (r.crop_code is null or r.crop_code = c.crop_code)
+       and c.stage = r.stage
+      left join public.agri_knowledge_sources src on src.code = e.source_code
+     where r.is_active
+       and r.source_kind = 'knowledge'
+       and r.starts_at <= now()
+       and r.ends_at > now()
+       and r.category = any (v_categories)
+       and e.is_published
+       and e.evidence_tier = 'verified'
+       and (
+         e.regions is null
+         or cardinality(e.regions) = 0
+         or 'Punjab' = any (e.regions)
+         or exists (
+           select 1 from public.farmer_intelligence_profiles ip
+            where ip.farmer_id = p_farmer_id
+              and ip.district is not null
+              and ip.district = any (e.regions)
+         )
+       )
+     order by r.priority, e.slug, c.id
+    loop
+      exit when v_live >= v_max;
+
+      if not exists (
+        select 1 from public.recommendations r
+         where r.farmer_id = p_farmer_id
+           and r.alert_rule_code = v_match.rule_code
+           and r.withdrawn_at is null
+           and (r.valid_until is null or r.valid_until > now())
+      ) and not exists (
+        select 1 from public.recommendations r
+         where r.farmer_id = p_farmer_id
+           and r.alert_rule_code = v_match.rule_code
+           and r.alert_at > now() - make_interval(mins => v_match.cooldown_minutes)
+      ) then
+        -- The curated rule's category is authoritative for feed filtering and
+        -- for the action we offer; the knowledge topic is supporting context.
+        v_kind := case v_match.category
+          when 'pest' then 'pest'
+          when 'disease' then 'disease'
+          when 'weather' then 'weather'
+          else 'crop_stage'
+        end;
+
+        v_dedupe := 'alert:knowledge:' || v_match.rule_code || ':' || v_match.crop_id::text
+          || ':v' || v_match.rule_version::text;
+        v_source_url := case
+          when coalesce(v_match.entry_source_url, v_match.source_url) ~ '^https://'
+            then coalesce(v_match.entry_source_url, v_match.source_url)
+          else null
+        end;
+        v_source_label := coalesce(v_match.publisher, v_match.source_name, 'Farmer App editorial notes');
+        v_valid_until := least(v_match.ends_at, now() + make_interval(mins => v_match.valid_for_minutes));
+
+        v_rec := null;
+        insert into public.recommendations (
+          farmer_id, crop_id, kind, title, title_ur, body, body_ur,
+          action_label, action_label_ur, action_kind,
+          source, source_ref, source_label, source_url,
+          confidence, knowledge_version, valid_until, priority, dedupe_key,
+          evidence_tier, reason_code, reason_context, rule_version,
+          alert_level, alert_at, alert_rule_code
+        ) values (
+          p_farmer_id, v_match.crop_id, v_kind, v_match.title_en, v_match.title_ur,
+          v_match.body_en, v_match.body_ur,
+          case when v_kind in ('pest', 'disease') then 'Scan the crop' else 'Open crop' end,
+          case when v_kind in ('pest', 'disease') then 'فصل اسکین کریں' else 'فصل کھولیں' end,
+          case when v_kind in ('pest', 'disease') then 'open_scan' else 'open_crop' end,
+          'knowledge_base', v_match.slug, v_source_label, v_source_url,
+          0.95, v_match.entry_version, v_valid_until, v_match.priority, v_dedupe,
+          v_match.evidence_tier, 'crop_stage',
+          jsonb_strip_nulls(jsonb_build_object(
+            'crop_code', v_match.crop_code,
+            'stage', v_match.stage,
+            'topic', v_match.topic,
+            'rule', v_match.rule_code
+          )),
+          v_match.rule_version, v_match.level, now(), v_match.rule_code
+        )
+        on conflict (farmer_id, dedupe_key) where withdrawn_at is null do nothing
+        returning id into v_rec;
+
+        if v_rec is not null then
+          v_count := v_count + 1;
+          v_live := v_live + 1;
+          if v_in_app then
+            insert into public.notification_events (
+              party_id, kind, recommendation_id, delivered_channels
+            ) values (
+              p_farmer_id, 'recommendation', v_rec, array['in_app']::text[]
+            )
+            on conflict do nothing;
+          end if;
+          perform public.write_audit(
+            'alert.generated', 'recommendations', v_rec, v_match.rule_code,
+            null, v_match.level,
+            jsonb_build_object('source', 'knowledge', 'slug', v_match.slug)
+          );
+        end if;
+      end if;
+    end loop;
+  end if;
+
+  insert into public.farmer_intelligence_profiles (farmer_id, alerts_refreshed_at)
+  values (p_farmer_id, now())
+  on conflict (farmer_id) do update
+    set alerts_refreshed_at = excluded.alerts_refreshed_at,
+        updated_at = now();
+
+  perform public.write_audit(
+    'alerts.refreshed', 'farmer_intelligence_profiles', p_farmer_id, null,
+    null, v_count::text,
+    jsonb_build_object('generated', v_count, 'live', v_live, 'rule_version', v_rule_ver)
+  );
+
+  return v_count;
+end;
+$$;
+
+comment on function public.refresh_farmer_alerts(uuid) is
+  'Service-only alert producer. Uses direct WMO observations and time-bound reviewed knowledge rules, bounded by cooldown, daily cap and live-alert cap. Never creates an outbreak claim from static guidance.';
+
+-- ---------------------------------------------------------------------------
+-- Authenticated preparation and read model
+-- ---------------------------------------------------------------------------
+create or replace function public.prepare_my_alerts()
+returns integer
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_farmer uuid := public.current_farmer_id();
+begin
+  if v_farmer is null then
+    raise exception 'An identified farmer is required.' using errcode = 'insufficient_privilege';
+  end if;
+  return public.refresh_farmer_alerts(v_farmer);
+end;
+$$;
+
+comment on function public.prepare_my_alerts() is
+  'Authenticated seam for alert preparation. The farmer comes from the JWT; no client-supplied id is accepted.';
+
+create or replace function public.intelligence_alert_feed(p_limit integer default 20)
+returns table (
+  notification_id  uuid,
+  recommendation_id uuid,
+  crop_id          uuid,
+  crop_code        text,
+  kind             text,
+  title            text,
+  title_ur         text,
+  body             text,
+  body_ur          text,
+  source           public.recommendation_source,
+  source_label     text,
+  source_url       text,
+  evidence_tier    text,
+  confidence       numeric,
+  alert_level      text,
+  alert_at         timestamptz,
+  valid_until      timestamptz,
+  is_read          boolean,
+  read_at          timestamptz,
+  created_at       timestamptz,
+  reason_code      text,
+  reason_context   jsonb,
+  action_kind      text,
+  action_label     text,
+  action_label_ur  text
+)
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+  with mine as (
+    select
+      public.current_farmer_id() as farmer_id,
+      public.current_party_id() as party_id
+  ),
+  pref as (
+    select p.value
+      from public.farmer_preferences p, mine
+     where p.farmer_id = mine.farmer_id and p.key = 'alerts'
+  )
+  select
+    n.id,
+    r.id,
+    r.crop_id,
+    ci.crop_code,
+    r.kind,
+    r.title,
+    r.title_ur,
+    r.body,
+    r.body_ur,
+    r.source,
+    r.source_label,
+    r.source_url,
+    r.evidence_tier,
+    r.confidence,
+    r.alert_level,
+    r.alert_at,
+    r.valid_until,
+    (n.read_at is not null),
+    n.read_at,
+    r.created_at,
+    r.reason_code,
+    r.reason_context,
+    r.action_kind,
+    r.action_label,
+    r.action_label_ur
+  from public.recommendations r
+  join public.notification_events n
+    on n.recommendation_id = r.id
+   and n.party_id = (select party_id from mine)
+  left join public.crop_instances ci on ci.id = r.crop_id
+  left join pref p on true
+  where r.farmer_id = (select farmer_id from mine)
+    and r.alert_level is not null
+    and r.withdrawn_at is null
+    and (r.valid_until is null or r.valid_until > now())
+    and n.dismissed_at is null
+    and (r.crop_id is null or ci.closed_at is null)
+    and coalesce((p.value->>'in_app')::boolean, true)
+    and (
+      p.value is null
+      or jsonb_typeof(p.value->'categories') <> 'array'
+      or p.value->'categories' ? case
+        when r.kind in ('weather', 'pest', 'disease', 'crop_stage') then r.kind
+        else 'crop_stage'
+      end
+    )
+  order by
+    case r.alert_level when 'urgent' then 0 when 'watch' then 1 else 2 end,
+    r.alert_at desc,
+    r.created_at desc
+  limit greatest(1, least(coalesce(p_limit, 20), 20));
+$$;
+
+comment on function public.intelligence_alert_feed(integer) is
+  'The caller''s own live alerts, joined to the existing notification pointer. Respects in-app and category preferences, dismissal and validity; no farmer id is accepted.';
+
+create or replace function public.mark_alert_read(p_notification_id uuid)
+returns boolean
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_party uuid := public.current_party_id();
+  v_farmer uuid := public.current_farmer_id();
+begin
+  if v_party is null or v_farmer is null or p_notification_id is null then
+    return false;
+  end if;
+
+  update public.notification_events n
+     set read_at = coalesce(n.read_at, now())
+   where n.id = p_notification_id
+     and n.party_id = v_party
+     and n.dismissed_at is null
+     and exists (
+       select 1 from public.recommendations r
+        where r.id = n.recommendation_id
+          and r.farmer_id = v_farmer
+          and r.alert_level is not null
+     );
+  return found;
+end;
+$$;
+
+create or replace function public.dismiss_alert(p_notification_id uuid)
+returns boolean
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_party uuid := public.current_party_id();
+  v_farmer uuid := public.current_farmer_id();
+  v_recommendation uuid;
+begin
+  if v_party is null or v_farmer is null or p_notification_id is null then
+    return false;
+  end if;
+
+  select n.recommendation_id into v_recommendation
+    from public.notification_events n
+    join public.recommendations r on r.id = n.recommendation_id
+   where n.id = p_notification_id
+     and n.party_id = v_party
+     and n.dismissed_at is null
+     and r.farmer_id = v_farmer
+     and r.alert_level is not null;
+
+  if not found then
+    return false;
+  end if;
+
+  update public.notification_events
+     set dismissed_at = now(),
+         read_at = coalesce(read_at, now())
+   where id = p_notification_id;
+
+  begin
+    perform public.record_intelligence_feedback(
+      'alert-dismiss:' || p_notification_id::text,
+      'dismissed',
+      v_recommendation,
+      null,
+      null,
+      jsonb_build_object('screen', 'alerts')
+    );
+  exception when others then
+    -- The dismissal is the farmer's action and must not be undone by a ranking
+    -- side-effect failure. The event remains the source of truth.
+    perform public.write_audit(
+      'alert.feedback_failed', 'notification_events', p_notification_id, null,
+      null, sqlerrm, jsonb_build_object('recommendation_id', v_recommendation)
+    );
+  end;
+
+  perform public.write_audit(
+    'alert.dismissed', 'notification_events', p_notification_id, null,
+    null, 'dismissed', jsonb_build_object('recommendation_id', v_recommendation)
+  );
+
+  return true;
+end;
+$$;
+
+create or replace function public.mark_all_alerts_read()
+returns integer
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_party uuid := public.current_party_id();
+  v_farmer uuid := public.current_farmer_id();
+  v_count integer := 0;
+begin
+  if v_party is null or v_farmer is null then
+    return 0;
+  end if;
+
+  with marked as (
+    update public.notification_events n
+       set read_at = now()
+     where n.party_id = v_party
+       and n.read_at is null
+       and n.dismissed_at is null
+       and exists (
+         select 1 from public.recommendations r
+          where r.id = n.recommendation_id
+            and r.farmer_id = v_farmer
+            and r.alert_level is not null
+       )
+    returning 1
+  )
+  select count(*) into v_count from marked;
+
+  return v_count;
+end;
+$$;
+
+create or replace function public.job_refresh_all_alerts()
+returns integer
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_farmer uuid;
+  v_total integer := 0;
+begin
+  for v_farmer in
+    select fp.party_id
+      from public.farmer_profiles fp
+     where fp.default_lat is not null
+       and fp.default_lon is not null
+       and exists (
+         select 1 from public.crop_instances c
+          where c.farmer_id = fp.party_id and c.closed_at is null
+       )
+  loop
+    v_total := v_total + public.refresh_farmer_alerts(v_farmer);
+  end loop;
+  return v_total;
+end;
+$$;
+
+comment on function public.job_refresh_all_alerts() is
+  'Service-only scheduler wrapper. It does not widen the authenticated path and is bounded by each farmer''s own cooldown.';
+
+-- ---------------------------------------------------------------------------
+-- Grants and notification write lock
+-- ---------------------------------------------------------------------------
+revoke update on public.notification_events from authenticated;
+drop policy if exists notification_events_mark_read on public.notification_events;
+
+revoke execute on function public.refresh_farmer_alerts(uuid) from public, anon, authenticated;
+grant execute on function public.refresh_farmer_alerts(uuid) to service_role;
+
+revoke execute on function public.job_refresh_all_alerts() from public, anon, authenticated;
+grant execute on function public.job_refresh_all_alerts() to service_role;
+
+revoke execute on function public.prepare_my_alerts() from public, anon;
+grant execute on function public.prepare_my_alerts() to authenticated;
+
+revoke execute on function public.intelligence_alert_feed(integer) from public, anon;
+grant execute on function public.intelligence_alert_feed(integer) to authenticated;
+
+revoke execute on function public.mark_alert_read(uuid) from public, anon;
+grant execute on function public.mark_alert_read(uuid) to authenticated;
+
+revoke execute on function public.dismiss_alert(uuid) from public, anon;
+grant execute on function public.dismiss_alert(uuid) to authenticated;
+
+revoke execute on function public.mark_all_alerts_read() from public, anon;
+grant execute on function public.mark_all_alerts_read() to authenticated;
+
+revoke execute on function public.farmer_alert_preferences() from public, anon;
+grant execute on function public.farmer_alert_preferences() to authenticated;
+
+revoke execute on function public.set_farmer_alert_preferences(boolean, boolean, text[], integer) from public, anon;
+grant execute on function public.set_farmer_alert_preferences(boolean, boolean, text[], integer) to authenticated;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261103001000_advisory_forecast_alerts.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Farmer App · migration 0042 · Phase 5.1 advisory and forecast-risk alerts
+--
+-- This migration extends the Phase 5 producer; it does not add a second alert
+-- engine, notification table or Home surface. An alert remains a canonical
+-- `recommendations` row with an `alert_level`, announced through the existing
+-- `notification_events` pointer.
+--
+-- Two evidence boundaries are made explicit here:
+--
+--   · An advisory is not official because a row exists. It is official only
+--     after an administrator verifies the source, URL, region and validity
+--     window. Unverified and rejected rows are not readable by clients and the
+--     producer cannot see them.
+--   · A forecast risk is not an observation and is not an outbreak. It can reach
+--     the producer only from an active, reviewed rule whose cited knowledge is
+--     published and verified, and only for a matching district, crop and stage.
+--
+-- No advisory and no active threshold is inserted by this migration.
+
+-- ---------------------------------------------------------------------------
+-- Advisory verification state
+-- ---------------------------------------------------------------------------
+alter table public.agri_advisories
+  add column if not exists verification_status text not null default 'unverified',
+  add column if not exists verified_at timestamptz,
+  add column if not exists verified_by uuid references public.parties (id) on delete set null,
+  add column if not exists verification_note text,
+  add column if not exists alert_level text,
+  add column if not exists title_ur text,
+  add column if not exists summary_ur text;
+
+alter table public.agri_advisories
+  drop constraint if exists agri_advisories_verification_status_check,
+  drop constraint if exists agri_advisories_alert_level_check,
+  drop constraint if exists agri_advisories_source_url_https,
+  drop constraint if exists agri_advisories_verified_evidence;
+
+alter table public.agri_advisories
+  add constraint agri_advisories_verification_status_check
+    check (verification_status in ('unverified', 'verified', 'rejected')),
+  add constraint agri_advisories_alert_level_check
+    check (alert_level is null or alert_level in ('info', 'watch', 'urgent')),
+  add constraint agri_advisories_source_url_https
+    check (source_url is null or source_url ~ '^https://[^[:space:]]+$'),
+  add constraint agri_advisories_verified_evidence
+    check (
+      verification_status <> 'verified'
+      or (
+        verified_at is not null
+        and verified_by is not null
+        and source_url is not null
+        and district is not null
+        and valid_until is not null
+        and alert_level is not null
+        and title_ur is not null
+        and summary_ur is not null
+      )
+    );
+
+comment on column public.agri_advisories.verification_status is
+  'Unverified by default. Only an administrator can set verified or rejected through verify_official_advisory; import alone never makes a row official.';
+comment on column public.agri_advisories.verified_by is
+  'The person who checked the source document and its region/validity window. Null on every unverified row.';
+comment on column public.agri_advisories.title_ur is
+  'Urdu wording only when it is part of the checked source material; the alert falls back to the English title rather than machine-translating an official quotation.';
+
+create index if not exists agri_advisories_verified_lookup_idx
+  on public.agri_advisories (district, valid_until)
+  where is_active and verification_status = 'verified';
+
+-- Direct client reads no longer expose an advisory just because its importer
+-- set `is_active`: verification is now part of the row's public eligibility.
+drop policy if exists agri_advisories_read on public.agri_advisories;
+create policy agri_advisories_verified_read on public.agri_advisories
+  for select to anon, authenticated
+  using (
+    is_active
+    and verification_status = 'verified'
+    and valid_until is not null
+    and valid_until > now()
+  );
+
+-- ---------------------------------------------------------------------------
+-- The explicit review act
+-- ---------------------------------------------------------------------------
+create or replace function public.verify_official_advisory(
+  p_advisory_id uuid,
+  p_status      text,
+  p_alert_level text default null,
+  p_note        text default null
+)
+returns public.agri_advisories
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_advisory public.agri_advisories;
+  v_source   public.intel_sources;
+  v_actor    uuid := public.current_party_id();
+begin
+  if not public.has_capability('admin') then
+    raise exception 'Verifying an official advisory requires the admin capability.'
+      using errcode = 'insufficient_privilege';
+  end if;
+
+  if p_status not in ('verified', 'rejected') then
+    raise exception 'Advisory review status must be verified or rejected.' using errcode = 'check_violation';
+  end if;
+
+  if coalesce(btrim(p_note), '') = '' then
+    raise exception 'Advisory review requires a note recording what was checked.' using errcode = 'check_violation';
+  end if;
+
+  select * into v_advisory
+    from public.agri_advisories
+   where id = p_advisory_id
+   for update;
+  if not found then
+    raise exception 'Advisory % not found.', p_advisory_id using errcode = 'no_data_found';
+  end if;
+
+  if p_status = 'verified' then
+    if p_alert_level is null or p_alert_level not in ('info', 'watch', 'urgent') then
+      raise exception 'A verified advisory needs an alert level: info, watch or urgent.'
+        using errcode = 'check_violation';
+    end if;
+
+    if v_advisory.source_url is null
+       or v_advisory.source_url !~ '^https://[^[:space:]]+$' then
+      raise exception 'A verified advisory needs a direct HTTPS source URL.' using errcode = 'check_violation';
+    end if;
+
+    if v_advisory.district is null or btrim(v_advisory.district) = '' then
+      raise exception 'A verified advisory needs an affected district.' using errcode = 'check_violation';
+    end if;
+
+    if v_advisory.valid_until is null or v_advisory.valid_until <= now() then
+      raise exception 'A verified advisory needs a future validity window.' using errcode = 'check_violation';
+    end if;
+
+    if v_advisory.published_at > now() then
+      raise exception 'An advisory published in the future cannot be verified as current.' using errcode = 'check_violation';
+    end if;
+
+    if v_advisory.title_ur is null or v_advisory.summary_ur is null then
+      raise exception 'Verified advisory text needs Urdu title and summary, or the importer must supply the checked translation.'
+        using errcode = 'check_violation';
+    end if;
+
+    select * into v_source
+      from public.intel_sources
+     where code = v_advisory.source_code;
+    if not found or not v_source.is_active or v_source.kind <> 'official_advisory' then
+      raise exception 'The advisory source must be an active official_advisory source.'
+        using errcode = 'check_violation';
+    end if;
+
+    update public.agri_advisories
+       set verification_status = 'verified',
+           verified_at = now(),
+           verified_by = v_actor,
+           verification_note = btrim(p_note),
+           alert_level = p_alert_level,
+           is_active = true
+     where id = p_advisory_id
+    returning * into v_advisory;
+
+    perform public.write_audit(
+      'intel.advisory_verified', 'agri_advisories', p_advisory_id, v_advisory.source_code,
+      'unverified', 'verified',
+      jsonb_build_object(
+        'source_url', v_advisory.source_url,
+        'source_ref', v_advisory.source_ref,
+        'district', v_advisory.district,
+        'valid_until', v_advisory.valid_until,
+        'alert_level', p_alert_level
+      ),
+      v_actor, 'admin'
+    );
+  else
+    update public.agri_advisories
+       set verification_status = 'rejected',
+           verified_at = now(),
+           verified_by = v_actor,
+           verification_note = btrim(p_note),
+           alert_level = null,
+           is_active = false
+     where id = p_advisory_id
+    returning * into v_advisory;
+
+    perform public.write_audit(
+      'intel.advisory_rejected', 'agri_advisories', p_advisory_id, v_advisory.source_code,
+      'unverified', 'rejected',
+      jsonb_build_object('source_url', v_advisory.source_url, 'note', btrim(p_note)),
+      v_actor, 'admin'
+    );
+  end if;
+
+  return v_advisory;
+end;
+$$;
+
+comment on function public.verify_official_advisory(uuid, text, text, text) is
+  'Admin-only review of one imported advisory. Requires a direct HTTPS source, district, future validity window and Urdu copy before it can become official. Rejection deactivates the row and is recorded.';
+
+revoke execute on function public.verify_official_advisory(uuid, text, text, text) from public, anon;
+grant execute on function public.verify_official_advisory(uuid, text, text, text) to authenticated;
+
+-- ---------------------------------------------------------------------------
+-- A threshold may only be turned on with verified, published evidence
+-- ---------------------------------------------------------------------------
+create or replace function public.activate_forecast_risk_rule(
+  p_code text,
+  p_note text
+)
+returns public.forecast_risk_rules
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_rule  public.forecast_risk_rules;
+  v_actor uuid := public.current_party_id();
+  v_entry public.agri_knowledge_entries;
+begin
+  if not public.has_capability('admin') then
+    raise exception 'Activating a risk threshold requires the admin capability.' using errcode = 'insufficient_privilege';
+  end if;
+  if coalesce(btrim(p_note), '') = '' then
+    raise exception 'Activating a threshold requires a note saying why it is right.' using errcode = 'check_violation';
+  end if;
+
+  select * into v_rule from public.forecast_risk_rules where code = p_code for update;
+  if not found then
+    raise exception 'Risk rule % not found.', p_code using errcode = 'no_data_found';
+  end if;
+
+  select * into v_entry from public.agri_knowledge_entries where id = v_rule.knowledge_entry_id;
+  if not found or not v_entry.is_published then
+    raise exception 'Rule % cites an entry that is missing or unpublished.', p_code using errcode = 'check_violation';
+  end if;
+
+  -- Phase 5.1: a published entry is not automatically verified. The stricter
+  -- tier is the review requirement, not an optional label.
+  if v_entry.evidence_tier <> 'verified' then
+    raise exception 'Rule % cites % evidence, not verified published knowledge. It cannot be activated.',
+      p_code, v_entry.evidence_tier
+      using errcode = 'check_violation';
+  end if;
+
+  if not exists (
+    select 1 from public.intel_sources s
+     where s.code = v_rule.source_code
+       and s.kind = 'forecast_risk'
+       and s.is_active
+  ) then
+    raise exception 'Rule % cites an inactive or non-forecast source.', p_code using errcode = 'check_violation';
+  end if;
+
+  update public.forecast_risk_rules
+     set is_active       = true,
+         activated_at    = now(),
+         activated_by    = v_actor,
+         activation_note = btrim(p_note)
+   where code = p_code
+  returning * into v_rule;
+
+  perform public.write_audit(
+    'intel.risk_rule_activated', 'forecast_risk_rules', null, p_code,
+    'inactive', 'active',
+    jsonb_build_object(
+      'threshold', v_rule.threshold,
+      'metric', v_rule.metric,
+      'citation', v_entry.slug,
+      'evidence_tier', v_entry.evidence_tier
+    ),
+    v_actor, 'admin'
+  );
+
+  return v_rule;
+end;
+$$;
+
+comment on function public.activate_forecast_risk_rule(text, text) is
+  'Admin-only. Requires a note, a published entry at evidence_tier=verified and an active forecast source. An interpretation with supplementary evidence cannot be activated.';
+
+-- Optional model confidence, never inferred from a threshold. A producer that
+-- knows the provider's confidence can store it; otherwise it remains NULL and
+-- the alert does not invent one.
+alter table public.forecast_risks
+  add column if not exists confidence numeric
+    check (confidence is null or (confidence between 0 and 1));
+
+comment on column public.forecast_risks.confidence is
+  'Optional provider/model confidence in this risk. NULL means the provider did not give one; the alert does not substitute a made-up number.';
+
+-- ---------------------------------------------------------------------------
+-- Canonical alert provenance
+-- ---------------------------------------------------------------------------
+alter table public.recommendations
+  add column if not exists alert_source_kind text;
+
+update public.recommendations
+   set alert_source_kind = case
+     when source = 'weather' then 'weather_observation'
+     else 'knowledge'
+   end
+ where alert_level is not null
+   and alert_source_kind is null;
+
+alter table public.recommendations
+  drop constraint if exists recommendations_alert_provenance_check;
+
+alter table public.recommendations
+  add constraint recommendations_alert_provenance_check
+    check (
+      (alert_level is null and alert_source_kind is null)
+      or (
+        alert_level is not null
+        and alert_source_kind in ('weather_observation', 'knowledge', 'official_advisory', 'forecast_risk')
+      )
+    );
+
+comment on column public.recommendations.alert_source_kind is
+  'What kind of evidence produced this alert. Distinguishes an observed weather reading, curated knowledge, a verified official advisory and a modelled forecast risk even when they share the recommendation table and notification pointer.';
+
+-- ---------------------------------------------------------------------------
+-- The Phase 5 producer, extended in place
+-- ---------------------------------------------------------------------------
+create or replace function public.refresh_farmer_alerts(p_farmer_id uuid)
+returns integer
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_pair       uuid;
+  v_pref       jsonb := '{}'::jsonb;
+  v_in_app     boolean := true;
+  v_push       boolean := false;
+  v_categories text[];
+  v_lat        double precision;
+  v_lon        double precision;
+  v_area       text;
+  v_district   text;
+  v_crop       record;
+  v_weather    record;
+  v_rule       public.alert_rules%rowtype;
+  v_match      record;
+  v_adv        record;
+  v_risk       record;
+  v_rec        uuid;
+  v_count      integer := 0;
+  v_live       integer := 0;
+  v_max        integer := 3;
+  v_refresh    integer := 15;
+  v_rule_ver   integer := 1;
+  v_last       timestamptz;
+  v_code       integer;
+  v_dedupe     text;
+  v_body_en    text;
+  v_body_ur    text;
+  v_title_en   text;
+  v_title_ur   text;
+  v_kind       text;
+  v_source_url text;
+  v_source_label text;
+  v_valid_until timestamptz;
+  v_source_kind text;
+  v_risk_confidence numeric;
+begin
+  if p_farmer_id is null then
+    raise exception 'A farmer is required.' using errcode = 'invalid_parameter_value';
+  end if;
+
+  perform pg_advisory_xact_lock(hashtextextended('alerts:' || p_farmer_id::text, 0));
+
+  select coalesce((value #>> '{}')::integer, 3) into v_max
+    from public.intelligence_config where key = 'alert_max_per_farmer';
+  select coalesce((value #>> '{}')::integer, 15) into v_refresh
+    from public.intelligence_config where key = 'alert_refresh_minutes';
+  select coalesce((value #>> '{}')::integer, 1) into v_rule_ver
+    from public.intelligence_config where key = 'alert_rule_version';
+
+  select value into v_pref
+    from public.farmer_preferences
+   where farmer_id = p_farmer_id and key = 'alerts';
+  if v_pref is null or jsonb_typeof(v_pref) <> 'object' then
+    v_pref := '{}'::jsonb;
+  end if;
+
+  v_in_app := coalesce((v_pref->>'in_app')::boolean, true);
+  v_push := coalesce((v_pref->>'push')::boolean, false);
+  if not v_in_app and not v_push then
+    return 0;
+  end if;
+
+  if jsonb_typeof(v_pref->'categories') = 'array' then
+    select coalesce(array_agg(value), array[]::text[])
+      into v_categories
+      from jsonb_array_elements_text(v_pref->'categories') value
+     where value in ('weather', 'pest', 'disease', 'crop_stage');
+  else
+    v_categories := array['weather', 'pest', 'disease', 'crop_stage']::text[];
+  end if;
+  if cardinality(v_categories) = 0 then
+    return 0;
+  end if;
+
+  select default_lat, default_lon, default_location_label
+    into v_lat, v_lon, v_area
+    from public.farmer_profiles
+   where party_id = p_farmer_id;
+
+  if v_lat is null or v_lon is null then
+    return 0;
+  end if;
+
+  -- A district is the region unit both official advisories and forecast risks
+  -- use. Prefer the explicit profile value; fall back to the saved area label so
+  -- a farmer whose district has not been separately captured is not silently
+  -- treated as regionless.
+  select nullif(btrim(ip.district), '')
+    into v_district
+    from public.farmer_intelligence_profiles ip
+   where ip.farmer_id = p_farmer_id;
+
+  if v_district is null and v_area is not null then
+    select d.name_en
+      into v_district
+      from public.districts d
+     where d.is_active
+       and (
+         v_area ilike '%' || d.name_en || '%'
+         or v_area ilike '%' || d.name_ur || '%'
+       )
+     order by length(d.name_en) desc
+     limit 1;
+  end if;
+
+  select id, crop_code, stage
+    into v_crop
+    from public.crop_instances
+   where farmer_id = p_farmer_id and closed_at is null
+   order by is_primary desc, created_at
+   limit 1;
+
+  if not found then
+    return 0;
+  end if;
+
+  select alerts_refreshed_at into v_last
+    from public.farmer_intelligence_profiles
+   where farmer_id = p_farmer_id;
+  if v_last is not null and v_last > now() - make_interval(mins => greatest(1, least(v_refresh, 360))) then
+    return 0;
+  end if;
+
+  -- Retire this farmer's expired alerts before counting the live cap. A stale
+  -- row must not keep a new observation out through the unique dedupe index.
+  update public.recommendations
+     set withdrawn_at = now(),
+         withdraw_reason = 'alert validity window passed'
+   where farmer_id = p_farmer_id
+     and alert_level is not null
+     and withdrawn_at is null
+     and valid_until is not null
+     and valid_until <= now();
+
+  select count(*) into v_live
+    from public.recommendations
+   where farmer_id = p_farmer_id
+     and alert_level is not null
+     and withdrawn_at is null
+     and (valid_until is null or valid_until > now());
+
+  -- Direct observed weather. This is a WMO condition, not an inferred pest
+  -- outbreak and not a threshold claimed to be agronomic advice.
+  select w.*, wr.condition_code
+    into v_weather
+    from public.farmer_profiles fp
+    cross join lateral public.latest_weather(fp.default_lat, fp.default_lon) w
+    join public.weather_readings wr
+      on wr.provider_code = w.provider_code
+     and wr.observed_at = w.observed_at
+     and wr.lat_cell = round(fp.default_lat::numeric, 3)
+     and wr.lon_cell = round(fp.default_lon::numeric, 3)
+   where fp.party_id = p_farmer_id
+     and w.is_usable
+     and wr.condition_code ~ '^[0-9]{1,3}$'
+   order by wr.observed_at desc
+   limit 1;
+
+  if found and v_live < v_max then
+    v_code := v_weather.condition_code::integer;
+
+    select * into v_rule
+      from public.alert_rules r
+     where r.is_active
+       and r.source_kind = 'weather_observation'
+       and r.category = any (v_categories)
+       and exists (
+         select 1
+           from jsonb_array_elements_text(r.condition->'condition_codes') elem
+          where elem::integer = v_code
+       )
+     order by r.priority
+     limit 1;
+
+    if found then
+      v_dedupe := 'alert:weather:' || v_rule.code || ':' || v_weather.provider_code || ':'
+        || v_code::text || ':' || to_char(v_weather.observed_at at time zone 'Asia/Karachi', 'YYYYMMDDHH24');
+
+      if not exists (
+        select 1 from public.recommendations r
+         where r.farmer_id = p_farmer_id
+           and r.alert_rule_code = v_rule.code
+           and r.withdrawn_at is null
+           and (r.valid_until is null or r.valid_until > now())
+      ) and not exists (
+        select 1 from public.recommendations r
+         where r.farmer_id = p_farmer_id
+           and r.alert_rule_code = v_rule.code
+           and r.alert_at > now() - make_interval(mins => v_rule.cooldown_minutes)
+      ) and (
+        select count(*) from public.recommendations r
+         where r.farmer_id = p_farmer_id
+           and r.alert_rule_code = v_rule.code
+           and r.alert_at > now() - interval '24 hours'
+      ) < v_rule.daily_cap then
+        v_title_en := v_rule.title_en;
+        v_title_ur := v_rule.title_ur;
+        v_body_en := format(v_rule.body_en, coalesce(v_weather.condition_text, 'Weather'), to_char(v_weather.observed_at at time zone 'Asia/Karachi', 'DD/MM HH24:MI'));
+        v_body_ur := format(v_rule.body_ur, coalesce(v_weather.condition_text, 'موسم'), to_char(v_weather.observed_at at time zone 'Asia/Karachi', 'DD/MM HH24:MI'));
+        v_valid_until := now() + make_interval(mins => v_rule.valid_for_minutes);
+
+        v_rec := null;
+        insert into public.recommendations (
+          farmer_id, crop_id, kind, title, title_ur, body, body_ur,
+          action_label, action_label_ur, action_kind,
+          source, source_ref, source_label, source_url,
+          confidence, valid_until, priority, dedupe_key,
+          evidence_tier, reason_code, reason_context, rule_version,
+          alert_level, alert_at, alert_rule_code, alert_source_kind
+        ) values (
+          p_farmer_id, v_crop.id, 'weather', v_title_en, v_title_ur, v_body_en, v_body_ur,
+          'Check weather', 'موسم دیکھیں', 'open_weather',
+          'weather', 'weather:' || v_weather.provider_code, v_weather.provider_name, null,
+          0.95, v_valid_until, v_rule.priority, v_dedupe,
+          null, 'weather_observation',
+          jsonb_strip_nulls(jsonb_build_object(
+            'crop_code', v_crop.crop_code,
+            'stage', v_crop.stage,
+            'condition_code', v_code,
+            'observed_at', v_weather.observed_at,
+            'area_label', left(coalesce(v_area, ''), 120)
+          )),
+          v_rule_ver, v_rule.level, now(), v_rule.code, 'weather_observation'
+        )
+        on conflict (farmer_id, dedupe_key) where withdrawn_at is null do nothing
+        returning id into v_rec;
+
+        if v_rec is not null then
+          v_count := v_count + 1;
+          v_live := v_live + 1;
+          if v_in_app then
+            insert into public.notification_events (
+              party_id, kind, recommendation_id, delivered_channels
+            ) values (
+              p_farmer_id, 'weather_alert', v_rec, array['in_app']::text[]
+            )
+            on conflict do nothing;
+          end if;
+          perform public.write_audit(
+            'alert.generated', 'recommendations', v_rec, v_rule.code,
+            null, v_rule.level,
+            jsonb_build_object('source', 'weather_observation', 'condition_code', v_code)
+          );
+        end if;
+      end if;
+    end if;
+  end if;
+
+  -- Time-bound, reviewed knowledge campaigns. This loop can only see a rule a
+  -- reviewer created with a start and end; a published entry alone never fires.
+  if v_live < v_max then
+    for v_match in
+      select
+        r.code as rule_code,
+        r.level,
+        r.category,
+        r.priority,
+        r.valid_for_minutes,
+        r.cooldown_minutes,
+        r.daily_cap,
+        r.ends_at,
+        r.version as rule_version,
+        e.slug,
+        e.version as entry_version,
+        e.title_en,
+        e.title_ur,
+        e.body_en,
+        e.body_ur,
+        e.topic,
+        e.problem_type,
+        e.evidence_tier,
+        e.regions,
+        c.id as crop_id,
+        c.crop_code,
+        c.stage,
+        e.source_url as entry_source_url,
+        src.publisher,
+        src.name as source_name,
+        src.url as source_url
+      from public.alert_rules r
+      join public.agri_knowledge_entries e on e.id = r.knowledge_entry_id
+      join public.crop_instances c
+        on c.farmer_id = p_farmer_id
+       and c.closed_at is null
+       and (r.crop_code is null or r.crop_code = c.crop_code)
+       and c.stage = r.stage
+      left join public.agri_knowledge_sources src on src.code = e.source_code
+     where r.is_active
+       and r.source_kind = 'knowledge'
+       and r.starts_at <= now()
+       and r.ends_at > now()
+       and r.category = any (v_categories)
+       and e.is_published
+       and e.evidence_tier = 'verified'
+       and (
+         e.regions is null
+         or cardinality(e.regions) = 0
+         or 'Punjab' = any (e.regions)
+         or exists (
+           select 1 from public.farmer_intelligence_profiles ip
+            where ip.farmer_id = p_farmer_id
+              and ip.district is not null
+              and ip.district = any (e.regions)
+         )
+       )
+     order by r.priority, e.slug, c.id
+    loop
+      exit when v_live >= v_max;
+
+      if not exists (
+        select 1 from public.recommendations r
+         where r.farmer_id = p_farmer_id
+           and r.alert_rule_code = v_match.rule_code
+           and r.withdrawn_at is null
+           and (r.valid_until is null or r.valid_until > now())
+      ) and not exists (
+        select 1 from public.recommendations r
+         where r.farmer_id = p_farmer_id
+           and r.alert_rule_code = v_match.rule_code
+           and r.alert_at > now() - make_interval(mins => v_match.cooldown_minutes)
+      ) then
+        -- The curated rule's category is authoritative for feed filtering and
+        -- for the action we offer; the knowledge topic is supporting context.
+        v_kind := case v_match.category
+          when 'pest' then 'pest'
+          when 'disease' then 'disease'
+          when 'weather' then 'weather'
+          else 'crop_stage'
+        end;
+
+        v_dedupe := 'alert:knowledge:' || v_match.rule_code || ':' || v_match.crop_id::text
+          || ':v' || v_match.rule_version::text;
+        v_source_url := case
+          when coalesce(v_match.entry_source_url, v_match.source_url) ~ '^https://'
+            then coalesce(v_match.entry_source_url, v_match.source_url)
+          else null
+        end;
+        v_source_label := coalesce(v_match.publisher, v_match.source_name, 'Farmer App editorial notes');
+        v_valid_until := least(v_match.ends_at, now() + make_interval(mins => v_match.valid_for_minutes));
+
+        v_rec := null;
+        insert into public.recommendations (
+          farmer_id, crop_id, kind, title, title_ur, body, body_ur,
+          action_label, action_label_ur, action_kind,
+          source, source_ref, source_label, source_url,
+          confidence, knowledge_version, valid_until, priority, dedupe_key,
+          evidence_tier, reason_code, reason_context, rule_version,
+          alert_level, alert_at, alert_rule_code, alert_source_kind
+        ) values (
+          p_farmer_id, v_match.crop_id, v_kind, v_match.title_en, v_match.title_ur,
+          v_match.body_en, v_match.body_ur,
+          case when v_kind in ('pest', 'disease') then 'Scan the crop' else 'Open crop' end,
+          case when v_kind in ('pest', 'disease') then 'فصل اسکین کریں' else 'فصل کھولیں' end,
+          case when v_kind in ('pest', 'disease') then 'open_scan' else 'open_crop' end,
+          'knowledge_base', v_match.slug, v_source_label, v_source_url,
+          0.95, v_match.entry_version, v_valid_until, v_match.priority, v_dedupe,
+          v_match.evidence_tier, 'crop_stage',
+          jsonb_strip_nulls(jsonb_build_object(
+            'crop_code', v_match.crop_code,
+            'stage', v_match.stage,
+            'topic', v_match.topic,
+            'rule', v_match.rule_code
+          )),
+          v_match.rule_version, v_match.level, now(), v_match.rule_code, 'knowledge'
+        )
+        on conflict (farmer_id, dedupe_key) where withdrawn_at is null do nothing
+        returning id into v_rec;
+
+        if v_rec is not null then
+          v_count := v_count + 1;
+          v_live := v_live + 1;
+          if v_in_app then
+            insert into public.notification_events (
+              party_id, kind, recommendation_id, delivered_channels
+            ) values (
+              p_farmer_id, 'recommendation', v_rec, array['in_app']::text[]
+            )
+            on conflict do nothing;
+          end if;
+          perform public.write_audit(
+            'alert.generated', 'recommendations', v_rec, v_match.rule_code,
+            null, v_match.level,
+            jsonb_build_object('source', 'knowledge', 'slug', v_match.slug)
+          );
+        end if;
+      end if;
+    end loop;
+  end if;
+
+  -- Verified official advisories. Unverified rows are invisible at the table
+  -- read policy and are filtered here again; the review act is admin-only and
+  -- requires the source URL, district and future validity window.
+  if v_district is not null and v_live < v_max then
+    for v_adv in
+      select
+        a.id as advisory_id,
+        a.title,
+        a.title_ur,
+        a.summary,
+        a.summary_ur,
+        a.topic,
+        a.alert_level,
+        a.source_code,
+        a.source_ref,
+        a.source_url,
+        a.published_at,
+        a.valid_until,
+        c.id as crop_id,
+        c.crop_code,
+        c.stage,
+        src.name as source_name
+      from public.agri_advisories a
+      join public.intel_sources src
+        on src.code = a.source_code
+       and src.is_active
+       and src.kind = 'official_advisory'
+      join public.crop_instances c
+        on c.farmer_id = p_farmer_id
+       and c.closed_at is null
+       and (a.crop_code is null or a.crop_code = c.crop_code)
+     where a.is_active
+       and a.verification_status = 'verified'
+       and a.published_at <= now()
+       and a.valid_until is not null
+       and a.valid_until > now()
+       and a.district is not null
+       and lower(btrim(a.district)) = lower(btrim(v_district))
+       and a.alert_level is not null
+       and (case a.topic
+         when 'pest' then 'pest'
+         when 'disease' then 'disease'
+         when 'weather_damage' then 'weather'
+         when 'water' then 'weather'
+         else 'crop_stage'
+       end) = any (v_categories)
+     order by
+       case a.alert_level when 'urgent' then 0 when 'watch' then 1 else 2 end,
+       a.published_at desc,
+       c.id
+    loop
+      exit when v_live >= v_max;
+
+      v_dedupe := 'alert:advisory:' || v_adv.advisory_id::text || ':' || v_adv.crop_id::text;
+
+      if not exists (
+        select 1 from public.recommendations r
+         where r.farmer_id = p_farmer_id
+           and r.dedupe_key = v_dedupe
+      ) then
+        v_kind := case v_adv.topic
+          when 'pest' then 'pest'
+          when 'disease' then 'disease'
+          when 'weather_damage' then 'weather'
+          when 'water' then 'weather'
+          else 'crop_stage'
+        end;
+        v_source_url := case
+          when v_adv.source_url ~ '^https://[^[:space:]]+$' then v_adv.source_url
+          else null
+        end;
+        v_source_label := v_adv.source_name;
+        v_valid_until := v_adv.valid_until;
+
+        v_rec := null;
+        insert into public.recommendations (
+          farmer_id, crop_id, kind, title, title_ur, body, body_ur,
+          action_label, action_label_ur, action_kind,
+          source, source_ref, source_label, source_url,
+          confidence, valid_until, priority, dedupe_key,
+          evidence_tier, reason_code, reason_context, rule_version,
+          alert_level, alert_at, alert_rule_code, alert_source_kind
+        ) values (
+          p_farmer_id, v_adv.crop_id, v_kind, v_adv.title, coalesce(v_adv.title_ur, v_adv.title),
+          v_adv.summary, coalesce(v_adv.summary_ur, v_adv.summary),
+          'Open crop', 'فصل کھولیں', 'open_crop',
+          'knowledge_base', 'official_advisory:' || v_adv.advisory_id::text,
+          v_source_label, v_source_url,
+          null, v_valid_until, 10, v_dedupe,
+          'verified', 'official_advisory',
+          jsonb_strip_nulls(jsonb_build_object(
+            'crop_code', v_adv.crop_code,
+            'stage', v_adv.stage,
+            'topic', v_adv.topic,
+            'district', v_district,
+            'source_code', v_adv.source_code,
+            'source_ref', v_adv.source_ref,
+            'published_at', v_adv.published_at,
+            'advisory_id', v_adv.advisory_id
+          )),
+          v_rule_ver, v_adv.alert_level, now(),
+          'advisory:' || v_adv.advisory_id::text, 'official_advisory'
+        )
+        on conflict (farmer_id, dedupe_key) where withdrawn_at is null do nothing
+        returning id into v_rec;
+
+        if v_rec is not null then
+          v_count := v_count + 1;
+          v_live := v_live + 1;
+          if v_in_app then
+            insert into public.notification_events (
+              party_id, kind, recommendation_id, delivered_channels
+            ) values (
+              p_farmer_id, 'recommendation', v_rec, array['in_app']::text[]
+            )
+            on conflict do nothing;
+          end if;
+          perform public.write_audit(
+            'alert.generated', 'recommendations', v_rec,
+            'advisory:' || v_adv.advisory_id::text,
+            null, v_adv.alert_level,
+            jsonb_build_object(
+              'source', 'official_advisory',
+              'source_code', v_adv.source_code,
+              'advisory_id', v_adv.advisory_id,
+              'district', v_district
+            )
+          );
+        end if;
+      end if;
+    end loop;
+  end if;
+
+  -- Model-derived risks. A row is eligible only when its rule is active, the
+  -- rule's cited knowledge is published and verified, the source is an active
+  -- forecast source, and district/crop/stage match this farmer. An inactive rule
+  -- (the only state this repository ships) cannot produce an alert even if a
+  -- stale risk row exists.
+  if v_district is not null and v_live < v_max then
+    for v_risk in
+      select
+        k.id as risk_id,
+        k.rule_code,
+        k.topic,
+        k.title,
+        k.title_ur,
+        k.summary,
+        k.summary_ur,
+        k.risk_on,
+        k.issued_on,
+        k.expires_at,
+        k.confidence,
+        k.metric,
+        k.operator,
+        k.threshold,
+        k.observed_value,
+        k.basis,
+        k.district_code,
+        r.source_code,
+        e.slug as entry_slug,
+        e.evidence_tier,
+        e.applies_to_stages,
+        e.source_url as entry_source_url,
+        src.name as source_name,
+        src.endpoint_url as source_endpoint_url,
+        d.name_en as district_name,
+        c.id as crop_id,
+        c.crop_code,
+        c.stage
+      from public.forecast_risks k
+      join public.forecast_risk_rules r
+        on r.code = k.rule_code
+       and r.is_active
+      join public.agri_knowledge_entries e
+        on e.id = r.knowledge_entry_id
+       and e.is_published
+       and e.evidence_tier = 'verified'
+      join public.intel_sources src
+        on src.code = r.source_code
+       and src.is_active
+       and src.kind = 'forecast_risk'
+      join public.districts d
+        on d.code = k.district_code
+       and d.is_active
+      join public.crop_instances c
+        on c.farmer_id = p_farmer_id
+       and c.closed_at is null
+       and (k.crop_code is null or k.crop_code = c.crop_code)
+       and (
+         e.applies_to_stages is null
+         or cardinality(e.applies_to_stages) = 0
+         or c.stage = any (e.applies_to_stages)
+       )
+     where k.expires_at > now()
+       and k.observed_at <= now()
+       and (
+         lower(d.name_en) = lower(btrim(v_district))
+         or lower(d.name_ur) = lower(btrim(v_district))
+       )
+       and (case k.topic
+         when 'pest' then 'pest'
+         when 'disease' then 'disease'
+         when 'weather_damage' then 'weather'
+         when 'water' then 'weather'
+         else 'crop_stage'
+       end) = any (v_categories)
+     order by k.risk_on, k.expires_at, c.id
+    loop
+      exit when v_live >= v_max;
+
+      v_dedupe := 'alert:forecast:' || v_risk.risk_id::text;
+
+      if not exists (
+        select 1 from public.recommendations r
+         where r.farmer_id = p_farmer_id
+           and r.dedupe_key = v_dedupe
+      ) then
+        v_kind := case v_risk.topic
+          when 'pest' then 'pest'
+          when 'disease' then 'disease'
+          when 'weather_damage' then 'weather'
+          when 'water' then 'weather'
+          else 'crop_stage'
+        end;
+        v_source_url := case
+          when v_risk.entry_source_url ~ '^https://[^[:space:]]+$' then v_risk.entry_source_url
+          when v_risk.source_endpoint_url ~ '^https://[^[:space:]]+$' then v_risk.source_endpoint_url
+          else null
+        end;
+        v_source_label := v_risk.source_name;
+        v_valid_until := v_risk.expires_at;
+        v_risk_confidence := v_risk.confidence;
+        v_title_en := v_risk.title;
+        v_title_ur := coalesce(v_risk.title_ur, v_risk.title);
+        v_body_en := v_risk.summary;
+        v_body_ur := coalesce(v_risk.summary_ur, v_risk.summary);
+
+        v_rec := null;
+        insert into public.recommendations (
+          farmer_id, crop_id, kind, title, title_ur, body, body_ur,
+          action_label, action_label_ur, action_kind,
+          source, source_ref, source_label, source_url,
+          confidence, valid_until, priority, dedupe_key,
+          evidence_tier, reason_code, reason_context, rule_version,
+          alert_level, alert_at, alert_rule_code, alert_source_kind
+        ) values (
+          p_farmer_id, v_risk.crop_id, v_kind, v_title_en, v_title_ur, v_body_en, v_body_ur,
+          case when v_kind = 'weather' then 'Check weather' else 'Open crop' end,
+          case when v_kind = 'weather' then 'موسم دیکھیں' else 'فصل کھولیں' end,
+          case when v_kind = 'weather' then 'open_weather' else 'open_crop' end,
+          'weather', 'forecast_risk:' || v_risk.rule_code,
+          v_source_label, v_source_url,
+          v_risk_confidence, v_valid_until, 20, v_dedupe,
+          null, 'forecast_risk',
+          jsonb_strip_nulls(jsonb_build_object(
+            'crop_code', v_risk.crop_code,
+            'stage', v_risk.stage,
+            'topic', v_risk.topic,
+            'district_code', v_risk.district_code,
+            'district', v_risk.district_name,
+            'risk_on', v_risk.risk_on,
+            'issued_on', v_risk.issued_on,
+            'metric', v_risk.metric,
+            'operator', v_risk.operator,
+            'threshold', v_risk.threshold,
+            'observed_value', v_risk.observed_value,
+            'basis', v_risk.basis,
+            'rule', v_risk.rule_code,
+            'knowledge', v_risk.entry_slug
+          )),
+          v_rule_ver, 'watch', now(),
+          'forecast:' || v_risk.rule_code, 'forecast_risk'
+        )
+        on conflict (farmer_id, dedupe_key) where withdrawn_at is null do nothing
+        returning id into v_rec;
+
+        if v_rec is not null then
+          v_count := v_count + 1;
+          v_live := v_live + 1;
+          if v_in_app then
+            insert into public.notification_events (
+              party_id, kind, recommendation_id, delivered_channels
+            ) values (
+              p_farmer_id, 'recommendation', v_rec, array['in_app']::text[]
+            )
+            on conflict do nothing;
+          end if;
+          perform public.write_audit(
+            'alert.generated', 'recommendations', v_rec,
+            'forecast:' || v_risk.rule_code,
+            null, 'watch',
+            jsonb_build_object(
+              'source', 'forecast_risk',
+              'risk_id', v_risk.risk_id,
+              'district_code', v_risk.district_code,
+              'knowledge', v_risk.entry_slug
+            )
+          );
+        end if;
+      end if;
+    end loop;
+  end if;
+
+  insert into public.farmer_intelligence_profiles (farmer_id, alerts_refreshed_at)
+  values (p_farmer_id, now())
+  on conflict (farmer_id) do update
+    set alerts_refreshed_at = excluded.alerts_refreshed_at,
+        updated_at = now();
+
+  perform public.write_audit(
+    'alerts.refreshed', 'farmer_intelligence_profiles', p_farmer_id, null,
+    null, v_count::text,
+    jsonb_build_object('generated', v_count, 'live', v_live, 'rule_version', v_rule_ver)
+  );
+
+  return v_count;
+end;
+$$;
+
+comment on function public.refresh_farmer_alerts(uuid) is
+  'Service-only canonical alert producer. Uses direct WMO observations, reviewed knowledge campaigns, verified official advisories and active forecast risks whose cited knowledge is published and verified. All paths are bounded by cooldown/daily caps, dedupe and live-alert caps. A forecast risk is never labelled an observation or outbreak.';
+
+revoke execute on function public.refresh_farmer_alerts(uuid) from public, anon, authenticated;
+grant execute on function public.refresh_farmer_alerts(uuid) to service_role;
+
+-- ---------------------------------------------------------------------------
+-- The existing alert read model, now carrying provenance
+-- ---------------------------------------------------------------------------
+drop function if exists public.intelligence_alert_feed(integer);
+
+create function public.intelligence_alert_feed(p_limit integer default 20)
+returns table (
+  notification_id  uuid,
+  recommendation_id uuid,
+  crop_id          uuid,
+  crop_code        text,
+  kind             text,
+  title            text,
+  title_ur         text,
+  body             text,
+  body_ur          text,
+  source           public.recommendation_source,
+  source_label     text,
+  source_url       text,
+  evidence_tier    text,
+  confidence       numeric,
+  alert_level      text,
+  alert_at         timestamptz,
+  valid_until      timestamptz,
+  is_read          boolean,
+  read_at          timestamptz,
+  created_at       timestamptz,
+  reason_code      text,
+  reason_context   jsonb,
+  action_kind      text,
+  action_label     text,
+  action_label_ur  text,
+  alert_source_kind text
+)
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+  with mine as (
+    select
+      public.current_farmer_id() as farmer_id,
+      public.current_party_id() as party_id
+  ),
+  pref as (
+    select p.value
+      from public.farmer_preferences p, mine
+     where p.farmer_id = mine.farmer_id and p.key = 'alerts'
+  )
+  select
+    n.id,
+    r.id,
+    r.crop_id,
+    ci.crop_code,
+    r.kind,
+    r.title,
+    r.title_ur,
+    r.body,
+    r.body_ur,
+    r.source,
+    r.source_label,
+    r.source_url,
+    r.evidence_tier,
+    r.confidence,
+    r.alert_level,
+    r.alert_at,
+    r.valid_until,
+    (n.read_at is not null),
+    n.read_at,
+    r.created_at,
+    r.reason_code,
+    r.reason_context,
+    r.action_kind,
+    r.action_label,
+    r.action_label_ur,
+    r.alert_source_kind
+  from public.recommendations r
+  join public.notification_events n
+    on n.recommendation_id = r.id
+   and n.party_id = (select party_id from mine)
+  left join public.crop_instances ci on ci.id = r.crop_id
+  left join pref p on true
+  where r.farmer_id = (select farmer_id from mine)
+    and r.alert_level is not null
+    and r.withdrawn_at is null
+    and (r.valid_until is null or r.valid_until > now())
+    and n.dismissed_at is null
+    and (r.crop_id is null or ci.closed_at is null)
+    and coalesce((p.value->>'in_app')::boolean, true)
+    and (
+      p.value is null
+      or jsonb_typeof(p.value->'categories') <> 'array'
+      or p.value->'categories' ? case
+        when r.kind in ('weather', 'pest', 'disease', 'crop_stage') then r.kind
+        else 'crop_stage'
+      end
+    )
+  order by
+    case r.alert_level when 'urgent' then 0 when 'watch' then 1 else 2 end,
+    r.alert_at desc,
+    r.created_at desc
+  limit greatest(1, least(coalesce(p_limit, 20), 20));
+$$;
+
+comment on function public.intelligence_alert_feed(integer) is
+  'The caller''s own live alerts, joined to the existing notification pointer and carrying alert_source_kind so weather observations, curated knowledge, verified official advisories and forecast risks cannot be confused.';
+
+revoke execute on function public.intelligence_alert_feed(integer) from public, anon;
+grant execute on function public.intelligence_alert_feed(integer) to authenticated;
+
+-- ---------------------------------------------------------------------------
+-- The public intelligence feed must not turn an unverified row into an official
+-- advisory, or serve a risk whose rule is not active with verified evidence.
+-- ---------------------------------------------------------------------------
+create or replace function public.intel_feed(
+  p_lat double precision,
+  p_lon double precision,
+  p_radius_m double precision default 10000,
+  p_crop_code text default null,
+  p_topic text default null,
+  p_limit integer default 20
+)
+returns table (
+  id uuid,
+  kind text,
+  title text,
+  summary text,
+  crop_code text,
+  topic text,
+  evidence text,
+  area_label text,
+  district text,
+  observed_at timestamptz,
+  valid_until timestamptz,
+  distance_m double precision,
+  source_code text,
+  title_ur text,
+  summary_ur text
+)
+language plpgsql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_origin extensions.geography;
+begin
+  if p_lat is null or p_lat < -90 or p_lat > 90 or p_lon is null or p_lon < -180 or p_lon > 180 then
+    raise exception 'Invalid origin: lat/lon required.' using errcode = 'check_violation';
+  end if;
+  if p_radius_m is null or p_radius_m < 1 or p_radius_m > 500000 then
+    raise exception 'Radius must be between 1 and 500000 metres.' using errcode = 'check_violation';
+  end if;
+
+  v_origin := extensions.ST_SetSRID(extensions.ST_MakePoint(p_lon, p_lat), 4326)::extensions.geography;
+
+  return query
+  with nearest_district as (
+    select d.code
+      from public.districts d
+     where d.is_active
+     order by extensions.ST_Distance(
+       extensions.ST_SetSRID(extensions.ST_MakePoint(d.hq_lon, d.hq_lat), 4326)::extensions.geography,
+       v_origin
+     )
+     limit 1
+  ),
+  reports as (
+    select
+      r.id, 'report'::text as kind, r.title, r.body as summary, r.crop_code, r.topic,
+      r.evidence, r.area_label, r.district, r.observed_at, r.expires_at as valid_until,
+      extensions.ST_Distance(r.geog, v_origin) as distance_m, r.source_code, r.cluster_id,
+      r.observed_at as sort_at, null::text as title_ur, null::text as summary_ur,
+      row_number() over (
+        partition by coalesce(r.cluster_id, r.id)
+        order by case when r.evidence = 'expert_verified' then 0 else 1 end, r.observed_at desc, r.id
+      ) as dup_rank
+    from public.crop_reports r
+    where r.status = 'published'
+      and r.visibility = 'public'
+      and r.observed_at <= now()
+      and r.expires_at > now()
+      and (p_crop_code is null or r.crop_code = p_crop_code or r.crop_code is null)
+      and (p_topic is null or r.topic = p_topic)
+      and extensions.ST_DWithin(r.geog, v_origin, p_radius_m)
+  ),
+  advisories as (
+    select
+      a.id, 'advisory'::text as kind, a.title, a.summary, a.crop_code, a.topic,
+      'official_advisory'::text as evidence, a.area_label, a.district, a.published_at as observed_at,
+      a.valid_until, null::double precision as distance_m, a.source_code, null::uuid as cluster_id,
+      a.published_at as sort_at, a.title_ur, a.summary_ur, 1 as dup_rank
+    from public.agri_advisories a
+    join public.intel_sources src
+      on src.code = a.source_code
+     and src.is_active
+     and src.kind = 'official_advisory'
+    where a.is_active
+      and a.verification_status = 'verified'
+      and a.published_at <= now()
+      and a.valid_until is not null
+      and a.valid_until > now()
+      and (p_crop_code is null or a.crop_code = p_crop_code or a.crop_code is null)
+      and (p_topic is null or a.topic = p_topic)
+      and (a.geog is null or extensions.ST_DWithin(a.geog, v_origin, p_radius_m))
+  ),
+  risks as (
+    select
+      k.id, 'risk'::text as kind, k.title,
+      k.summary, k.crop_code, k.topic,
+      'forecast_risk'::text as evidence,
+      d.name_en as area_label, d.name_en as district,
+      k.observed_at, k.expires_at as valid_until,
+      extensions.ST_Distance(
+        extensions.ST_SetSRID(extensions.ST_MakePoint(d.hq_lon, d.hq_lat), 4326)::extensions.geography,
+        v_origin
+      ) as distance_m,
+      r.source_code, null::uuid as cluster_id,
+      k.observed_at as sort_at, k.title_ur, k.summary_ur, 1 as dup_rank
+    from public.forecast_risks k
+    join public.forecast_risk_rules r
+      on r.code = k.rule_code
+     and r.is_active
+    join public.agri_knowledge_entries e
+      on e.id = r.knowledge_entry_id
+     and e.is_published
+     and e.evidence_tier = 'verified'
+    join public.intel_sources src
+      on src.code = r.source_code
+     and src.is_active
+     and src.kind = 'forecast_risk'
+    join public.districts d on d.code = k.district_code and d.is_active
+    where k.expires_at > now()
+      and (k.crop_code is null or p_crop_code is null or k.crop_code = p_crop_code)
+      and (p_topic is null or k.topic = p_topic)
+      and (
+        k.district_code = (select code from nearest_district)
+        or extensions.ST_DWithin(
+          extensions.ST_SetSRID(extensions.ST_MakePoint(d.hq_lon, d.hq_lat), 4326)::extensions.geography,
+          v_origin, p_radius_m
+        )
+      )
+  )
+  select c.id, c.kind, c.title, c.summary, c.crop_code, c.topic, c.evidence,
+         c.area_label, c.district, c.observed_at, c.valid_until, c.distance_m, c.source_code,
+         c.title_ur, c.summary_ur
+  from (select * from reports where dup_rank = 1 union all select * from advisories union all select * from risks) c
+  order by c.sort_at desc, c.id
+  limit greatest(1, least(coalesce(p_limit, 20), 100));
+end;
+$$;
+
+comment on function public.intel_feed(double precision, double precision, double precision, text, text, integer) is
+  'Dynamic-radius local intelligence: reports, verified official advisories and active forecast risks. Returns evidence on every row and no coordinates. Unverified advisories and risks without active, verified evidence are not served.';
+
+revoke all on function public.intel_feed(double precision, double precision, double precision, text, text, integer) from public;
+grant execute on function public.intel_feed(double precision, double precision, double precision, text, text, integer) to anon, authenticated, service_role;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261103001100_evidence_review.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Farmer App · migration 0043 · Phase 5.2 evidence and review management
+--
+-- This is not a second knowledge or alert engine. It is the missing review
+-- dossier around the existing agricultural content:
+--
+--   agri_knowledge_entries ─┐
+--   agri_advisories         ├─ evidence_item_id ─▶ agri_evidence_items
+--   forecast_risk_rules     ┘                         │
+--                                                     └─▶ agri_evidence_reviews
+--
+-- Publication and activation are guarded at the table boundary: a target cannot
+-- become published/verified/active unless its linked evidence is published. The
+-- separation of powers is deliberate:
+--
+--   evidence_reviewer  checks source authenticity, applicability and agronomy;
+--   content_manager    publishes already-approved evidence and targets.
+--
+-- `admin` is not either authority. An administrator may grant authority, but the
+-- grant is a recorded human decision and does not itself make anyone an
+-- agronomist. No authority, evidence, reviewer, advisory or threshold is seeded.
+
+-- ---------------------------------------------------------------------------
+-- Review authorities
+-- ---------------------------------------------------------------------------
+create table public.agri_review_authorities (
+  id                uuid primary key default gen_random_uuid(),
+  party_id          uuid not null references public.parties (id) on delete cascade,
+  authority         text not null check (authority in ('evidence_reviewer', 'content_manager')),
+  -- An empty scope means "all" and is only appropriate for a national/lead role.
+  scope_crops       text[] not null default '{}'::text[],
+  scope_districts   text[] not null default '{}'::text[],
+  granted_by        uuid references public.parties (id) on delete set null,
+  granted_at        timestamptz not null default now(),
+  revoked_at        timestamptz,
+  note              text not null,
+  unique (party_id, authority)
+);
+
+comment on table public.agri_review_authorities is
+  'Named human authority for agricultural review. Separate from admin: an administrator is not automatically an agronomist, and content publication is not agronomic approval.';
+
+create index agri_review_authorities_active_idx
+  on public.agri_review_authorities (party_id, authority)
+  where revoked_at is null;
+
+alter table public.agri_review_authorities enable row level security;
+revoke all on public.agri_review_authorities from public, anon, authenticated;
+
+create or replace function public.agri_has_authority_role(p_authority text)
+returns boolean
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+  select exists (
+    select 1 from public.agri_review_authorities a
+     where a.party_id = public.current_party_id()
+       and a.authority = p_authority
+       and a.revoked_at is null
+  );
+$$;
+
+comment on function public.agri_has_authority_role(text) is
+  'Whether the caller holds the named authority at all, regardless of scope. Used only for workspace entry, never for a specific evidence decision.';
+
+create or replace function public.agri_has_authority(
+  p_authority text,
+  p_crop      text default null,
+  p_districts text[] default '{}'::text[]
+)
+returns boolean
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+  select exists (
+    select 1
+      from public.agri_review_authorities a
+     where a.party_id = public.current_party_id()
+       and a.authority = p_authority
+       and a.revoked_at is null
+       and (
+         cardinality(a.scope_crops) = 0
+         or (p_crop is not null and p_crop = any (a.scope_crops))
+       )
+       and (
+         cardinality(a.scope_districts) = 0
+         or (cardinality(p_districts) > 0 and a.scope_districts @> p_districts)
+       )
+  );
+$$;
+
+comment on function public.agri_has_authority(text, text, text[]) is
+  'True only when the authority scope actually covers the evidence. A null crop or empty district set means all, so it requires an all-scope authority; a scoped reviewer can never widen it by omission. Admin capability is deliberately not consulted.';
+
+create or replace function public.agri_has_review_access()
+returns boolean
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+  select public.agri_has_authority_role('evidence_reviewer')
+      or public.agri_has_authority_role('content_manager');
+$$;
+
+create or replace function public.agri_review_context()
+returns jsonb
+language plpgsql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_actor uuid := public.current_party_id();
+  v_review boolean;
+  v_manage boolean;
+begin
+  if v_actor is null then
+    raise exception 'An identified account is required.' using errcode = 'insufficient_privilege';
+  end if;
+
+  v_review := public.agri_has_authority_role('evidence_reviewer');
+  v_manage := public.agri_has_authority_role('content_manager');
+
+  return jsonb_build_object(
+    'party_id', v_actor,
+    'can_review', v_review,
+    'can_manage', v_manage,
+    'can_grant', public.has_capability('admin'),
+    'authorities', coalesce((
+      select jsonb_agg(jsonb_build_object(
+        'authority', a.authority,
+        'scope_crops', a.scope_crops,
+        'scope_districts', a.scope_districts,
+        'granted_at', a.granted_at
+      ) order by a.authority)
+      from public.agri_review_authorities a
+      where a.party_id = v_actor and a.revoked_at is null
+    ), '[]'::jsonb),
+    'counts', case
+      when v_review or v_manage then (
+        select jsonb_build_object(
+          'submitted', count(*) filter (where status = 'submitted'),
+          'under_review', count(*) filter (where status = 'under_review'),
+          'correction_requested', count(*) filter (where status = 'correction_requested'),
+          'approved', count(*) filter (where status = 'approved'),
+          'published', count(*) filter (where status = 'published'),
+          'rejected', count(*) filter (where status = 'rejected'),
+          'closed', count(*) filter (where status in ('expired', 'superseded'))
+        )
+        from public.agri_evidence_items
+      )
+      else '{}'::jsonb
+    end
+  );
+end;
+$$;
+
+comment on function public.agri_review_context() is
+  'The signed-in person''s review roles, scopes and aggregate queue counts. It never exposes a role inferred from admin.';
+
+create or replace function public.grant_agri_review_authority(
+  p_party_id       uuid,
+  p_authority      text,
+  p_scope_crops    text[] default '{}'::text[],
+  p_scope_districts text[] default '{}'::text[],
+  p_note           text default null
+)
+returns public.agri_review_authorities
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_actor uuid := public.current_party_id();
+  v_row public.agri_review_authorities;
+begin
+  if not public.has_capability('admin') then
+    raise exception 'Granting review authority requires the admin capability.' using errcode = 'insufficient_privilege';
+  end if;
+  if p_authority not in ('evidence_reviewer', 'content_manager') then
+    raise exception 'Unknown review authority.' using errcode = 'check_violation';
+  end if;
+  if coalesce(btrim(p_note), '') = '' then
+    raise exception 'Granting review authority requires a note.' using errcode = 'check_violation';
+  end if;
+  if not exists (select 1 from public.parties p where p.id = p_party_id) then
+    raise exception 'Party % not found.', p_party_id using errcode = 'no_data_found';
+  end if;
+  if exists (
+    select 1 from unnest(coalesce(p_scope_crops, '{}'::text[])) c
+     where not exists (select 1 from public.crop_catalog cc where cc.code = c)
+  ) then
+    raise exception 'Review scope contains an unknown crop code.' using errcode = 'check_violation';
+  end if;
+
+  insert into public.agri_review_authorities (
+    party_id, authority, scope_crops, scope_districts, granted_by, note
+  ) values (
+    p_party_id, p_authority, coalesce(p_scope_crops, '{}'::text[]),
+    coalesce(p_scope_districts, '{}'::text[]), v_actor, btrim(p_note)
+  )
+  on conflict (party_id, authority) do update
+    set scope_crops = excluded.scope_crops,
+        scope_districts = excluded.scope_districts,
+        granted_by = excluded.granted_by,
+        granted_at = now(),
+        revoked_at = null,
+        note = excluded.note
+  returning * into v_row;
+
+  perform public.write_audit(
+    'agri.review_authority_granted', 'agri_review_authorities', v_row.id, p_authority,
+    null, 'active',
+    jsonb_build_object('party_id', p_party_id, 'scopes', jsonb_build_object(
+      'crops', v_row.scope_crops, 'districts', v_row.scope_districts
+    )),
+    v_actor, 'admin'
+  );
+
+  return v_row;
+end;
+$$;
+
+comment on function public.grant_agri_review_authority(uuid, text, text[], text[], text) is
+  'Admin-only authority grant. It records a named human decision; it never makes the grantee an agronomist and does not seed an authority.';
+
+create or replace function public.revoke_agri_review_authority(
+  p_party_id  uuid,
+  p_authority text,
+  p_note      text
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_actor uuid := public.current_party_id();
+begin
+  if not public.has_capability('admin') then
+    raise exception 'Revoking review authority requires the admin capability.' using errcode = 'insufficient_privilege';
+  end if;
+  if coalesce(btrim(p_note), '') = '' then
+    raise exception 'Revoking review authority requires a note.' using errcode = 'check_violation';
+  end if;
+
+  update public.agri_review_authorities
+     set revoked_at = now(), note = btrim(p_note)
+   where party_id = p_party_id and authority = p_authority and revoked_at is null;
+  if not found then return false; end if;
+
+  perform public.write_audit(
+    'agri.review_authority_revoked', 'agri_review_authorities', null, p_authority,
+    'active', 'revoked', jsonb_build_object('party_id', p_party_id, 'note', btrim(p_note)),
+    v_actor, 'admin'
+  );
+  return true;
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- Evidence dossier
+-- ---------------------------------------------------------------------------
+create table public.agri_evidence_items (
+  id                    uuid primary key default gen_random_uuid(),
+  evidence_key          text not null unique,
+  target_kind           text not null check (target_kind in ('knowledge_entry', 'official_advisory', 'forecast_rule')),
+  target_ref            text not null,
+  version               integer not null check (version > 0),
+  supersedes_id         uuid references public.agri_evidence_items (id) on delete set null,
+  superseded_by         uuid references public.agri_evidence_items (id) on delete set null,
+
+  source_organization   text not null check (length(btrim(source_organization)) between 1 and 240),
+  source_type           text not null check (source_type in (
+                          'official_government', 'official_extension', 'regulator',
+                          'university', 'peer_reviewed', 'qualified_expert',
+                          'supplementary_editorial', 'community', 'unknown'
+                        )),
+  source_code           text references public.agri_knowledge_sources (code) on delete set null,
+  source_url            text check (source_url is null or source_url ~ '^https://[^[:space:]]+$'),
+  document_ref          text,
+  document_title        text not null check (length(btrim(document_title)) between 1 and 400),
+  published_on          date,
+  accessed_at           timestamptz not null default now(),
+  language              text not null default 'en' check (language in ('en', 'ur', 'bilingual')),
+
+  crop_code             text references public.crop_catalog (code) on delete set null,
+  topic                 text not null default 'other' check (topic in ('pest', 'disease', 'weed', 'water', 'weather_damage', 'sowing', 'other')),
+  districts             text[] not null default '{}'::text[],
+  stages                text[] not null default '{}'::text[],
+  classification        text not null check (classification in (
+                          'official_government', 'peer_reviewed_research',
+                          'qualified_expert', 'supplementary_editorial',
+                          'unverified_submission'
+                        )),
+  confidence            numeric check (confidence is null or (confidence >= 0 and confidence <= 1)),
+
+  status                text not null default 'draft' check (status in (
+                          'draft', 'submitted', 'under_review', 'correction_requested',
+                          'approved', 'rejected', 'published', 'expired', 'superseded'
+                        )),
+  source_check_status   text not null default 'pending' check (source_check_status in ('pending', 'authentic', 'not_authentic')),
+  applicability_status  text not null default 'pending' check (applicability_status in ('pending', 'applicable', 'not_applicable')),
+  agronomic_status      text not null default 'pending' check (agronomic_status in ('pending', 'approved', 'rejected')),
+
+  submitted_by          uuid references public.parties (id) on delete set null,
+  submitted_at          timestamptz,
+  review_started_at     timestamptz,
+  reviewer_id           uuid references public.parties (id) on delete set null,
+  reviewed_at           timestamptz,
+  review_note            text,
+  rejection_reason      text,
+  correction_note       text,
+
+  valid_from            timestamptz not null default now(),
+  valid_until           timestamptz,
+  published_at          timestamptz,
+  expired_at            timestamptz,
+
+  created_by             uuid references public.parties (id) on delete set null,
+  created_at             timestamptz not null default now(),
+  updated_at             timestamptz not null default now(),
+
+  unique (target_kind, target_ref, version),
+  constraint agri_evidence_validity check (valid_until is null or valid_until > valid_from),
+  constraint agri_evidence_approved_state check (
+    status not in ('approved', 'published')
+    or (
+      source_check_status = 'authentic'
+      and applicability_status = 'applicable'
+      and agronomic_status = 'approved'
+      and reviewer_id is not null
+      and reviewed_at is not null
+      and valid_until is not null
+      and classification <> 'unverified_submission'
+    )
+  ),
+  constraint agri_evidence_published_state check (
+    status <> 'published' or published_at is not null
+  )
+);
+
+comment on table public.agri_evidence_items is
+  'One reviewable evidence dossier per content version. It records source, document, applicability, classification and the separate source/applicability/agronomy checks. Publication is a separate content-manager act.';
+
+create index agri_evidence_queue_idx on public.agri_evidence_items (status, submitted_at desc);
+create index agri_evidence_target_idx on public.agri_evidence_items (target_kind, target_ref, version desc);
+create index agri_evidence_expiry_idx on public.agri_evidence_items (valid_until) where status = 'published';
+
+alter table public.agri_evidence_items enable row level security;
+revoke all on public.agri_evidence_items from public, anon, authenticated;
+
+create table public.agri_evidence_reviews (
+  id           uuid primary key default gen_random_uuid(),
+  evidence_id  uuid not null references public.agri_evidence_items (id) on delete cascade,
+  actor_id     uuid references public.parties (id) on delete set null,
+  actor_role   text not null check (actor_role in ('evidence_reviewer', 'content_manager', 'admin', 'submitter')),
+  action       text not null check (action in (
+                 'create', 'submit', 'start_review', 'source_check',
+                 'applicability_check', 'approve', 'reject', 'request_correction',
+                 'resubmit', 'publish', 'expire', 'supersede'
+               )),
+  from_status  text,
+  to_status    text,
+  note         text,
+  detail       jsonb not null default '{}'::jsonb,
+  created_at   timestamptz not null default now()
+);
+
+comment on table public.agri_evidence_reviews is
+  'Append-only review ledger. It records every transition, the actor and the stated reason; it is never edited or deleted by a client path.';
+
+create index agri_evidence_reviews_item_idx
+  on public.agri_evidence_reviews (evidence_id, created_at desc);
+
+alter table public.agri_evidence_reviews enable row level security;
+revoke all on public.agri_evidence_reviews from public, anon, authenticated;
+
+create or replace function public.agri_block_review_ledger_mutation()
+returns trigger
+language plpgsql
+as $$
+begin
+  if session_user = 'postgres' then
+    return old;
+  end if;
+  raise exception 'The evidence review ledger is append-only.' using errcode = 'insufficient_privilege';
+end;
+$$;
+
+create trigger agri_evidence_reviews_append_only
+  before update or delete on public.agri_evidence_reviews
+  for each row execute function public.agri_block_review_ledger_mutation();
+
+create or replace function public.agri_touch_evidence()
+returns trigger
+language plpgsql
+as $$
+begin
+  new.updated_at := now();
+  return new;
+end;
+$$;
+
+create trigger agri_evidence_items_touch
+  before update on public.agri_evidence_items
+  for each row execute function public.agri_touch_evidence();
+
+-- ---------------------------------------------------------------------------
+-- Links to the existing content and recommendation objects
+-- ---------------------------------------------------------------------------
+alter table public.agri_knowledge_entries
+  add column if not exists evidence_item_id uuid references public.agri_evidence_items (id) on delete set null;
+alter table public.agri_advisories
+  add column if not exists evidence_item_id uuid references public.agri_evidence_items (id) on delete set null;
+alter table public.forecast_risk_rules
+  add column if not exists evidence_item_id uuid references public.agri_evidence_items (id) on delete set null,
+  add column if not exists version integer not null default 1 check (version > 0),
+  add column if not exists deactivated_at timestamptz,
+  add column if not exists deactivated_by uuid references public.parties (id) on delete set null,
+  add column if not exists deactivation_note text;
+alter table public.recommendations
+  add column if not exists evidence_item_id uuid references public.agri_evidence_items (id) on delete set null,
+  add column if not exists decision_trace jsonb not null default '{}'::jsonb;
+
+comment on column public.agri_knowledge_entries.evidence_item_id is
+  'The evidence dossier that authorised this version''s publication. Legacy rows may be null; a new publication cannot be.';
+comment on column public.agri_advisories.evidence_item_id is
+  'The verified evidence dossier behind an official advisory. Direct verification without a published dossier is blocked.';
+comment on column public.forecast_risk_rules.evidence_item_id is
+  'The approved evidence dossier behind an active forecast rule. Activation without a published dossier is blocked.';
+comment on column public.recommendations.evidence_item_id is
+  'The evidence item used when this decision was generated. It is a snapshot pointer; later evidence changes do not rewrite history.';
+comment on column public.recommendations.decision_trace is
+  'Reproducible internal trace for this decision: source, rule/version, evidence snapshot, farmer-context fields and eligibility reasons. No exact coordinates or other farmers'' data.';
+
+create index if not exists agri_knowledge_evidence_idx on public.agri_knowledge_entries (evidence_item_id);
+create index if not exists agri_advisories_evidence_idx on public.agri_advisories (evidence_item_id);
+create index if not exists agri_forecast_rules_evidence_idx on public.forecast_risk_rules (evidence_item_id);
+create index if not exists recommendations_evidence_idx on public.recommendations (evidence_item_id);
+
+-- ---------------------------------------------------------------------------
+-- Publication/activation guards
+-- ---------------------------------------------------------------------------
+create or replace function public.agri_guard_knowledge_publication()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  if new.is_published then
+    if new.evidence_item_id is null or not exists (
+      select 1 from public.agri_evidence_items e
+       where e.id = new.evidence_item_id
+         and e.target_kind = 'knowledge_entry'
+         and e.target_ref = new.id::text
+         and e.status = 'published'
+    ) then
+      raise exception 'Published knowledge must be linked to its published evidence dossier.' using errcode = 'check_violation';
+    end if;
+  end if;
+  return new;
+end;
+$$;
+
+create trigger agri_knowledge_publication_guard
+  before insert or update on public.agri_knowledge_entries
+  for each row execute function public.agri_guard_knowledge_publication();
+
+create or replace function public.agri_guard_advisory_publication()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  if new.verification_status = 'verified' then
+    if new.evidence_item_id is null or not exists (
+      select 1 from public.agri_evidence_items e
+       where e.id = new.evidence_item_id
+         and e.target_kind = 'official_advisory'
+         and e.target_ref = new.id::text
+         and e.status = 'published'
+    ) then
+      raise exception 'Verified advisories require a published evidence dossier.' using errcode = 'check_violation';
+    end if;
+  end if;
+  return new;
+end;
+$$;
+
+create trigger agri_advisory_publication_guard
+  before insert or update on public.agri_advisories
+  for each row execute function public.agri_guard_advisory_publication();
+
+create or replace function public.agri_guard_rule_activation()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  if new.is_active and (tg_op = 'INSERT' or not old.is_active) then
+    if new.evidence_item_id is null or not exists (
+      select 1 from public.agri_evidence_items e
+       where e.id = new.evidence_item_id
+         and e.target_kind = 'forecast_rule'
+         and e.target_ref = new.code
+         and e.status = 'published'
+    ) then
+      raise exception 'Active forecast rules require a published evidence dossier.' using errcode = 'check_violation';
+    end if;
+  end if;
+  return new;
+end;
+$$;
+
+create trigger agri_rule_activation_guard
+  before insert or update on public.forecast_risk_rules
+  for each row execute function public.agri_guard_rule_activation();
+
+-- ---------------------------------------------------------------------------
+-- Existing verification/activation paths stay in place and gain the guard.
+-- `verify_official_advisory()` and `activate_forecast_risk_rule()` keep their
+-- original source and threshold checks; their UPDATE now fails unless a
+-- published evidence dossier is already linked. The normal path is
+-- agri_publish_evidence(), which also updates the content target.
+-- ---------------------------------------------------------------------------
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261103001200_evidence_review_operations.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Farmer App · migration 0044 · Phase 5.2 evidence review operations
+--
+-- Every transition is a security-definer RPC. The reviewer identity is the JWT
+-- party; no RPC accepts a reviewer id. Content creation/submission, source and
+-- applicability verification, agronomic approval, and publication are separate
+-- acts with separate authorities.
+--
+-- The review ledger is append-only. The target rows keep their own content and
+-- version; evidence changes require a new dossier version, never an edit to an
+-- approved historical decision.
+
+create or replace function public.agri_log_evidence_event(
+  p_evidence_id uuid,
+  p_action      text,
+  p_from_status text,
+  p_to_status   text,
+  p_note        text,
+  p_detail      jsonb,
+  p_actor_role  text
+)
+returns void
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  insert into public.agri_evidence_reviews (
+    evidence_id, actor_id, actor_role, action, from_status, to_status, note, detail
+  ) values (
+    p_evidence_id, public.current_party_id(), p_actor_role, p_action,
+    p_from_status, p_to_status, nullif(btrim(p_note), ''), coalesce(p_detail, '{}'::jsonb)
+  );
+end;
+$$;
+
+revoke all on function public.agri_log_evidence_event(uuid, text, text, text, text, jsonb, text)
+  from public, anon, authenticated;
+
+-- ---------------------------------------------------------------------------
+-- Intake
+-- ---------------------------------------------------------------------------
+create or replace function public.agri_create_evidence(
+  p_target_kind          text,
+  p_target_ref           text,
+  p_source_organization  text,
+  p_source_type          text,
+  p_classification       text,
+  p_document_title       text,
+  p_topic                text default 'other',
+  p_source_url           text default null,
+  p_source_code          text default null,
+  p_document_ref         text default null,
+  p_published_on         date default null,
+  p_accessed_at          timestamptz default now(),
+  p_language             text default 'en',
+  p_crop_code            text default null,
+  p_districts            text[] default '{}'::text[],
+  p_stages               text[] default '{}'::text[],
+  p_confidence           numeric default null,
+  p_valid_from           timestamptz default now(),
+  p_valid_until          timestamptz default null,
+  p_supersedes_id        uuid default null,
+  p_submit               boolean default false
+)
+returns public.agri_evidence_items
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_actor          uuid := public.current_party_id();
+  v_label          text;
+  v_target_crop    text;
+  v_target_topic   text;
+  v_target_district text;
+  v_crop           text := p_crop_code;
+  v_topic          text := p_topic;
+  v_districts      text[] := coalesce(p_districts, '{}'::text[]);
+  v_stages         text[] := coalesce(p_stages, '{}'::text[]);
+  v_supersedes     uuid := p_supersedes_id;
+  v_version        integer;
+  v_key            text;
+  v_status         text;
+  v_item           public.agri_evidence_items;
+  v_open           uuid;
+begin
+  if v_actor is null then
+    raise exception 'An identified account is required.' using errcode = 'insufficient_privilege';
+  end if;
+  if p_target_kind not in ('knowledge_entry', 'official_advisory', 'forecast_rule') then
+    raise exception 'Unknown evidence target kind.' using errcode = 'check_violation';
+  end if;
+  if coalesce(btrim(p_source_organization), '') = '' then
+    raise exception 'A source organisation is required.' using errcode = 'check_violation';
+  end if;
+  if coalesce(btrim(p_document_title), '') = '' then
+    raise exception 'A source document title is required.' using errcode = 'check_violation';
+  end if;
+  if p_source_type not in (
+    'official_government', 'official_extension', 'regulator', 'university',
+    'peer_reviewed', 'qualified_expert', 'supplementary_editorial', 'community', 'unknown'
+  ) then
+    raise exception 'Unknown source type.' using errcode = 'check_violation';
+  end if;
+  if p_classification not in (
+    'official_government', 'peer_reviewed_research', 'qualified_expert',
+    'supplementary_editorial', 'unverified_submission'
+  ) then
+    raise exception 'Unknown evidence classification.' using errcode = 'check_violation';
+  end if;
+  if p_language not in ('en', 'ur', 'bilingual') then
+    raise exception 'Unknown evidence language.' using errcode = 'check_violation';
+  end if;
+  if p_confidence is not null and (p_confidence < 0 or p_confidence > 1) then
+    raise exception 'Confidence must be between 0 and 1.' using errcode = 'check_violation';
+  end if;
+  if p_source_url is not null and p_source_url !~ '^https://[^[:space:]]+$' then
+    raise exception 'A source URL must be a direct HTTPS reference.' using errcode = 'check_violation';
+  end if;
+  if p_source_code is not null and not exists (
+    select 1 from public.agri_knowledge_sources where code = p_source_code
+  ) then
+    raise exception 'Source registry code % not found.', p_source_code using errcode = 'no_data_found';
+  end if;
+  if p_valid_until is not null and p_valid_until <= p_valid_from then
+    raise exception 'The validity end must be after its start.' using errcode = 'check_violation';
+  end if;
+  if exists (
+    select 1 from unnest(v_stages) s
+     where not exists (
+       select 1 from unnest(enum_range(null::public.crop_stage)) e where e::text = s
+     )
+  ) then
+    raise exception 'Evidence stages must be known crop stages.' using errcode = 'check_violation';
+  end if;
+
+  if p_target_kind = 'knowledge_entry' then
+    if p_target_ref !~ '^[0-9a-fA-F-]{36}$' then
+      raise exception 'A knowledge evidence target must be a UUID.' using errcode = 'check_violation';
+    end if;
+    select title_en, crop_code, topic
+      into v_label, v_target_crop, v_target_topic
+      from public.agri_knowledge_entries
+     where id = p_target_ref::uuid;
+  elsif p_target_kind = 'official_advisory' then
+    if p_target_ref !~ '^[0-9a-fA-F-]{36}$' then
+      raise exception 'An advisory evidence target must be a UUID.' using errcode = 'check_violation';
+    end if;
+    select title, crop_code, topic, district
+      into v_label, v_target_crop, v_target_topic, v_target_district
+      from public.agri_advisories
+     where id = p_target_ref::uuid;
+  else
+    select label_en, crop_code, topic
+      into v_label, v_target_crop, v_target_topic
+      from public.forecast_risk_rules
+     where code = p_target_ref;
+  end if;
+
+  if v_label is null then
+    raise exception 'The evidence target does not exist.' using errcode = 'no_data_found';
+  end if;
+
+  -- The evidence's applicability is derived where the target states it. This
+  -- prevents a scoped manager from widening an advisory into another district
+  -- merely by sending an empty district array.
+  if v_target_crop is not null then
+    if v_crop is null then
+      v_crop := v_target_crop;
+    elsif v_crop <> v_target_crop then
+      raise exception 'The evidence crop must match the target crop.' using errcode = 'check_violation';
+    end if;
+  end if;
+
+  if v_target_district is not null then
+    if cardinality(v_districts) = 0 then
+      v_districts := array[v_target_district];
+    elsif not (v_target_district = any (v_districts)) then
+      raise exception 'The evidence districts must include the advisory district.' using errcode = 'check_violation';
+    end if;
+  end if;
+
+  if v_topic is null or v_topic = 'other' then
+    v_topic := v_target_topic;
+  elsif v_topic <> v_target_topic then
+    raise exception 'The evidence topic must match the target topic.' using errcode = 'check_violation';
+  end if;
+
+  if not public.agri_has_authority('content_manager', v_crop, v_districts) then
+    raise exception 'You need content-management authority for this crop and district scope.' using errcode = 'insufficient_privilege';
+  end if;
+
+  -- One open dossier per target. A rejected/expired/superseded dossier is closed;
+  -- a published one is replaced only through a new version.
+  select id into v_open
+    from public.agri_evidence_items
+   where target_kind = p_target_kind
+     and target_ref = p_target_ref
+     and status in ('draft', 'submitted', 'under_review', 'correction_requested', 'approved')
+   limit 1;
+  if v_open is not null then
+    raise exception 'An open evidence dossier already exists for this target.' using errcode = 'unique_violation';
+  end if;
+
+  if v_supersedes is null then
+    select id into v_supersedes
+      from public.agri_evidence_items
+     where target_kind = p_target_kind and target_ref = p_target_ref and status = 'published'
+     order by version desc limit 1;
+  else
+    if not exists (
+      select 1 from public.agri_evidence_items
+       where id = v_supersedes
+         and target_kind = p_target_kind
+         and target_ref = p_target_ref
+         and status = 'published'
+    ) then
+      raise exception 'A superseded dossier must be a published version of the same target.' using errcode = 'check_violation';
+    end if;
+  end if;
+
+  select coalesce(max(version), 0) + 1 into v_version
+    from public.agri_evidence_items
+   where target_kind = p_target_kind and target_ref = p_target_ref;
+  v_key := p_target_kind || ':' || p_target_ref || ':v' || v_version;
+  v_status := case when p_submit then 'submitted' else 'draft' end;
+
+  insert into public.agri_evidence_items (
+    evidence_key, target_kind, target_ref, version, supersedes_id,
+    source_organization, source_type, source_code, source_url, document_ref,
+    document_title, published_on, accessed_at, language,
+    crop_code, topic, districts, stages, classification, confidence,
+    status, submitted_by, submitted_at, valid_from, valid_until, created_by
+  ) values (
+    v_key, p_target_kind, p_target_ref, v_version, v_supersedes,
+    btrim(p_source_organization), p_source_type, p_source_code,
+    nullif(btrim(p_source_url), ''), nullif(btrim(p_document_ref), ''),
+    btrim(p_document_title), p_published_on, coalesce(p_accessed_at, now()), p_language,
+    v_crop, v_topic, v_districts, v_stages, p_classification, p_confidence,
+    v_status,
+    case when p_submit then v_actor else null end,
+    case when p_submit then now() else null end,
+    coalesce(p_valid_from, now()), p_valid_until, v_actor
+  )
+  returning * into v_item;
+
+  perform public.agri_log_evidence_event(
+    v_item.id, 'create', null, v_status,
+    'Evidence dossier created for ' || v_label,
+    jsonb_build_object('target_kind', p_target_kind, 'target_ref', p_target_ref, 'version', v_version),
+    'content_manager'
+  );
+  if p_submit then
+    perform public.agri_log_evidence_event(
+      v_item.id, 'submit', 'draft', 'submitted', 'Submitted for review', '{}'::jsonb, 'content_manager'
+    );
+  end if;
+
+  perform public.write_audit(
+    'agri.evidence_created', 'agri_evidence_items', v_item.id, p_target_ref,
+    null, v_item.status,
+    jsonb_build_object('target_kind', p_target_kind, 'version', v_version, 'classification', p_classification),
+    v_actor, 'content_manager'
+  );
+  return v_item;
+end;
+$$;
+
+comment on function public.agri_create_evidence(text, text, text, text, text, text, text, text, text, text, date, timestamptz, text, text, text[], text[], numeric, timestamptz, timestamptz, uuid, boolean) is
+  'Content-manager intake. Derives crop/topic/district from the target, blocks a second open dossier, versions automatically, and records the creator from the session.';
+
+create or replace function public.agri_submit_evidence(p_evidence_id uuid)
+returns public.agri_evidence_items
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_actor uuid := public.current_party_id();
+  v_item public.agri_evidence_items;
+begin
+  select * into v_item from public.agri_evidence_items where id = p_evidence_id for update;
+  if not found then
+    raise exception 'Evidence dossier not found.' using errcode = 'no_data_found';
+  end if;
+  if not public.agri_has_authority('content_manager', v_item.crop_code, v_item.districts) then
+    raise exception 'You need content-management authority for this evidence.' using errcode = 'insufficient_privilege';
+  end if;
+  if v_item.status not in ('draft', 'correction_requested') then
+    raise exception 'Only a draft or correction-requested dossier can be submitted.' using errcode = 'check_violation';
+  end if;
+
+  update public.agri_evidence_items
+     set status = 'submitted',
+         submitted_by = v_actor,
+         submitted_at = now(),
+         source_check_status = 'pending',
+         applicability_status = 'pending',
+         agronomic_status = 'pending',
+         reviewer_id = null,
+         reviewed_at = null,
+         review_started_at = null,
+         review_note = null,
+         rejection_reason = null,
+         correction_note = null
+   where id = p_evidence_id
+  returning * into v_item;
+
+  perform public.agri_log_evidence_event(
+    p_evidence_id, 'submit', 'draft', 'submitted', 'Submitted for review', '{}'::jsonb, 'content_manager'
+  );
+  return v_item;
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- Review acts
+-- ---------------------------------------------------------------------------
+create or replace function public.agri_start_review(p_evidence_id uuid)
+returns public.agri_evidence_items
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_actor uuid := public.current_party_id();
+  v_item public.agri_evidence_items;
+begin
+  select * into v_item from public.agri_evidence_items where id = p_evidence_id for update;
+  if not found then
+    raise exception 'Evidence dossier not found.' using errcode = 'no_data_found';
+  end if;
+  if not public.agri_has_authority('evidence_reviewer', v_item.crop_code, v_item.districts) then
+    raise exception 'You need evidence-reviewer authority for this crop and district scope.' using errcode = 'insufficient_privilege';
+  end if;
+  if v_item.status = 'under_review' and v_item.reviewer_id = v_actor then
+    return v_item;
+  end if;
+  if v_item.status <> 'submitted' then
+    raise exception 'Only a submitted dossier can enter review.' using errcode = 'check_violation';
+  end if;
+  if v_item.created_by = v_actor or v_item.submitted_by = v_actor then
+    raise exception 'A reviewer cannot review evidence they created or submitted.' using errcode = 'check_violation';
+  end if;
+
+  update public.agri_evidence_items
+     set status = 'under_review',
+         reviewer_id = v_actor,
+         review_started_at = now()
+   where id = p_evidence_id
+  returning * into v_item;
+
+  perform public.agri_log_evidence_event(
+    p_evidence_id, 'start_review', 'submitted', 'under_review',
+    'Review started', '{}'::jsonb, 'evidence_reviewer'
+  );
+  return v_item;
+end;
+$$;
+
+create or replace function public.agri_set_source_check(
+  p_evidence_id uuid,
+  p_status      text,
+  p_note        text
+)
+returns public.agri_evidence_items
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_actor uuid := public.current_party_id();
+  v_item public.agri_evidence_items;
+begin
+  if p_status not in ('authentic', 'not_authentic') then
+    raise exception 'Source check must be authentic or not_authentic.' using errcode = 'check_violation';
+  end if;
+  if coalesce(btrim(p_note), '') = '' then
+    raise exception 'A source check needs a note describing what was inspected.' using errcode = 'check_violation';
+  end if;
+
+  select * into v_item from public.agri_evidence_items where id = p_evidence_id for update;
+  if not found then raise exception 'Evidence dossier not found.' using errcode = 'no_data_found'; end if;
+  if not public.agri_has_authority('evidence_reviewer', v_item.crop_code, v_item.districts) then
+    raise exception 'You need evidence-reviewer authority for this evidence.' using errcode = 'insufficient_privilege';
+  end if;
+  if v_item.status <> 'under_review' or v_item.reviewer_id <> v_actor then
+    raise exception 'Only the reviewer who started the review can check its source.' using errcode = 'check_violation';
+  end if;
+
+  update public.agri_evidence_items
+     set source_check_status = p_status,
+         review_note = btrim(p_note)
+   where id = p_evidence_id
+  returning * into v_item;
+
+  perform public.agri_log_evidence_event(
+    p_evidence_id, 'source_check', 'under_review', 'under_review',
+    btrim(p_note),
+    jsonb_build_object('source_check_status', p_status), 'evidence_reviewer'
+  );
+  return v_item;
+end;
+$$;
+
+create or replace function public.agri_set_applicability_check(
+  p_evidence_id uuid,
+  p_status      text,
+  p_note        text
+)
+returns public.agri_evidence_items
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_actor uuid := public.current_party_id();
+  v_item public.agri_evidence_items;
+begin
+  if p_status not in ('applicable', 'not_applicable') then
+    raise exception 'Applicability check must be applicable or not_applicable.' using errcode = 'check_violation';
+  end if;
+  if coalesce(btrim(p_note), '') = '' then
+    raise exception 'An applicability check needs a note about crop, district and stage.' using errcode = 'check_violation';
+  end if;
+
+  select * into v_item from public.agri_evidence_items where id = p_evidence_id for update;
+  if not found then raise exception 'Evidence dossier not found.' using errcode = 'no_data_found'; end if;
+  if not public.agri_has_authority('evidence_reviewer', v_item.crop_code, v_item.districts) then
+    raise exception 'You need evidence-reviewer authority for this evidence.' using errcode = 'insufficient_privilege';
+  end if;
+  if v_item.status <> 'under_review' or v_item.reviewer_id <> v_actor then
+    raise exception 'Only the reviewer who started the review can check applicability.' using errcode = 'check_violation';
+  end if;
+
+  update public.agri_evidence_items
+     set applicability_status = p_status,
+         review_note = btrim(p_note)
+   where id = p_evidence_id
+  returning * into v_item;
+
+  perform public.agri_log_evidence_event(
+    p_evidence_id, 'applicability_check', 'under_review', 'under_review',
+    btrim(p_note),
+    jsonb_build_object('applicability_status', p_status), 'evidence_reviewer'
+  );
+  return v_item;
+end;
+$$;
+
+create or replace function public.agri_approve_evidence(
+  p_evidence_id uuid,
+  p_note        text
+)
+returns public.agri_evidence_items
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_actor uuid := public.current_party_id();
+  v_item public.agri_evidence_items;
+begin
+  if coalesce(btrim(p_note), '') = '' then
+    raise exception 'Approval requires a short review note.' using errcode = 'check_violation';
+  end if;
+
+  select * into v_item from public.agri_evidence_items where id = p_evidence_id for update;
+  if not found then raise exception 'Evidence dossier not found.' using errcode = 'no_data_found'; end if;
+  if not public.agri_has_authority('evidence_reviewer', v_item.crop_code, v_item.districts) then
+    raise exception 'You need evidence-reviewer authority for this evidence.' using errcode = 'insufficient_privilege';
+  end if;
+  if v_item.status <> 'under_review' or v_item.reviewer_id <> v_actor then
+    raise exception 'Only the reviewer who started the review can approve it.' using errcode = 'check_violation';
+  end if;
+  if v_item.source_check_status <> 'authentic' then
+    raise exception 'The source must be checked as authentic before approval.' using errcode = 'check_violation';
+  end if;
+  if v_item.applicability_status <> 'applicable' then
+    raise exception 'Crop, district and stage applicability must be checked before approval.' using errcode = 'check_violation';
+  end if;
+  if v_item.classification = 'unverified_submission' then
+    raise exception 'Unverified farmer/community material cannot be approved as guidance. Reclassify it first.' using errcode = 'check_violation';
+  end if;
+  if v_item.valid_until is null or v_item.valid_until <= now() then
+    raise exception 'Approval requires a future validity end.' using errcode = 'check_violation';
+  end if;
+  if v_item.source_url is null and v_item.document_ref is null then
+    raise exception 'Approval requires a source URL or a document reference that can be inspected.' using errcode = 'check_violation';
+  end if;
+
+  update public.agri_evidence_items
+     set status = 'approved',
+         agronomic_status = 'approved',
+         reviewer_id = v_actor,
+         reviewed_at = now(),
+         review_note = btrim(p_note)
+   where id = p_evidence_id
+  returning * into v_item;
+
+  perform public.agri_log_evidence_event(
+    p_evidence_id, 'approve', 'under_review', 'approved', btrim(p_note),
+    jsonb_build_object('classification', v_item.classification), 'evidence_reviewer'
+  );
+  perform public.write_audit(
+    'agri.evidence_approved', 'agri_evidence_items', p_evidence_id, v_item.target_ref,
+    'under_review', 'approved',
+    jsonb_build_object('target_kind', v_item.target_kind, 'classification', v_item.classification),
+    v_actor, 'evidence_reviewer'
+  );
+  return v_item;
+end;
+$$;
+
+create or replace function public.agri_reject_evidence(
+  p_evidence_id uuid,
+  p_reason      text
+)
+returns public.agri_evidence_items
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_actor uuid := public.current_party_id();
+  v_item public.agri_evidence_items;
+  v_from text;
+begin
+  if coalesce(btrim(p_reason), '') = '' then
+    raise exception 'A rejection reason is required.' using errcode = 'check_violation';
+  end if;
+
+  select * into v_item from public.agri_evidence_items where id = p_evidence_id for update;
+  if not found then raise exception 'Evidence dossier not found.' using errcode = 'no_data_found'; end if;
+  if not public.agri_has_authority('evidence_reviewer', v_item.crop_code, v_item.districts) then
+    raise exception 'You need evidence-reviewer authority for this evidence.' using errcode = 'insufficient_privilege';
+  end if;
+  if v_item.status not in ('submitted', 'under_review', 'correction_requested') then
+    raise exception 'This dossier cannot be rejected in its current state.' using errcode = 'check_violation';
+  end if;
+  v_from := v_item.status;
+
+  update public.agri_evidence_items
+     set status = 'rejected',
+         agronomic_status = 'rejected',
+         reviewer_id = v_actor,
+         reviewed_at = now(),
+         rejection_reason = btrim(p_reason),
+         review_note = btrim(p_reason)
+   where id = p_evidence_id
+  returning * into v_item;
+
+  perform public.agri_log_evidence_event(
+    p_evidence_id, 'reject', v_from, 'rejected', btrim(p_reason), '{}'::jsonb, 'evidence_reviewer'
+  );
+  perform public.write_audit(
+    'agri.evidence_rejected', 'agri_evidence_items', p_evidence_id, v_item.target_ref,
+    v_from, 'rejected', jsonb_build_object('reason', btrim(p_reason)),
+    v_actor, 'evidence_reviewer'
+  );
+  return v_item;
+end;
+$$;
+
+create or replace function public.agri_request_correction(
+  p_evidence_id uuid,
+  p_note        text
+)
+returns public.agri_evidence_items
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_actor uuid := public.current_party_id();
+  v_item public.agri_evidence_items;
+  v_from text;
+begin
+  if coalesce(btrim(p_note), '') = '' then
+    raise exception 'A correction request needs a note.' using errcode = 'check_violation';
+  end if;
+
+  select * into v_item from public.agri_evidence_items where id = p_evidence_id for update;
+  if not found then raise exception 'Evidence dossier not found.' using errcode = 'no_data_found'; end if;
+  if not public.agri_has_authority('evidence_reviewer', v_item.crop_code, v_item.districts) then
+    raise exception 'You need evidence-reviewer authority for this evidence.' using errcode = 'insufficient_privilege';
+  end if;
+  if v_item.status not in ('submitted', 'under_review') then
+    raise exception 'Corrections can only be requested on submitted or in-review evidence.' using errcode = 'check_violation';
+  end if;
+  v_from := v_item.status;
+
+  update public.agri_evidence_items
+     set status = 'correction_requested',
+         reviewer_id = v_actor,
+         correction_note = btrim(p_note),
+         review_note = btrim(p_note),
+         agronomic_status = 'pending',
+         reviewed_at = null
+   where id = p_evidence_id
+  returning * into v_item;
+
+  perform public.agri_log_evidence_event(
+    p_evidence_id, 'request_correction', v_from, 'correction_requested', btrim(p_note),
+    '{}'::jsonb, 'evidence_reviewer'
+  );
+  return v_item;
+end;
+$$;
+
+create or replace function public.agri_update_and_resubmit(
+  p_evidence_id         uuid,
+  p_document_title      text,
+  p_source_url          text,
+  p_document_ref        text,
+  p_classification      text,
+  p_valid_until         timestamptz,
+  p_note                text
+)
+returns public.agri_evidence_items
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_actor uuid := public.current_party_id();
+  v_item public.agri_evidence_items;
+  v_from text;
+begin
+  select * into v_item from public.agri_evidence_items where id = p_evidence_id for update;
+  if not found then raise exception 'Evidence dossier not found.' using errcode = 'no_data_found'; end if;
+  if not public.agri_has_authority('content_manager', v_item.crop_code, v_item.districts) then
+    raise exception 'You need content-management authority for this evidence.' using errcode = 'insufficient_privilege';
+  end if;
+  if v_item.status not in ('draft', 'correction_requested') then
+    raise exception 'Only a draft or correction-requested dossier can be amended.' using errcode = 'check_violation';
+  end if;
+  if coalesce(btrim(p_note), '') = '' then
+    raise exception 'Describe the correction before resubmitting.' using errcode = 'check_violation';
+  end if;
+  if p_classification not in (
+    'official_government', 'peer_reviewed_research', 'qualified_expert',
+    'supplementary_editorial', 'unverified_submission'
+  ) then
+    raise exception 'Unknown evidence classification.' using errcode = 'check_violation';
+  end if;
+  if p_source_url is not null and p_source_url !~ '^https://[^[:space:]]+$' then
+    raise exception 'A source URL must be a direct HTTPS reference.' using errcode = 'check_violation';
+  end if;
+  if p_valid_until is not null and p_valid_until <= v_item.valid_from then
+    raise exception 'The validity end must be after its start.' using errcode = 'check_violation';
+  end if;
+  v_from := v_item.status;
+
+  update public.agri_evidence_items
+     set document_title = coalesce(nullif(btrim(p_document_title), ''), document_title),
+         source_url = nullif(btrim(p_source_url), ''),
+         document_ref = nullif(btrim(p_document_ref), ''),
+         classification = p_classification,
+         valid_until = p_valid_until,
+         status = 'submitted',
+         source_check_status = 'pending',
+         applicability_status = 'pending',
+         agronomic_status = 'pending',
+         reviewer_id = null,
+         reviewed_at = null,
+         review_started_at = null,
+         review_note = null,
+         rejection_reason = null,
+         correction_note = null,
+         submitted_by = v_actor,
+         submitted_at = now()
+   where id = p_evidence_id
+  returning * into v_item;
+
+  perform public.agri_log_evidence_event(
+    p_evidence_id, 'resubmit', v_from, 'submitted', btrim(p_note),
+    jsonb_build_object('classification', p_classification), 'content_manager'
+  );
+  return v_item;
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- Publication, expiry and supersession
+-- ---------------------------------------------------------------------------
+create or replace function public.agri_publish_evidence(
+  p_evidence_id uuid,
+  p_alert_level text default null
+)
+returns public.agri_evidence_items
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_actor uuid := public.current_party_id();
+  v_item public.agri_evidence_items;
+  v_k public.agri_knowledge_entries;
+  v_a public.agri_advisories;
+  v_r public.forecast_risk_rules;
+  v_entry public.agri_knowledge_entries;
+  v_source public.intel_sources;
+  v_tier text;
+  v_target_id uuid;
+  v_target_table text;
+  v_target_ref text;
+  v_target_label text;
+  v_old public.agri_evidence_items;
+begin
+  select * into v_item from public.agri_evidence_items where id = p_evidence_id for update;
+  if not found then raise exception 'Evidence dossier not found.' using errcode = 'no_data_found'; end if;
+  if not public.agri_has_authority('content_manager', v_item.crop_code, v_item.districts) then
+    raise exception 'You need content-manager authority for this evidence.' using errcode = 'insufficient_privilege';
+  end if;
+  if v_item.status <> 'approved' then
+    raise exception 'Only approved evidence can be published.' using errcode = 'check_violation';
+  end if;
+  if v_item.valid_until is null or v_item.valid_until <= now() then
+    raise exception 'This evidence has no future validity window.' using errcode = 'check_violation';
+  end if;
+
+  if v_item.target_kind = 'knowledge_entry' then
+    select * into v_k from public.agri_knowledge_entries where id = v_item.target_ref::uuid for update;
+    if not found then raise exception 'Knowledge entry not found.' using errcode = 'no_data_found'; end if;
+    if v_k.is_published and v_k.evidence_item_id is not null and v_k.evidence_item_id <> p_evidence_id
+       and (v_item.supersedes_id is null or v_k.evidence_item_id <> v_item.supersedes_id) then
+      raise exception 'This knowledge entry already has different published evidence; create a superseding dossier.' using errcode = 'check_violation';
+    end if;
+    v_tier := case v_item.classification
+      when 'official_government' then 'verified'
+      when 'peer_reviewed_research' then 'verified'
+      when 'qualified_expert' then 'verified'
+      when 'supplementary_editorial' then 'supplementary'
+      else null
+    end;
+    if v_tier is null then
+      raise exception 'Unverified material cannot be published as knowledge.' using errcode = 'check_violation';
+    end if;
+    if v_tier = 'verified' and coalesce(v_item.source_code, v_k.source_code) is null then
+      raise exception 'Verified knowledge publication needs a source registry code.' using errcode = 'check_violation';
+    end if;
+    if v_tier = 'verified' and coalesce(v_item.source_url, v_k.source_url) is null then
+      raise exception 'Verified knowledge publication needs a direct source URL.' using errcode = 'check_violation';
+    end if;
+    v_target_id := v_k.id;
+    v_target_table := 'agri_knowledge_entries';
+    v_target_ref := v_k.slug;
+    v_target_label := v_k.title_en;
+  elsif v_item.target_kind = 'official_advisory' then
+    select * into v_a from public.agri_advisories where id = v_item.target_ref::uuid for update;
+    if not found then raise exception 'Advisory not found.' using errcode = 'no_data_found'; end if;
+    if p_alert_level is null or p_alert_level not in ('info', 'watch', 'urgent') then
+      raise exception 'Publishing an official advisory needs an alert level.' using errcode = 'check_violation';
+    end if;
+    if v_item.classification <> 'official_government' then
+      raise exception 'Only official government evidence can be published as an official advisory.' using errcode = 'check_violation';
+    end if;
+    if v_a.verification_status = 'verified' and v_a.evidence_item_id is not null and v_a.evidence_item_id <> p_evidence_id
+       and (v_item.supersedes_id is null or v_a.evidence_item_id <> v_item.supersedes_id) then
+      raise exception 'This advisory already has different verified evidence; create a superseding dossier.' using errcode = 'check_violation';
+    end if;
+    if v_a.source_url is null or v_a.source_url !~ '^https://[^[:space:]]+$' then
+      raise exception 'The advisory needs a direct HTTPS source URL before verification.' using errcode = 'check_violation';
+    end if;
+    if v_a.district is null or btrim(v_a.district) = '' then
+      raise exception 'The advisory needs a district before verification.' using errcode = 'check_violation';
+    end if;
+    if v_a.valid_until is null or v_a.valid_until <= now() then
+      raise exception 'The advisory needs a future validity window before verification.' using errcode = 'check_violation';
+    end if;
+    if v_a.published_at > now() then
+      raise exception 'A future-dated advisory cannot be verified as current.' using errcode = 'check_violation';
+    end if;
+    if v_a.title_ur is null or v_a.summary_ur is null then
+      raise exception 'The advisory needs its checked Urdu title and summary before verification.' using errcode = 'check_violation';
+    end if;
+    select * into v_source from public.intel_sources where code = v_a.source_code;
+    if not found or not v_source.is_active or v_source.kind <> 'official_advisory' then
+      raise exception 'The advisory source must be an active official_advisory source.' using errcode = 'check_violation';
+    end if;
+    v_target_id := v_a.id;
+    v_target_table := 'agri_advisories';
+    v_target_ref := v_a.source_ref;
+    v_target_label := v_a.title;
+  else
+    select * into v_r from public.forecast_risk_rules where code = v_item.target_ref for update;
+    if not found then raise exception 'Forecast rule not found.' using errcode = 'no_data_found'; end if;
+    if v_item.classification not in ('official_government', 'peer_reviewed_research', 'qualified_expert') then
+      raise exception 'A forecast threshold needs authoritative agronomic evidence.' using errcode = 'check_violation';
+    end if;
+    if v_r.is_active and v_r.evidence_item_id is not null and v_r.evidence_item_id <> p_evidence_id then
+      raise exception 'The rule is active with different evidence; deactivate it before publishing a new version.' using errcode = 'check_violation';
+    end if;
+    select * into v_entry from public.agri_knowledge_entries where id = v_r.knowledge_entry_id;
+    if not found or not v_entry.is_published or v_entry.evidence_tier <> 'verified' then
+      raise exception 'The rule cites unpublished or non-verified knowledge.' using errcode = 'check_violation';
+    end if;
+    if not exists (
+      select 1 from public.agri_evidence_items k
+       where k.id = v_entry.evidence_item_id
+         and k.status = 'published'
+         and k.classification in ('official_government', 'peer_reviewed_research', 'qualified_expert')
+    ) then
+      raise exception 'The rule''s cited knowledge must have its own published authoritative evidence.' using errcode = 'check_violation';
+    end if;
+    select * into v_source from public.intel_sources where code = v_r.source_code;
+    if not found or not v_source.is_active or v_source.kind <> 'forecast_risk' then
+      raise exception 'The rule needs an active forecast-risk source.' using errcode = 'check_violation';
+    end if;
+    v_target_id := null;
+    v_target_table := 'forecast_risk_rules';
+    v_target_ref := v_r.code;
+    v_target_label := v_r.label_en;
+  end if;
+
+  -- Publish the dossier first: the target guards read the dossier state in the
+  -- same transaction and must see it before the target may become official.
+  update public.agri_evidence_items
+     set status = 'published', published_at = now()
+   where id = p_evidence_id
+  returning * into v_item;
+
+  if v_target_table = 'agri_knowledge_entries' then
+    update public.agri_knowledge_entries
+       set evidence_item_id = p_evidence_id,
+           is_published = true,
+           evidence_tier = v_tier,
+           reviewed_by = v_item.reviewer_id,
+           reviewed_at = v_item.reviewed_at,
+           source_code = coalesce(v_item.source_code, source_code),
+           source_url = coalesce(v_item.source_url, source_url),
+           source_published_on = coalesce(v_item.published_on, source_published_on),
+           source_accessed_on = coalesce(v_item.accessed_at::date, source_accessed_on)
+     where id = v_target_id;
+  elsif v_target_table = 'agri_advisories' then
+    update public.agri_advisories
+       set evidence_item_id = p_evidence_id,
+           verification_status = 'verified',
+           verified_at = v_item.reviewed_at,
+           verified_by = v_item.reviewer_id,
+           verification_note = v_item.review_note,
+           alert_level = p_alert_level,
+           is_active = true
+     where id = v_target_id;
+  else
+    update public.forecast_risk_rules
+       set evidence_item_id = p_evidence_id,
+           version = greatest(version, v_item.version),
+           is_active = true,
+           activated_at = now(),
+           activated_by = v_actor,
+           activation_note = v_item.review_note,
+           deactivated_at = null,
+           deactivated_by = null,
+           deactivation_note = null
+     where code = v_target_ref;
+  end if;
+
+  if v_item.supersedes_id is not null then
+    select * into v_old from public.agri_evidence_items where id = v_item.supersedes_id for update;
+    if v_old.status = 'published' then
+      update public.agri_evidence_items
+         set status = 'superseded', superseded_by = p_evidence_id
+       where id = v_old.id;
+      perform public.agri_log_evidence_event(
+        v_old.id, 'supersede', 'published', 'superseded',
+        'Superseded by version ' || v_item.version || ' of the same target',
+        jsonb_build_object('superseded_by', p_evidence_id), 'content_manager'
+      );
+    end if;
+  end if;
+
+  perform public.agri_log_evidence_event(
+    p_evidence_id, 'publish', 'approved', 'published',
+    'Published ' || v_target_label,
+    jsonb_build_object('target_kind', v_item.target_kind, 'target_ref', v_item.target_ref, 'alert_level', p_alert_level),
+    'content_manager'
+  );
+  perform public.write_audit(
+    'agri.evidence_published', v_target_table, v_target_id, v_target_ref,
+    'approved', 'published',
+    jsonb_build_object('evidence_item_id', p_evidence_id, 'evidence_version', v_item.version, 'alert_level', p_alert_level),
+    v_actor, 'content_manager'
+  );
+  return v_item;
+end;
+$$;
+
+create or replace function public.agri_expire_evidence(
+  p_evidence_id uuid,
+  p_reason      text
+)
+returns public.agri_evidence_items
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_actor uuid := public.current_party_id();
+  v_item public.agri_evidence_items;
+  v_from text;
+begin
+  if coalesce(btrim(p_reason), '') = '' then
+    raise exception 'An expiry reason is required.' using errcode = 'check_violation';
+  end if;
+  select * into v_item from public.agri_evidence_items where id = p_evidence_id for update;
+  if not found then raise exception 'Evidence dossier not found.' using errcode = 'no_data_found'; end if;
+  if not public.agri_has_authority('content_manager', v_item.crop_code, v_item.districts) then
+    raise exception 'You need content-manager authority for this evidence.' using errcode = 'insufficient_privilege';
+  end if;
+  if v_item.status not in ('approved', 'published') then
+    raise exception 'Only approved or published evidence can expire.' using errcode = 'check_violation';
+  end if;
+  v_from := v_item.status;
+
+  if v_item.target_kind = 'knowledge_entry' and v_item.status = 'published' then
+    update public.agri_knowledge_entries set is_published = false where id = v_item.target_ref::uuid;
+  elsif v_item.target_kind = 'official_advisory' and v_item.status = 'published' then
+    update public.agri_advisories set is_active = false where id = v_item.target_ref::uuid;
+  elsif v_item.target_kind = 'forecast_rule' and v_item.status = 'published' then
+    update public.forecast_risk_rules
+       set is_active = false, deactivated_at = now(), deactivated_by = v_actor, deactivation_note = btrim(p_reason)
+     where code = v_item.target_ref;
+  end if;
+
+  update public.agri_evidence_items
+     set status = 'expired', expired_at = now(), review_note = btrim(p_reason)
+   where id = p_evidence_id
+  returning * into v_item;
+
+  perform public.agri_log_evidence_event(
+    p_evidence_id, 'expire', v_from, 'expired', btrim(p_reason), '{}'::jsonb, 'content_manager'
+  );
+  perform public.write_audit(
+    'agri.evidence_expired', 'agri_evidence_items', p_evidence_id, v_item.target_ref,
+    v_from, 'expired', jsonb_build_object('reason', btrim(p_reason)), v_actor, 'content_manager'
+  );
+  return v_item;
+end;
+$$;
+
+create or replace function public.agri_supersede_evidence(
+  p_old_id uuid,
+  p_new_id uuid,
+  p_note   text
+)
+returns public.agri_evidence_items
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_actor uuid := public.current_party_id();
+  v_old public.agri_evidence_items;
+  v_new public.agri_evidence_items;
+  v_current uuid;
+begin
+  if coalesce(btrim(p_note), '') = '' then
+    raise exception 'A supersession note is required.' using errcode = 'check_violation';
+  end if;
+  select * into v_old from public.agri_evidence_items where id = p_old_id for update;
+  select * into v_new from public.agri_evidence_items where id = p_new_id for update;
+  if v_old.id is null or v_new.id is null then
+    raise exception 'Both evidence dossiers must exist.' using errcode = 'no_data_found';
+  end if;
+  if not public.agri_has_authority('content_manager', v_old.crop_code, v_old.districts) then
+    raise exception 'You need content-manager authority for this evidence.' using errcode = 'insufficient_privilege';
+  end if;
+  if v_old.status <> 'published' or v_new.status <> 'published' then
+    raise exception 'Both evidence dossiers must be published before supersession.' using errcode = 'check_violation';
+  end if;
+  if v_old.target_kind <> v_new.target_kind or v_old.target_ref <> v_new.target_ref then
+    raise exception 'Only evidence for the same target can supersede.' using errcode = 'check_violation';
+  end if;
+  if v_new.version <= v_old.version then
+    raise exception 'The replacement must be a newer version.' using errcode = 'check_violation';
+  end if;
+  if v_old.superseded_by is not null then
+    raise exception 'This evidence is already superseded.' using errcode = 'check_violation';
+  end if;
+  if v_new.supersedes_id <> p_old_id then
+    raise exception 'The newer dossier must record the older dossier as supersedes_id.' using errcode = 'check_violation';
+  end if;
+  if v_old.target_kind = 'knowledge_entry' then
+    select evidence_item_id into v_current from public.agri_knowledge_entries where id = v_old.target_ref::uuid;
+  elsif v_old.target_kind = 'official_advisory' then
+    select evidence_item_id into v_current from public.agri_advisories where id = v_old.target_ref::uuid;
+  else
+    select evidence_item_id into v_current from public.forecast_risk_rules where code = v_old.target_ref;
+  end if;
+  if v_current <> p_new_id then
+    raise exception 'The target is not currently published from the replacement dossier.' using errcode = 'check_violation';
+  end if;
+
+  update public.agri_evidence_items
+     set status = 'superseded', superseded_by = p_new_id
+   where id = p_old_id
+  returning * into v_old;
+  perform public.agri_log_evidence_event(
+    p_old_id, 'supersede', 'published', 'superseded', btrim(p_note),
+    jsonb_build_object('superseded_by', p_new_id), 'content_manager'
+  );
+  perform public.write_audit(
+    'agri.evidence_superseded', 'agri_evidence_items', p_old_id, v_old.target_ref,
+    'published', 'superseded', jsonb_build_object('superseded_by', p_new_id), v_actor, 'content_manager'
+  );
+  return v_old;
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- Reviewer workspace reads
+-- ---------------------------------------------------------------------------
+create or replace function public.agri_review_queue(
+  p_status      text default null,
+  p_target_kind text default null,
+  p_search      text default null,
+  p_limit       integer default 50
+)
+returns table (
+  id                 uuid,
+  target_kind        text,
+  target_ref         text,
+  target_label       text,
+  document_title     text,
+  source_organization text,
+  source_type        text,
+  classification     text,
+  status             text,
+  crop_code          text,
+  topic              text,
+  districts          text[],
+  stages             text[],
+  version            integer,
+  valid_until        timestamptz,
+  submitted_at       timestamptz,
+  reviewer_id        uuid,
+  supersedes_id      uuid,
+  rejection_reason   text,
+  can_review         boolean,
+  can_manage         boolean
+)
+language plpgsql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_limit integer := least(greatest(coalesce(p_limit, 50), 1), 200);
+begin
+  if not public.agri_has_review_access() then
+    raise exception 'Review access is required.' using errcode = 'insufficient_privilege';
+  end if;
+  if p_status is not null and p_status not in (
+    'draft', 'submitted', 'under_review', 'correction_requested', 'approved',
+    'rejected', 'published', 'expired', 'superseded'
+  ) then
+    raise exception 'Unknown evidence status filter.' using errcode = 'check_violation';
+  end if;
+  if p_target_kind is not null and p_target_kind not in ('knowledge_entry', 'official_advisory', 'forecast_rule') then
+    raise exception 'Unknown evidence target filter.' using errcode = 'check_violation';
+  end if;
+
+  return query
+  select
+    i.id,
+    i.target_kind,
+    i.target_ref,
+    case i.target_kind
+      when 'knowledge_entry' then (select e.title_en from public.agri_knowledge_entries e where e.id = i.target_ref::uuid)
+      when 'official_advisory' then (select a.title from public.agri_advisories a where a.id = i.target_ref::uuid)
+      else (select r.label_en from public.forecast_risk_rules r where r.code = i.target_ref)
+    end as target_label,
+    i.document_title,
+    i.source_organization,
+    i.source_type,
+    i.classification,
+    i.status,
+    i.crop_code,
+    i.topic,
+    i.districts,
+    i.stages,
+    i.version,
+    i.valid_until,
+    i.submitted_at,
+    i.reviewer_id,
+    i.supersedes_id,
+    i.rejection_reason,
+    public.agri_has_authority('evidence_reviewer', i.crop_code, i.districts) as can_review,
+    public.agri_has_authority('content_manager', i.crop_code, i.districts) as can_manage
+  from public.agri_evidence_items i
+  where (p_status is null or i.status = p_status)
+    and (p_target_kind is null or i.target_kind = p_target_kind)
+    and (
+      public.agri_has_authority('evidence_reviewer', i.crop_code, i.districts)
+      or public.agri_has_authority('content_manager', i.crop_code, i.districts)
+    )
+    and (
+      p_search is null
+      or p_search = ''
+      or i.document_title ilike '%' || p_search || '%'
+      or i.source_organization ilike '%' || p_search || '%'
+      or i.target_ref ilike '%' || p_search || '%'
+      or coalesce(
+        case i.target_kind
+          when 'knowledge_entry' then (select e.title_en from public.agri_knowledge_entries e where e.id = i.target_ref::uuid)
+          when 'official_advisory' then (select a.title from public.agri_advisories a where a.id = i.target_ref::uuid)
+          else (select r.label_en from public.forecast_risk_rules r where r.code = i.target_ref)
+        end, ''
+      ) ilike '%' || p_search || '%'
+    )
+  order by case i.status
+    when 'submitted' then 1 when 'under_review' then 2 when 'correction_requested' then 3
+    when 'approved' then 4 when 'published' then 5 when 'rejected' then 6
+    when 'expired' then 7 when 'superseded' then 8 else 9 end,
+    coalesce(i.submitted_at, i.created_at) desc
+  limit v_limit;
+end;
+$$;
+
+create or replace function public.agri_review_targets(p_target_kind text default null)
+returns table (
+  target_kind           text,
+  target_ref            text,
+  label                 text,
+  crop_code             text,
+  topic                 text,
+  current_state         text,
+  current_evidence_id   uuid,
+  current_evidence_status text,
+  version               integer
+)
+language plpgsql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  if not public.agri_has_review_access() then
+    raise exception 'Review access is required.' using errcode = 'insufficient_privilege';
+  end if;
+  if p_target_kind is not null and p_target_kind not in ('knowledge_entry', 'official_advisory', 'forecast_rule') then
+    raise exception 'Unknown target kind.' using errcode = 'check_violation';
+  end if;
+
+  return query
+  select x.target_kind, x.target_ref, x.label, x.crop_code, x.topic,
+         x.current_state, x.current_evidence_id, x.current_evidence_status, x.version
+  from (
+    select 'knowledge_entry'::text as target_kind, e.id::text as target_ref,
+           e.title_en as label, e.crop_code, e.topic,
+           case when e.is_published then 'published' else 'unpublished' end as current_state,
+           e.evidence_item_id as current_evidence_id,
+           (select i.status from public.agri_evidence_items i where i.id = e.evidence_item_id) as current_evidence_status,
+           e.version
+      from public.agri_knowledge_entries e
+    union all
+    select 'official_advisory'::text, a.id::text, a.title, a.crop_code, a.topic,
+           a.verification_status, a.evidence_item_id,
+           (select i.status from public.agri_evidence_items i where i.id = a.evidence_item_id),
+           null::integer
+      from public.agri_advisories a
+    union all
+    select 'forecast_rule'::text, r.code, r.label_en, r.crop_code, r.topic,
+           case when r.is_active then 'active' else 'inactive' end, r.evidence_item_id,
+           (select i.status from public.agri_evidence_items i where i.id = r.evidence_item_id),
+           r.version
+      from public.forecast_risk_rules r
+  ) x
+  where p_target_kind is null or x.target_kind = p_target_kind
+  order by x.target_kind, x.label
+  limit 200;
+end;
+$$;
+
+create or replace function public.agri_evidence_detail(p_evidence_id uuid)
+returns jsonb
+language plpgsql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_actor uuid := public.current_party_id();
+  v_item public.agri_evidence_items;
+  v_can_review boolean;
+  v_can_manage boolean;
+  v_target jsonb;
+  v_reviews jsonb;
+  v_usage integer;
+  v_last_used timestamptz;
+  v_decisions jsonb;
+begin
+  if v_actor is null then
+    raise exception 'An identified account is required.' using errcode = 'insufficient_privilege';
+  end if;
+  select * into v_item from public.agri_evidence_items where id = p_evidence_id;
+  if not found then
+    raise exception 'Evidence dossier not found.' using errcode = 'no_data_found';
+  end if;
+  v_can_review := public.agri_has_authority('evidence_reviewer', v_item.crop_code, v_item.districts);
+  v_can_manage := public.agri_has_authority('content_manager', v_item.crop_code, v_item.districts);
+  if not (v_can_review or v_can_manage or v_item.created_by = v_actor or v_item.submitted_by = v_actor or public.has_capability('admin')) then
+    raise exception 'You are not authorized to view this evidence.' using errcode = 'insufficient_privilege';
+  end if;
+
+  if v_item.target_kind = 'knowledge_entry' then
+    select jsonb_build_object(
+      'kind', 'knowledge_entry', 'title', e.title_en, 'title_ur', e.title_ur,
+      'slug', e.slug, 'version', e.version, 'state', case when e.is_published then 'published' else 'unpublished' end,
+      'crop_code', e.crop_code, 'topic', e.topic, 'evidence_tier', e.evidence_tier
+    ) into v_target
+    from public.agri_knowledge_entries e where e.id = v_item.target_ref::uuid;
+  elsif v_item.target_kind = 'official_advisory' then
+    select jsonb_build_object(
+      'kind', 'official_advisory', 'title', a.title, 'title_ur', a.title_ur,
+      'district', a.district, 'verification_status', a.verification_status,
+      'is_active', a.is_active, 'source_code', a.source_code, 'source_url', a.source_url,
+      'valid_until', a.valid_until, 'alert_level', a.alert_level, 'crop_code', a.crop_code, 'topic', a.topic
+    ) into v_target
+    from public.agri_advisories a where a.id = v_item.target_ref::uuid;
+  else
+    select jsonb_build_object(
+      'kind', 'forecast_rule', 'code', r.code, 'label_en', r.label_en, 'label_ur', r.label_ur,
+      'is_active', r.is_active, 'metric', r.metric, 'operator', r.operator, 'threshold', r.threshold,
+      'unit', r.unit, 'version', r.version, 'activated_at', r.activated_at,
+      'knowledge_entry_id', r.knowledge_entry_id, 'source_code', r.source_code, 'crop_code', r.crop_code, 'topic', r.topic
+    ) into v_target
+    from public.forecast_risk_rules r where r.code = v_item.target_ref;
+  end if;
+
+  select coalesce(jsonb_agg(jsonb_build_object(
+    'id', r.id, 'action', r.action, 'actor_id', r.actor_id, 'actor_role', r.actor_role,
+    'actor_name', (select p.display_name from public.parties p where p.id = r.actor_id),
+    'from_status', r.from_status, 'to_status', r.to_status, 'note', r.note,
+    'detail', r.detail, 'created_at', r.created_at
+  ) order by r.created_at), '[]'::jsonb) into v_reviews
+  from public.agri_evidence_reviews r where r.evidence_id = v_item.id;
+
+  select count(*), max(created_at) into v_usage, v_last_used
+    from public.recommendations where evidence_item_id = v_item.id and withdrawn_at is null;
+
+  select coalesce(jsonb_agg(jsonb_build_object(
+    'id', r.id, 'alert_level', r.alert_level, 'alert_source_kind', r.alert_source_kind,
+    'created_at', r.created_at, 'valid_until', r.valid_until
+  ) order by r.created_at desc), '[]'::jsonb) into v_decisions
+  from (
+    select id, alert_level, alert_source_kind, created_at, valid_until
+      from public.recommendations where evidence_item_id = v_item.id
+     order by created_at desc limit 20
+  ) r;
+
+  return jsonb_build_object(
+    'evidence', to_jsonb(v_item),
+    'target', coalesce(v_target, '{}'::jsonb),
+    'review_history', v_reviews,
+    'usage', jsonb_build_object('live_decisions', v_usage, 'last_used_at', v_last_used, 'latest', v_decisions),
+    'access', jsonb_build_object(
+      'can_review', v_can_review,
+      'can_manage', v_can_manage,
+      'is_submitter', v_item.created_by = v_actor or v_item.submitted_by = v_actor,
+      'is_reviewer', v_item.reviewer_id = v_actor,
+      'can_start_review', v_can_review and v_item.status = 'submitted' and v_item.created_by <> v_actor and v_item.submitted_by <> v_actor,
+      'can_check', v_can_review and v_item.status = 'under_review' and v_item.reviewer_id = v_actor,
+      'can_approve', v_can_review and v_item.status = 'under_review' and v_item.reviewer_id = v_actor
+        and v_item.source_check_status = 'authentic' and v_item.applicability_status = 'applicable',
+      'can_publish', v_can_manage and v_item.status = 'approved',
+      'can_expire', v_can_manage and v_item.status in ('approved', 'published')
+    )
+  );
+end;
+$$;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261103001300_decision_trace.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Farmer App · migration 0045 · Phase 5.2 decision trace
+--
+-- The recommendation row remains the canonical decision and the notification
+-- event remains only a pointer to it. This migration adds the minimum missing
+-- columns and one before-write trigger:
+--
+--   · evidence_item_id is the dossier used at generation time;
+--   · decision_trace is the internal, reproducible explanation of that choice.
+--
+-- The farmer-facing explanation is a projection of the same row. It never
+-- exposes reviewer ids, internal notes or another farmer's context.
+
+create or replace function public.agri_attach_recommendation_trace()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_kind text;
+  v_ref text;
+  v_evidence_id uuid;
+  v_evidence public.agri_evidence_items%rowtype;
+  v_crop text;
+  v_stage text;
+  v_district text;
+  v_scoring integer;
+  v_trace jsonb;
+begin
+  if new.decision_trace is not null and new.decision_trace <> '{}'::jsonb then
+    return new;
+  end if;
+
+  if new.source_ref like 'official_advisory:%' then
+    v_kind := 'official_advisory';
+    v_ref := substring(new.source_ref from length('official_advisory:') + 1);
+    select evidence_item_id into v_evidence_id
+      from public.agri_advisories where id = v_ref::uuid;
+  elsif new.source_ref like 'forecast_risk:%' then
+    v_kind := 'forecast_rule';
+    v_ref := substring(new.source_ref from length('forecast_risk:') + 1);
+    select evidence_item_id into v_evidence_id
+      from public.forecast_risk_rules where code = v_ref;
+  elsif new.alert_rule_code like 'advisory:%' then
+    v_kind := 'official_advisory';
+    v_ref := substring(new.alert_rule_code from length('advisory:') + 1);
+    select evidence_item_id into v_evidence_id
+      from public.agri_advisories where id = v_ref::uuid;
+  elsif new.alert_rule_code like 'forecast:%' then
+    v_kind := 'forecast_rule';
+    v_ref := substring(new.alert_rule_code from length('forecast:') + 1);
+    select evidence_item_id into v_evidence_id
+      from public.forecast_risk_rules where code = v_ref;
+  elsif new.source::text = 'knowledge_base' and new.source_ref is not null then
+    v_kind := 'knowledge_entry';
+    select e.evidence_item_id, e.slug into v_evidence_id, v_ref
+      from public.agri_knowledge_entries e
+     where e.slug = new.source_ref
+       and (new.knowledge_version is null or e.version = new.knowledge_version)
+     order by e.version desc
+     limit 1;
+    if v_evidence_id is null and v_ref is null then
+      select e.evidence_item_id, e.slug into v_evidence_id, v_ref
+        from public.agri_knowledge_entries e
+       where e.slug = new.source_ref
+       order by e.version desc
+       limit 1;
+    end if;
+  end if;
+
+  if v_evidence_id is not null then
+    select * into v_evidence from public.agri_evidence_items where id = v_evidence_id;
+    new.evidence_item_id := coalesce(new.evidence_item_id, v_evidence_id);
+  end if;
+
+  if new.crop_id is not null then
+    select ci.crop_code, ci.stage::text into v_crop, v_stage
+      from public.crop_instances ci where ci.id = new.crop_id;
+  end if;
+  select nullif(btrim(ip.district), '') into v_district
+    from public.farmer_intelligence_profiles ip where ip.farmer_id = new.farmer_id;
+
+  select coalesce((value #>> '{}')::integer, 1) into v_scoring
+    from public.intelligence_config where key = 'scoring_version';
+
+  v_trace := jsonb_build_object(
+    'trace_version', 1,
+    'generated_at', now(),
+    'source_kind', new.alert_source_kind,
+    'source', new.source,
+    'source_ref', new.source_ref,
+    'source_label', new.source_label,
+    'source_url', new.source_url,
+    'alert_rule_code', new.alert_rule_code,
+    'evidence_item_id', coalesce(new.evidence_item_id, v_evidence_id),
+    'target_kind', v_kind,
+    'target_ref', v_ref,
+    'evidence_version', v_evidence.version,
+    'evidence_status', v_evidence.status,
+    'evidence_classification', v_evidence.classification,
+    'evidence_valid_until', v_evidence.valid_until,
+    'source_check_status', v_evidence.source_check_status,
+    'applicability_status', v_evidence.applicability_status,
+    'agronomic_status', v_evidence.agronomic_status,
+    'reviewed_at', v_evidence.reviewed_at,
+    'reviewer_id', v_evidence.reviewer_id,
+    'rule_version', new.rule_version,
+    'knowledge_version', new.knowledge_version,
+    'scoring_version', v_scoring,
+    'score_components', coalesce(new.reason_context -> 'components', '{}'::jsonb),
+    'crop_code', v_crop,
+    'stage', v_stage,
+    'district', v_district,
+    'alert_level', new.alert_level,
+    'validity', jsonb_build_object('valid_from', new.valid_from, 'valid_until', new.valid_until),
+    'eligibility', coalesce(new.reason_context, '{}'::jsonb),
+    'included', true
+  );
+  new.decision_trace := v_trace;
+  return new;
+end;
+$$;
+
+comment on function public.agri_attach_recommendation_trace() is
+  'Attaches a bounded, reproducible trace to every new canonical recommendation. It records source, versions, evidence snapshot, crop/stage/district and eligibility; it never records coordinates, phone numbers or free text.';
+
+create trigger recommendations_decision_trace
+  before insert or update on public.recommendations
+  for each row execute function public.agri_attach_recommendation_trace();
+
+-- Backfill only the empty traces. The trigger resolves evidence for old rows too
+-- and never rewrites an existing decision's trace.
+update public.recommendations
+   set decision_trace = '{}'::jsonb
+ where decision_trace = '{}'::jsonb;
+
+create or replace function public.recommendation_decision_trace(p_recommendation_id uuid)
+returns jsonb
+language plpgsql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_actor uuid := public.current_party_id();
+  v_rec public.recommendations%rowtype;
+  v_evidence public.agri_evidence_items%rowtype;
+  v_has_evidence boolean := false;
+  v_staff boolean;
+  v_reviews jsonb := '[]'::jsonb;
+  v_usage integer := 0;
+  v_crop text;
+  v_stage text;
+  v_district text;
+  v_farmer jsonb;
+  v_internal jsonb;
+begin
+  select * into v_rec from public.recommendations where id = p_recommendation_id;
+  if not found then
+    raise exception 'Recommendation not found.' using errcode = 'no_data_found';
+  end if;
+  v_staff := public.agri_has_review_access() or public.has_capability('admin');
+  if v_rec.farmer_id <> public.current_farmer_id() and not v_staff then
+    raise exception 'This decision belongs to another farmer.' using errcode = 'insufficient_privilege';
+  end if;
+
+  if v_rec.evidence_item_id is not null then
+    select * into v_evidence from public.agri_evidence_items where id = v_rec.evidence_item_id;
+    v_has_evidence := v_evidence.id is not null;
+  end if;
+  v_crop := v_rec.decision_trace ->> 'crop_code';
+  v_stage := v_rec.decision_trace ->> 'stage';
+  v_district := v_rec.decision_trace ->> 'district';
+
+  if v_staff and v_has_evidence then
+    select coalesce(jsonb_agg(jsonb_build_object(
+      'action', r.action, 'actor_role', r.actor_role, 'from_status', r.from_status,
+      'to_status', r.to_status, 'note', r.note, 'created_at', r.created_at
+    ) order by r.created_at), '[]'::jsonb) into v_reviews
+    from public.agri_evidence_reviews r where r.evidence_id = v_evidence.id;
+    select count(*) into v_usage from public.recommendations where evidence_item_id = v_evidence.id;
+  end if;
+
+  v_farmer := jsonb_build_object(
+    'role', 'farmer',
+    'recommendation_id', v_rec.id,
+    'title', v_rec.title,
+    'body', v_rec.body,
+    'action_label', v_rec.action_label,
+    'why', jsonb_build_object(
+      'reason_code', v_rec.reason_code,
+      'reason_context', coalesce(v_rec.reason_context, '{}'::jsonb),
+      'crop_code', v_crop,
+      'stage', v_stage,
+      'alert_source_kind', v_rec.alert_source_kind
+    ),
+    'source', jsonb_build_object(
+      'kind', v_rec.alert_source_kind,
+      'label', v_rec.source_label,
+      'url', v_rec.source_url,
+      'evidence_status', case when v_has_evidence then v_evidence.status else 'not_linked' end,
+      'evidence_classification', case when v_has_evidence then v_evidence.classification else null end,
+      'verified_guidance', v_has_evidence and v_evidence.status = 'published'
+        and v_evidence.classification in ('official_government', 'peer_reviewed_research', 'qualified_expert'),
+      'reviewed', v_has_evidence and v_evidence.reviewed_at is not null,
+      'valid_until', case when v_has_evidence then v_evidence.valid_until else v_rec.valid_until end
+    ),
+    'generated_at', v_rec.created_at,
+    'valid_until', v_rec.valid_until
+  );
+
+  v_internal := jsonb_build_object(
+    'role', 'internal_audit',
+    'recommendation_id', v_rec.id,
+    'created_at', v_rec.created_at,
+    'validity', jsonb_build_object('valid_from', v_rec.valid_from, 'valid_until', v_rec.valid_until),
+    'rule', jsonb_build_object(
+      'alert_rule_code', v_rec.alert_rule_code,
+      'rule_version', v_rec.rule_version,
+      'knowledge_version', v_rec.knowledge_version,
+      'scoring_version', v_rec.decision_trace ->> 'scoring_version',
+      'score_components', v_rec.decision_trace -> 'score_components'
+    ),
+    'farmer_context', jsonb_build_object(
+      'crop_code', v_crop, 'stage', v_stage, 'district', v_district
+    ),
+    'eligibility', v_rec.decision_trace -> 'eligibility',
+    'included', v_rec.decision_trace -> 'included',
+    'exclusion_reasons', v_rec.decision_trace -> 'exclusion_reasons',
+    'trace', v_rec.decision_trace,
+    'evidence', case when v_has_evidence then jsonb_build_object(
+      'item_id', v_evidence.id,
+      'version', v_evidence.version,
+      'status', v_evidence.status,
+      'classification', v_evidence.classification,
+      'source_organization', v_evidence.source_organization,
+      'source_type', v_evidence.source_type,
+      'source_code', v_evidence.source_code,
+      'source_url', v_evidence.source_url,
+      'document_title', v_evidence.document_title,
+      'document_ref', v_evidence.document_ref,
+      'published_on', v_evidence.published_on,
+      'accessed_at', v_evidence.accessed_at,
+      'language', v_evidence.language,
+      'crop_code', v_evidence.crop_code,
+      'topic', v_evidence.topic,
+      'districts', v_evidence.districts,
+      'stages', v_evidence.stages,
+      'valid_from', v_evidence.valid_from,
+      'valid_until', v_evidence.valid_until,
+      'reviewer_id', v_evidence.reviewer_id,
+      'reviewed_at', v_evidence.reviewed_at,
+      'review_note', v_evidence.review_note,
+      'source_check_status', v_evidence.source_check_status,
+      'applicability_status', v_evidence.applicability_status,
+      'agronomic_status', v_evidence.agronomic_status
+    ) else null end,
+    'review_history', v_reviews,
+    'same_evidence_decisions', v_usage
+  );
+
+  if v_staff then
+    return jsonb_build_object('farmer_explanation', v_farmer, 'internal', v_internal);
+  end if;
+
+  -- A farmer sees their own decision and its public evidence summary, never the
+  -- internal audit block, reviewer identity or another farmer's context.
+  return jsonb_build_object('farmer_explanation', v_farmer);
+end;
+$$;
+
+comment on function public.recommendation_decision_trace(uuid) is
+  'Two-level explanation for one canonical recommendation: a farmer-safe projection and, only for review/admin callers, the evidence, versions, eligibility and review history.';
+
+-- ---------------------------------------------------------------------------
+-- Execute grants: only the signed-in browser can reach these RPCs. The two
+-- evidence tables stay RLS-enabled with no client policies, so PostgREST direct
+-- reads/writes are denied; every read goes through these checked functions.
+-- ---------------------------------------------------------------------------
+revoke execute on function public.agri_attach_recommendation_trace() from public, anon, authenticated;
+revoke execute on function public.agri_log_evidence_event(uuid, text, text, text, text, jsonb, text) from public, anon, authenticated;
+revoke execute on function public.agri_block_review_ledger_mutation() from public, anon, authenticated;
+revoke execute on function public.agri_touch_evidence() from public, anon, authenticated;
+revoke execute on function public.agri_guard_knowledge_publication() from public, anon, authenticated;
+revoke execute on function public.agri_guard_advisory_publication() from public, anon, authenticated;
+revoke execute on function public.agri_guard_rule_activation() from public, anon, authenticated;
+
+revoke execute on function public.agri_has_authority(text, text, text[]) from public, anon;
+revoke execute on function public.agri_has_authority_role(text) from public, anon;
+revoke execute on function public.agri_has_review_access() from public, anon;
+revoke execute on function public.agri_review_context() from public, anon;
+revoke execute on function public.grant_agri_review_authority(uuid, text, text[], text[], text) from public, anon;
+revoke execute on function public.revoke_agri_review_authority(uuid, text, text) from public, anon;
+revoke execute on function public.agri_create_evidence(text, text, text, text, text, text, text, text, text, text, date, timestamptz, text, text, text[], text[], numeric, timestamptz, timestamptz, uuid, boolean) from public, anon;
+revoke execute on function public.agri_submit_evidence(uuid) from public, anon;
+revoke execute on function public.agri_start_review(uuid) from public, anon;
+revoke execute on function public.agri_set_source_check(uuid, text, text) from public, anon;
+revoke execute on function public.agri_set_applicability_check(uuid, text, text) from public, anon;
+revoke execute on function public.agri_approve_evidence(uuid, text) from public, anon;
+revoke execute on function public.agri_reject_evidence(uuid, text) from public, anon;
+revoke execute on function public.agri_request_correction(uuid, text) from public, anon;
+revoke execute on function public.agri_update_and_resubmit(uuid, text, text, text, text, timestamptz, text) from public, anon;
+revoke execute on function public.agri_publish_evidence(uuid, text) from public, anon;
+revoke execute on function public.agri_expire_evidence(uuid, text) from public, anon;
+revoke execute on function public.agri_supersede_evidence(uuid, uuid, text) from public, anon;
+revoke execute on function public.agri_review_queue(text, text, text, integer) from public, anon;
+revoke execute on function public.agri_review_targets(text) from public, anon;
+revoke execute on function public.agri_evidence_detail(uuid) from public, anon;
+revoke execute on function public.recommendation_decision_trace(uuid) from public, anon;
+
+grant execute on function public.agri_has_authority(text, text, text[]) to authenticated;
+grant execute on function public.agri_has_authority_role(text) to authenticated;
+grant execute on function public.agri_has_review_access() to authenticated;
+grant execute on function public.agri_review_context() to authenticated;
+grant execute on function public.grant_agri_review_authority(uuid, text, text[], text[], text) to authenticated;
+grant execute on function public.revoke_agri_review_authority(uuid, text, text) to authenticated;
+grant execute on function public.agri_create_evidence(text, text, text, text, text, text, text, text, text, text, date, timestamptz, text, text, text[], text[], numeric, timestamptz, timestamptz, uuid, boolean) to authenticated;
+grant execute on function public.agri_submit_evidence(uuid) to authenticated;
+grant execute on function public.agri_start_review(uuid) to authenticated;
+grant execute on function public.agri_set_source_check(uuid, text, text) to authenticated;
+grant execute on function public.agri_set_applicability_check(uuid, text, text) to authenticated;
+grant execute on function public.agri_approve_evidence(uuid, text) to authenticated;
+grant execute on function public.agri_reject_evidence(uuid, text) to authenticated;
+grant execute on function public.agri_request_correction(uuid, text) to authenticated;
+grant execute on function public.agri_update_and_resubmit(uuid, text, text, text, text, timestamptz, text) to authenticated;
+grant execute on function public.agri_publish_evidence(uuid, text) to authenticated;
+grant execute on function public.agri_expire_evidence(uuid, text) to authenticated;
+grant execute on function public.agri_supersede_evidence(uuid, uuid, text) to authenticated;
+grant execute on function public.agri_review_queue(text, text, text, integer) to authenticated;
+grant execute on function public.agri_review_targets(text) to authenticated;
+grant execute on function public.agri_evidence_detail(uuid) to authenticated;
+grant execute on function public.recommendation_decision_trace(uuid) to authenticated;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261103001400_review_hardening.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Farmer App · migration 0046 · Phase 5.2.1 review operational hardening
+--
+-- Three gaps left open by Phase 5.2, closed without a second authority model:
+--
+--   · authority administration is a server-checked, self-escalation-proof act;
+--   · expiry of a validity window is a scheduled server act, recorded in the
+--     same append-only review ledger as a human expiry;
+--   · queue counts are scoped to the caller's actual authority, not global.
+--
+-- `admin` still only grants authority. It never becomes agronomic approval.
+
+-- ---------------------------------------------------------------------------
+-- Authority administration
+-- ---------------------------------------------------------------------------
+alter table public.agri_review_authorities
+  add column if not exists revoked_by uuid references public.parties (id) on delete set null;
+
+comment on column public.agri_review_authorities.revoked_by is
+  'The administrator who revoked this authority. Revocation is recorded, never deleted.';
+
+-- Scheduled expiry has no signed-in person. The ledger records it honestly as a
+-- system actor rather than attributing the act to a human reviewer.
+alter table public.agri_evidence_reviews
+  drop constraint if exists agri_evidence_reviews_actor_role_check;
+alter table public.agri_evidence_reviews
+  add constraint agri_evidence_reviews_actor_role_check
+  check (actor_role in ('evidence_reviewer', 'content_manager', 'admin', 'submitter', 'system'));
+
+create or replace function public.grant_agri_review_authority(
+  p_party_id        uuid,
+  p_authority       text,
+  p_scope_crops     text[] default '{}'::text[],
+  p_scope_districts text[] default '{}'::text[],
+  p_note            text default null
+)
+returns public.agri_review_authorities
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_actor uuid := public.current_party_id();
+  v_row public.agri_review_authorities;
+begin
+  if not public.has_capability('admin') then
+    raise exception 'Granting review authority requires the admin capability.' using errcode = 'insufficient_privilege';
+  end if;
+  if p_authority not in ('evidence_reviewer', 'content_manager') then
+    raise exception 'Unknown review authority.' using errcode = 'check_violation';
+  end if;
+  if coalesce(btrim(p_note), '') = '' then
+    raise exception 'Granting review authority requires a note.' using errcode = 'check_violation';
+  end if;
+  -- An administrator may appoint someone else, never themselves. Self-grant is
+  -- the one path that would let admin silently become agronomic authority.
+  if p_party_id = v_actor then
+    raise exception 'You cannot grant review authority to yourself.' using errcode = 'insufficient_privilege';
+  end if;
+  if not exists (select 1 from public.parties p where p.id = p_party_id) then
+    raise exception 'Party % not found.', p_party_id using errcode = 'no_data_found';
+  end if;
+  if exists (
+    select 1 from unnest(coalesce(p_scope_crops, '{}'::text[])) c
+     where not exists (select 1 from public.crop_catalog cc where cc.code = c)
+  ) then
+    raise exception 'Review scope contains an unknown crop code.' using errcode = 'check_violation';
+  end if;
+
+  insert into public.agri_review_authorities (
+    party_id, authority, scope_crops, scope_districts, granted_by, note
+  ) values (
+    p_party_id, p_authority, coalesce(p_scope_crops, '{}'::text[]),
+    coalesce(p_scope_districts, '{}'::text[]), v_actor, btrim(p_note)
+  )
+  on conflict (party_id, authority) do update
+    set scope_crops = excluded.scope_crops,
+        scope_districts = excluded.scope_districts,
+        granted_by = excluded.granted_by,
+        granted_at = now(),
+        revoked_at = null,
+        revoked_by = null,
+        note = excluded.note
+  returning * into v_row;
+
+  perform public.write_audit(
+    'agri.review_authority_granted', 'agri_review_authorities', v_row.id, p_authority,
+    null, 'active',
+    jsonb_build_object('party_id', p_party_id, 'scopes', jsonb_build_object(
+      'crops', v_row.scope_crops, 'districts', v_row.scope_districts
+    )),
+    v_actor, 'admin'
+  );
+
+  return v_row;
+end;
+$$;
+
+comment on function public.grant_agri_review_authority(uuid, text, text[], text[], text) is
+  'Admin-only authority grant. Self-grant is refused: an administrator may appoint another person, never themselves. The grant is a recorded human decision and does not seed agronomic expertise.';
+
+create or replace function public.revoke_agri_review_authority(
+  p_party_id  uuid,
+  p_authority text,
+  p_note      text
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_actor uuid := public.current_party_id();
+begin
+  if not public.has_capability('admin') then
+    raise exception 'Revoking review authority requires the admin capability.' using errcode = 'insufficient_privilege';
+  end if;
+  if coalesce(btrim(p_note), '') = '' then
+    raise exception 'Revoking review authority requires a note.' using errcode = 'check_violation';
+  end if;
+
+  update public.agri_review_authorities
+     set revoked_at = now(), revoked_by = v_actor, note = btrim(p_note)
+   where party_id = p_party_id and authority = p_authority and revoked_at is null;
+  if not found then return false; end if;
+
+  perform public.write_audit(
+    'agri.review_authority_revoked', 'agri_review_authorities', null, p_authority,
+    'active', 'revoked', jsonb_build_object('party_id', p_party_id, 'note', btrim(p_note)),
+    v_actor, 'admin'
+  );
+  return true;
+end;
+$$;
+
+create or replace function public.agri_review_authorities_list()
+returns table (
+  party_id        uuid,
+  display_name    text,
+  authority       text,
+  scope_crops     text[],
+  scope_districts text[],
+  granted_at      timestamptz,
+  granted_by      uuid,
+  granted_by_name text,
+  revoked_at      timestamptz,
+  revoked_by      uuid,
+  revoked_by_name text,
+  note            text
+)
+language plpgsql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  if not public.has_capability('admin') then
+    raise exception 'Inspecting review authorities requires the admin capability.' using errcode = 'insufficient_privilege';
+  end if;
+
+  return query
+  select a.party_id,
+         coalesce(p.display_name, 'Account ' || left(a.party_id::text, 8)),
+         a.authority,
+         a.scope_crops,
+         a.scope_districts,
+         a.granted_at,
+         a.granted_by,
+         (select g.display_name from public.parties g where g.id = a.granted_by),
+         a.revoked_at,
+         a.revoked_by,
+         (select r.display_name from public.parties r where r.id = a.revoked_by),
+         a.note
+    from public.agri_review_authorities a
+    left join public.parties p on p.id = a.party_id
+   order by (a.revoked_at is null) desc, a.granted_at desc;
+end;
+$$;
+
+create or replace function public.agri_review_authority_candidates(p_search text default null)
+returns table (
+  party_id     uuid,
+  display_name text,
+  has_reviewer boolean,
+  has_manager  boolean
+)
+language plpgsql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  if not public.has_capability('admin') then
+    raise exception 'Inspecting review candidates requires the admin capability.' using errcode = 'insufficient_privilege';
+  end if;
+
+  return query
+  select p.id,
+         coalesce(p.display_name, 'Account ' || left(p.id::text, 8)),
+         exists (
+           select 1 from public.agri_review_authorities a
+            where a.party_id = p.id and a.authority = 'evidence_reviewer' and a.revoked_at is null
+         ),
+         exists (
+           select 1 from public.agri_review_authorities a
+            where a.party_id = p.id and a.authority = 'content_manager' and a.revoked_at is null
+         )
+    from public.parties p
+   where p.auth_user_id is not null
+     and (
+       p_search is null
+       or btrim(p_search) = ''
+       or coalesce(p.display_name, '') ilike '%' || btrim(p_search) || '%'
+     )
+   order by p.display_name nulls last, p.created_at
+   limit 20;
+end;
+$$;
+
+comment on function public.agri_review_authority_candidates(text) is
+  'Admin-only roster search for appointing a named person. It returns only accounts with a sign-in identity and never a phone number.';
+
+-- ---------------------------------------------------------------------------
+-- Scoped counts
+-- ---------------------------------------------------------------------------
+create or replace function public.agri_review_context()
+returns jsonb
+language plpgsql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_actor uuid := public.current_party_id();
+  v_review boolean;
+  v_manage boolean;
+begin
+  if v_actor is null then
+    raise exception 'An identified account is required.' using errcode = 'insufficient_privilege';
+  end if;
+
+  v_review := public.agri_has_authority_role('evidence_reviewer');
+  v_manage := public.agri_has_authority_role('content_manager');
+
+  return jsonb_build_object(
+    'party_id', v_actor,
+    'can_review', v_review,
+    'can_manage', v_manage,
+    'can_grant', public.has_capability('admin'),
+    'authorities', coalesce((
+      select jsonb_agg(jsonb_build_object(
+        'authority', a.authority,
+        'scope_crops', a.scope_crops,
+        'scope_districts', a.scope_districts,
+        'granted_at', a.granted_at
+      ) order by a.authority)
+      from public.agri_review_authorities a
+      where a.party_id = v_actor and a.revoked_at is null
+    ), '[]'::jsonb),
+    -- Counts are what this person may act on, not the national total. An
+    -- all-scope authority sees everything; a wheat-only reviewer sees wheat.
+    'counts', case
+      when v_review or v_manage then (
+        select jsonb_build_object(
+          'submitted', count(*) filter (where i.status = 'submitted'),
+          'under_review', count(*) filter (where i.status = 'under_review'),
+          'correction_requested', count(*) filter (where i.status = 'correction_requested'),
+          'approved', count(*) filter (where i.status = 'approved'),
+          'published', count(*) filter (where i.status = 'published'),
+          'rejected', count(*) filter (where i.status = 'rejected'),
+          'closed', count(*) filter (where i.status in ('expired', 'superseded'))
+        )
+        from public.agri_evidence_items i
+        where (v_review and public.agri_has_authority('evidence_reviewer', i.crop_code, i.districts))
+           or (v_manage and public.agri_has_authority('content_manager', i.crop_code, i.districts))
+      )
+      else '{}'::jsonb
+    end
+  );
+end;
+$$;
+
+comment on function public.agri_review_context() is
+  'The signed-in person''s review roles, scopes and counts scoped to the evidence their authority actually covers. It never exposes a role inferred from admin.';
+
+-- ---------------------------------------------------------------------------
+-- Scheduled expiry
+-- ---------------------------------------------------------------------------
+create or replace function public.agri_expire_due_evidence(p_now timestamptz default now())
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_row record;
+  v_count integer := 0;
+  v_ids uuid[] := '{}'::uuid[];
+begin
+  -- Only a live approved/published dossier can expire. A second run finds
+  -- nothing, so the schedule is idempotent by construction.
+  for v_row in
+    select *
+      from public.agri_evidence_items
+     where status in ('approved', 'published')
+       and valid_until is not null
+       and valid_until <= p_now
+     order by valid_until
+     for update
+  loop
+    -- Withdraw the content first: the target becomes unusable for new
+    -- recommendations, advisory verification or rule activation in the same
+    -- transaction that expires its evidence.
+    if v_row.status = 'published' then
+      if v_row.target_kind = 'knowledge_entry' then
+        update public.agri_knowledge_entries
+           set is_published = false
+         where id = v_row.target_ref::uuid;
+      elsif v_row.target_kind = 'official_advisory' then
+        update public.agri_advisories
+           set is_active = false
+         where id = v_row.target_ref::uuid;
+      else
+        update public.forecast_risk_rules
+           set is_active = false,
+               deactivated_at = p_now,
+               deactivation_note = 'Evidence validity window ended'
+         where code = v_row.target_ref;
+      end if;
+    end if;
+
+    update public.agri_evidence_items
+       set status = 'expired',
+           expired_at = p_now,
+           review_note = 'Validity window ended'
+     where id = v_row.id;
+
+    perform public.agri_log_evidence_event(
+      v_row.id, 'expire', v_row.status, 'expired', 'Validity window ended',
+      jsonb_build_object('automatic', true, 'valid_until', v_row.valid_until, 'expired_at', p_now),
+      'system'
+    );
+
+    v_count := v_count + 1;
+    v_ids := v_ids || v_row.id;
+  end loop;
+
+  return jsonb_build_object('expired', v_count, 'evidence_ids', to_jsonb(v_ids));
+end;
+$$;
+
+comment on function public.agri_expire_due_evidence(timestamptz) is
+  'Scheduled expiry of dossiers whose validity window has ended. It withdraws the linked target, writes the existing append-only ledger as a system actor and is idempotent: a repeated run expires nothing.';
+
+revoke execute on function public.agri_expire_due_evidence(timestamptz) from public, anon, authenticated;
+
+-- Hourly at :07. The function is the mechanism; pg_cron is only the clock. A
+-- local replay without pg_cron still has the function, and the DO block simply
+-- does not schedule it there.
+do $$
+begin
+  if exists (select 1 from pg_extension where extname = 'pg_cron') then
+    if exists (select 1 from cron.job where jobname = 'agri_evidence_expiry') then
+      perform cron.unschedule('agri_evidence_expiry');
+    end if;
+    perform cron.schedule(
+      'agri_evidence_expiry',
+      '7 * * * *',
+      'select public.agri_expire_due_evidence();'
+    );
+  end if;
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- Execute grants for the two new admin reads
+-- ---------------------------------------------------------------------------
+revoke execute on function public.agri_review_authorities_list() from public, anon;
+revoke execute on function public.agri_review_authority_candidates(text) from public, anon;
+grant execute on function public.agri_review_authorities_list() to authenticated;
+grant execute on function public.agri_review_authority_candidates(text) to authenticated;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261103001500_crop_lifecycle.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Phase 5.3 · Crop lifecycle intelligence
+--
+-- The platform already stores a stage on every crop instance and records every
+-- transition in crop_stage_history. What it could not answer was: who says so,
+-- how sure are they, from which rule version, and may advice rely on it?
+--
+-- This migration adds that evidence layer without creating a second crop or
+-- stage system:
+--
+--   * `crop_instances` keeps its one canonical stage, now with source,
+--     confidence, rule version and evidence;
+--   * `stage_source = 'unknown'` is the explicit unknown state. The enum is not
+--     extended, so existing consumers keep working and nobody can mistake an
+--     unknown stage for `planned`;
+--   * calendars live in `crop_lifecycle_calendars` and must be validated before
+--     they can be used. No crop calendar is seeded: unsupported crops stay
+--     unknown rather than receiving invented durations;
+--   * estimation is deterministic and idempotent. It never overwrites a
+--     farmer-confirmed stage and records every transition with its evidence;
+--   * stage-sensitive recommendations and alerts only qualify when the stage is
+--     confirmed or estimated above the configured confidence floor.
+
+-- ---------------------------------------------------------------------------
+-- Lifecycle provenance on the existing crop instance
+-- ---------------------------------------------------------------------------
+alter table public.crop_instances
+  add column variety             text,
+  add column stage_source        text not null default 'unknown',
+  add column stage_confidence    numeric,
+  add column stage_estimated_at  timestamptz,
+  add column stage_confirmed_at  timestamptz,
+  add column stage_confirmed_by  uuid references public.parties (id),
+  add column stage_rule_version  integer,
+  add column stage_evidence      jsonb not null default '{}'::jsonb,
+  add column stage_inputs_hash   text,
+  add column stage_calculated_at timestamptz;
+
+alter table public.crop_instances
+  add constraint crop_instances_stage_source_check
+    check (stage_source in ('unknown', 'estimated', 'farmer_confirmed', 'agronomist_confirmed')),
+  add constraint crop_instances_stage_confidence_check
+    check (stage_confidence is null or (stage_confidence >= 0 and stage_confidence <= 1)),
+  add constraint crop_instances_variety_check
+    check (variety is null or (variety = btrim(variety) and length(variety) between 1 and 80));
+
+comment on column public.crop_instances.stage_source is
+  'unknown | estimated | farmer_confirmed | agronomist_confirmed. An estimated stage is never presented as confirmed.';
+comment on column public.crop_instances.stage_confidence is
+  'Confidence of the current estimate, 0..1. Always 1 for a confirmed stage; null when unknown.';
+comment on column public.crop_instances.stage_evidence is
+  'Bounded evidence for the current stage: calendar id/version, inputs actually matched, days since sowing and weather context. No coordinates.';
+
+-- App-synced rows came from a stage the farmer chose in the app. Every other
+-- legacy row is treated as unknown until it is confirmed or estimated. Guessing
+-- `farmer_confirmed` from a non-app row would violate the separation this
+-- migration exists to enforce.
+update public.crop_instances
+   set stage_source = case when app_synced then 'farmer_confirmed' else 'unknown' end,
+       stage_confidence = case when app_synced then 1 else null end,
+       stage_confirmed_at = case when app_synced then updated_at else null end;
+
+alter table public.crop_stage_history
+  add column stage_source text,
+  add column confidence   numeric,
+  add column rule_version integer,
+  add column evidence     jsonb;
+
+comment on column public.crop_stage_history.stage_source is
+  'How the value was reached: farmer_confirmed, agronomist_confirmed, estimated or unknown (withdrawal).';
+
+-- ---------------------------------------------------------------------------
+-- Calendars: configurable, versioned, and inert until validated
+-- ---------------------------------------------------------------------------
+-- A calendar is an ordered list of inclusive day windows from sowing:
+--   [{"stage":"sown","start_day":0,"end_day":7}, ...]
+-- The validator checks structure and lifecycle order only. It deliberately does
+-- not judge whether the durations are agronomically right; that is what
+-- validated_by / validated_at / source_url record.
+create or replace function public.agri_validate_stage_calendar(p_stages jsonb)
+returns text
+language plpgsql
+immutable
+set search_path = public, pg_temp
+as $$
+declare
+  v_order constant text[] := array[
+    'planned','sown','germinating','vegetative','flowering','fruiting','maturity','harvested'
+  ];
+  v_item      jsonb;
+  v_stage     text;
+  v_start     integer;
+  v_end       integer;
+  v_prev_end  integer := -1;
+  v_prev_idx  integer := -1;
+  v_idx       integer;
+  v_first     boolean := true;
+begin
+  if p_stages is null or jsonb_typeof(p_stages) <> 'array' or jsonb_array_length(p_stages) = 0 then
+    return 'stages must be a non-empty array';
+  end if;
+
+  for v_item in select value from jsonb_array_elements(p_stages) loop
+    if jsonb_typeof(v_item) <> 'object' then
+      return 'each stage must be an object';
+    end if;
+
+    v_stage := v_item->>'stage';
+    v_idx := array_position(v_order, v_stage);
+    if v_stage is null or v_idx is null then
+      return 'unknown or unsupported calendar stage: ' || coalesce(v_stage, '(null)');
+    end if;
+
+    begin
+      v_start := (v_item->>'start_day')::integer;
+    exception when others then
+      return 'start_day must be an integer';
+    end;
+    begin
+      v_end := (v_item->>'end_day')::integer;
+    exception when others then
+      return 'end_day must be an integer or null';
+    end;
+
+    if v_start is null or v_start < 0 then
+      return 'start_day must be >= 0';
+    end if;
+    if v_end is not null and v_end < v_start then
+      return 'end_day must be >= start_day';
+    end if;
+    if v_first and v_start <> 0 then
+      return 'the first stage must start at day 0';
+    end if;
+    if v_start <> v_prev_end + 1 then
+      return 'stage windows must be contiguous';
+    end if;
+    if v_idx <= v_prev_idx then
+      return 'stages must follow lifecycle order and may not repeat';
+    end if;
+
+    v_prev_end := coalesce(v_end, 100000);
+    v_prev_idx := v_idx;
+    v_first := false;
+  end loop;
+
+  if v_prev_end < 20 then
+    return 'calendar must cover at least 20 days or leave the final window open';
+  end if;
+
+  return null;
+end;
+$$;
+
+comment on function public.agri_validate_stage_calendar(jsonb) is
+  'Structural and lifecycle-order validation for a calendar. Returns null when valid, otherwise the reason. It does not invent or judge agronomic durations.';
+
+create table public.crop_lifecycle_calendars (
+  id            uuid primary key default gen_random_uuid(),
+  crop_code     text not null references public.crop_catalog (code),
+  -- Null means "any variety" or "any district". A more specific row always wins.
+  variety       text,
+  district      text,
+  rule_version  integer not null check (rule_version > 0),
+  stages        jsonb not null,
+  source_code   text,
+  source_url    text check (source_url is null or source_url ~ '^https://[^[:space:]]+$'),
+  is_validated  boolean not null default false,
+  validated_by  uuid references public.parties (id),
+  validated_at  timestamptz,
+  notes         text,
+  is_active     boolean not null default true,
+  created_at    timestamptz not null default now(),
+  updated_at    timestamptz not null default now(),
+  constraint crop_lifecycle_calendar_shape
+    check (public.agri_validate_stage_calendar(stages) is null),
+  constraint crop_lifecycle_calendar_variety
+    check (variety is null or (variety = btrim(variety) and length(variety) between 1 and 80)),
+  constraint crop_lifecycle_calendar_district
+    check (district is null or (district = btrim(district) and length(district) between 1 and 80)),
+  constraint crop_lifecycle_calendar_validation
+    check (not is_validated or (validated_by is not null and validated_at is not null and source_url is not null))
+);
+
+comment on table public.crop_lifecycle_calendars is
+  'Versioned crop stage calendars. Only is_validated rows are used for estimation. No row is seeded by this migration: a crop without a validated calendar remains stage_unknown.';
+
+create unique index crop_lifecycle_calendars_unique_idx
+  on public.crop_lifecycle_calendars (crop_code, coalesce(variety, ''), coalesce(district, ''), rule_version);
+
+create index crop_lifecycle_calendars_lookup_idx
+  on public.crop_lifecycle_calendars (crop_code, variety, district)
+  where is_active and is_validated;
+
+create trigger crop_lifecycle_calendars_touch
+  before update on public.crop_lifecycle_calendars
+  for each row execute function public.touch_updated_at();
+
+alter table public.crop_lifecycle_calendars enable row level security;
+
+create policy crop_lifecycle_calendars_admin_read
+  on public.crop_lifecycle_calendars for select to authenticated
+  using (public.has_capability('admin'));
+
+revoke insert, update, delete on public.crop_lifecycle_calendars from anon, authenticated;
+grant select on public.crop_lifecycle_calendars to authenticated;
+
+-- ---------------------------------------------------------------------------
+-- One eligibility predicate, used by every stage-sensitive producer
+-- ---------------------------------------------------------------------------
+create or replace function public.agri_stage_matches(
+  p_source         text,
+  p_confidence     numeric,
+  p_stage          public.crop_stage,
+  p_required       public.crop_stage[],
+  p_min_confidence numeric default 0.7
+)
+returns boolean
+language sql
+immutable
+set search_path = public, pg_temp
+as $$
+  select case
+    when p_required is null or cardinality(p_required) = 0 then true
+    when p_stage is null then false
+    when p_source in ('farmer_confirmed', 'agronomist_confirmed') then p_stage = any (p_required)
+    when p_source = 'estimated'
+      and p_confidence is not null
+      and p_confidence >= greatest(0::numeric, least(1::numeric, coalesce(p_min_confidence, 0.7)))
+      then p_stage = any (p_required)
+    else false
+  end;
+$$;
+
+comment on function public.agri_stage_matches(text, numeric, public.crop_stage, public.crop_stage[], numeric) is
+  'The stage gate: confirmed stages always qualify; estimates only above the confidence floor; unknown never qualifies for stage-specific advice.';
+
+insert into public.intelligence_config (key, value, description) values
+  ('stage_rule_version', '1'::jsonb,
+   'Version of the deterministic lifecycle estimator.'),
+  ('stage_confidence_min_for_advice', '0.7'::jsonb,
+   'Minimum estimate confidence before stage-specific advice may rely on it.'),
+  ('stage_recalc_min_hours', '12'::jsonb,
+   'Minimum interval before an unchanged estimate is recalculated.')
+on conflict (key) do update
+  set value = excluded.value,
+      version = public.intelligence_config.version + 1,
+      description = excluded.description,
+      updated_at = now();
+
+-- ---------------------------------------------------------------------------
+-- The existing history trigger now records provenance as well as the stage
+-- ---------------------------------------------------------------------------
+create or replace function public.enforce_crop_stage_progress()
+returns trigger
+language plpgsql
+as $$
+declare
+  v_order constant text[] := array[
+    'planned','sown','germinating','vegetative','flowering','fruiting','maturity','harvested'
+  ];
+  v_from_idx integer;
+  v_to_idx   integer;
+begin
+  if new.stage is distinct from old.stage then
+    if new.stage = 'failed' then
+      null;
+    else
+      v_from_idx := array_position(v_order, old.stage::text);
+      v_to_idx   := array_position(v_order, new.stage::text);
+
+      if v_from_idx is not null and v_to_idx is not null and v_to_idx < v_from_idx then
+        if coalesce(btrim(current_setting('app.stage_correction_reason', true)), '') = '' then
+          raise exception
+            'Moving a crop from % back to % is a correction and requires a reason.',
+            old.stage, new.stage
+            using errcode = 'check_violation';
+        end if;
+      end if;
+    end if;
+
+    insert into public.crop_stage_history (
+      crop_id, from_stage, to_stage, changed_by, reason,
+      stage_source, confidence, rule_version, evidence
+    ) values (
+      new.id,
+      old.stage,
+      new.stage,
+      public.current_party_id(),
+      nullif(btrim(current_setting('app.stage_correction_reason', true)), ''),
+      new.stage_source,
+      new.stage_confidence,
+      new.stage_rule_version,
+      new.stage_evidence
+    );
+  end if;
+
+  return new;
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- Deterministic stage recalculation
+-- ---------------------------------------------------------------------------
+-- The estimator reads only existing inputs: the crop instance, live confirmed
+-- facts, the farmer's district and the richest validated calendar. Weather is
+-- recorded as context, never used to shift a stage because no validated
+-- weather-to-stage thresholds exist in this repository.
+create or replace function public.agri_recalculate_crop_stage(
+  p_crop_id uuid,
+  p_now     timestamptz default now()
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_crop             public.crop_instances;
+  v_district         text;
+  v_variety          text;
+  v_sown_on          date;
+  v_days             integer;
+  v_cal              public.crop_lifecycle_calendars;
+  v_stage            public.crop_stage;
+  v_stage_text       text;
+  v_confidence       numeric;
+  v_reason           text;
+  v_evidence         jsonb;
+  v_hash             text;
+  v_min_hours        integer := 12;
+  v_old_stage        public.crop_stage;
+  v_old_source       text;
+  v_weather          record;
+  v_weather_json     jsonb := '{}'::jsonb;
+  v_matched_variety  boolean := false;
+  v_matched_district boolean := false;
+  v_rule_version     integer;
+  v_calendar_id      uuid;
+begin
+  perform pg_advisory_xact_lock(hashtextextended('crop-stage:' || p_crop_id::text, 0));
+
+  select * into v_crop from public.crop_instances where id = p_crop_id;
+  if not found then
+    raise exception 'Crop % not found.', p_crop_id using errcode = 'no_data_found';
+  end if;
+  if v_crop.closed_at is not null then
+    return jsonb_build_object('status', 'closed', 'crop_id', p_crop_id);
+  end if;
+
+  -- A confirmed stage is never silently replaced by an estimate.
+  if v_crop.stage_source in ('farmer_confirmed', 'agronomist_confirmed') then
+    return jsonb_build_object(
+      'status', 'confirmed',
+      'crop_id', p_crop_id,
+      'stage', v_crop.stage,
+      'stage_source', v_crop.stage_source
+    );
+  end if;
+
+  select coalesce((value #>> '{}')::integer, 12) into v_min_hours
+    from public.intelligence_config where key = 'stage_recalc_min_hours';
+
+  select district into v_district
+    from public.farmer_intelligence_profiles where farmer_id = v_crop.farmer_id;
+
+  v_variety := nullif(btrim(coalesce(
+    v_crop.variety,
+    (select f.value_text from public.crop_facts f
+      where f.crop_id = v_crop.id and f.fact_key = 'variety' and f.superseded_at is null
+      order by f.stated_at desc limit 1)
+  )), '');
+
+  v_sown_on := coalesce(
+    v_crop.sown_on,
+    (select f.value_date from public.crop_facts f
+      where f.crop_id = v_crop.id and f.fact_key = 'sown_on'
+        and f.superseded_at is null and f.value_date is not null
+      order by f.stated_at desc limit 1)
+  );
+
+  if v_sown_on is null then
+    v_reason := 'sowing_date_missing';
+  elsif v_sown_on > p_now::date then
+    v_reason := 'sowing_date_future';
+  elsif p_now::date - v_sown_on > 1500 then
+    v_reason := 'sowing_date_too_old';
+  end if;
+
+  if v_reason is null then
+    select * into v_cal
+      from public.crop_lifecycle_calendars c
+     where c.crop_code = v_crop.crop_code
+       and c.is_active
+       and c.is_validated
+       and (c.variety is null or c.variety = v_variety)
+       and (c.district is null or c.district = v_district)
+     order by (c.variety is not null) desc,
+              (c.district is not null) desc,
+              c.rule_version desc,
+              c.created_at desc
+     limit 1;
+
+    if not found then
+      v_reason := 'calendar_unavailable';
+    else
+      v_rule_version := v_cal.rule_version;
+      v_calendar_id := v_cal.id;
+    end if;
+  end if;
+
+  if v_reason is null then
+    v_days := p_now::date - v_sown_on;
+
+    select s->>'stage' into v_stage_text
+      from jsonb_array_elements(v_cal.stages) s
+     where v_days >= (s->>'start_day')::integer
+       and (s->>'end_day' is null or v_days <= (s->>'end_day')::integer)
+     limit 1;
+
+    if v_stage_text is null then
+      v_reason := 'outside_calendar';
+    else
+      v_stage := v_stage_text::public.crop_stage;
+    end if;
+  end if;
+
+  if v_reason is null then
+    v_matched_variety := v_cal.variety is not null;
+    v_matched_district := v_cal.district is not null;
+
+    v_confidence := case
+      when v_matched_variety and v_matched_district then 0.90
+      when v_matched_variety then 0.80
+      when v_matched_district then 0.75
+      else 0.60
+    end;
+    if v_variety is not null and not v_matched_variety then
+      v_confidence := v_confidence - 0.05;
+    end if;
+    if v_district is not null and not v_matched_district then
+      v_confidence := v_confidence - 0.05;
+    end if;
+    v_confidence := round(greatest(0.40, least(0.95, v_confidence)), 2);
+  end if;
+
+  -- Weather is recorded as evidence of conditions, not used as a stage rule.
+  select * into v_weather
+    from public.farmer_profiles fp
+    cross join lateral public.latest_weather(fp.default_lat, fp.default_lon) w
+   where fp.party_id = v_crop.farmer_id
+     and fp.default_lat is not null
+     and fp.default_lon is not null
+   order by w.observed_at desc
+   limit 1;
+
+  if found then
+    v_weather_json := jsonb_strip_nulls(jsonb_build_object(
+      'provider', v_weather.provider_code,
+      'observed_at', v_weather.observed_at,
+      'usable', v_weather.is_usable,
+      'temp_c', v_weather.temp_c
+    ));
+  end if;
+
+  v_hash := md5(concat_ws('|',
+    v_crop.id::text,
+    v_crop.crop_code,
+    coalesce(v_variety, ''),
+    coalesce(v_sown_on::text, ''),
+    coalesce(v_district, ''),
+    coalesce(v_calendar_id::text, ''),
+    coalesce(v_rule_version::text, ''),
+    coalesce(v_reason, '')
+  ));
+
+  if v_hash = v_crop.stage_inputs_hash
+     and v_crop.stage_calculated_at is not null
+     and v_crop.stage_calculated_at > p_now - make_interval(hours => greatest(1, least(v_min_hours, 168))) then
+    return jsonb_build_object(
+      'status', 'unchanged',
+      'crop_id', p_crop_id,
+      'stage', v_crop.stage,
+      'stage_source', v_crop.stage_source,
+      'confidence', v_crop.stage_confidence
+    );
+  end if;
+
+  v_old_stage := v_crop.stage;
+  v_old_source := v_crop.stage_source;
+
+  if v_reason is not null then
+    v_evidence := jsonb_strip_nulls(jsonb_build_object(
+      'reason', v_reason,
+      'sown_on', v_sown_on,
+      'variety', v_variety,
+      'district', v_district,
+      'weather', v_weather_json,
+      'calculated_at', p_now
+    ));
+
+    update public.crop_instances
+       set stage_source = 'unknown',
+           stage_confidence = null,
+           stage_estimated_at = null,
+           stage_rule_version = null,
+           stage_evidence = v_evidence,
+           stage_inputs_hash = v_hash,
+           stage_calculated_at = p_now
+     where id = v_crop.id;
+
+    if v_old_source is distinct from 'unknown' then
+      insert into public.crop_stage_history (
+        crop_id, from_stage, to_stage, changed_by, reason,
+        stage_source, evidence
+      ) values (
+        v_crop.id, v_old_stage, v_old_stage, null,
+        'stage estimate withdrawn: ' || v_reason,
+        'unknown', v_evidence
+      );
+    end if;
+
+    perform public.write_audit(
+      'crop.stage_unknown', 'crop_instances', v_crop.id, v_crop.crop_code,
+      v_old_stage::text, 'unknown',
+      jsonb_build_object('reason', v_reason, 'rule_version', v_rule_version),
+      null, 'system'
+    );
+
+    return jsonb_build_object(
+      'status', 'unknown',
+      'crop_id', p_crop_id,
+      'reason', v_reason,
+      'stage', 'stage_unknown',
+      'stage_source', 'unknown',
+      'evidence', v_evidence
+    );
+  end if;
+
+  v_evidence := jsonb_strip_nulls(jsonb_build_object(
+    'reason', 'calendar_match',
+    'calendar_id', v_cal.id,
+    'calendar_version', v_cal.rule_version,
+    'sown_on', v_sown_on,
+    'days_since_sowing', v_days,
+    'variety', v_variety,
+    'district', v_district,
+    'variety_matched', v_matched_variety,
+    'district_matched', v_matched_district,
+    'weather', v_weather_json,
+    'calculated_at', p_now
+  ));
+
+  if v_stage is distinct from v_old_stage then
+    perform set_config(
+      'app.stage_correction_reason',
+      'stage estimated from lifecycle calendar ' || v_cal.rule_version::text,
+      true
+    );
+
+    update public.crop_instances
+       set stage = v_stage,
+           stage_source = 'estimated',
+           stage_confidence = v_confidence,
+           stage_estimated_at = p_now,
+           stage_rule_version = v_cal.rule_version,
+           stage_evidence = v_evidence,
+           stage_inputs_hash = v_hash,
+           stage_calculated_at = p_now
+     where id = v_crop.id;
+  else
+    update public.crop_instances
+       set stage_source = 'estimated',
+           stage_confidence = v_confidence,
+           stage_estimated_at = p_now,
+           stage_rule_version = v_cal.rule_version,
+           stage_evidence = v_evidence,
+           stage_inputs_hash = v_hash,
+           stage_calculated_at = p_now
+     where id = v_crop.id;
+
+    -- The row changed from unknown to estimated without changing stage, so the
+    -- before-update trigger had nothing to record. Keep that provenance edge.
+    if v_old_source is distinct from 'estimated' then
+      insert into public.crop_stage_history (
+        crop_id, from_stage, to_stage, changed_by, reason,
+        stage_source, confidence, rule_version, evidence
+      ) values (
+        v_crop.id, v_old_stage, v_stage, null,
+        'stage estimate recorded from lifecycle calendar ' || v_cal.rule_version::text,
+        'estimated', v_confidence, v_cal.rule_version, v_evidence
+      );
+    end if;
+  end if;
+
+  insert into public.crop_inferences (
+    crop_id, inference_key, value_text, derived_from, confidence, evidence, expires_at
+  ) values (
+    v_crop.id, 'growth_stage', v_stage::text, 'crop_lifecycle_calendar', v_confidence,
+    v_evidence, p_now + interval '30 days'
+  );
+
+  perform public.write_audit(
+    'crop.stage_estimated', 'crop_instances', v_crop.id, v_crop.crop_code,
+    v_old_stage::text, v_stage::text,
+    jsonb_build_object(
+      'confidence', v_confidence,
+      'rule_version', v_cal.rule_version,
+      'calendar_id', v_cal.id
+    ),
+    null, 'system'
+  );
+
+  return jsonb_build_object(
+    'status', 'estimated',
+    'crop_id', p_crop_id,
+    'stage', v_stage,
+    'stage_source', 'estimated',
+    'confidence', v_confidence,
+    'rule_version', v_cal.rule_version,
+    'evidence', v_evidence
+  );
+end;
+$$;
+
+comment on function public.agri_recalculate_crop_stage(uuid, timestamptz) is
+  'Deterministic, idempotent stage estimation. Refuses to touch a confirmed stage; writes unknown when inputs or a validated calendar are missing; records rule version and evidence.';
+
+create or replace function public.recalculate_my_crop_stage(p_crop_id uuid)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_farmer uuid := public.current_farmer_id();
+begin
+  if v_farmer is null then
+    raise exception 'An identified farmer is required.' using errcode = 'insufficient_privilege';
+  end if;
+  if not exists (
+    select 1 from public.crop_instances
+     where id = p_crop_id and farmer_id = v_farmer
+  ) then
+    raise exception 'Crop % not found for this farmer.', p_crop_id using errcode = 'insufficient_privilege';
+  end if;
+  return public.agri_recalculate_crop_stage(p_crop_id);
+end;
+$$;
+
+comment on function public.recalculate_my_crop_stage(uuid) is
+  'Authenticated recalculation for the caller''s own crop. The farmer id always comes from the JWT.';
+
+-- ---------------------------------------------------------------------------
+-- Farmer confirmation and correction
+-- ---------------------------------------------------------------------------
+create or replace function public.confirm_crop_stage(
+  p_crop_id uuid,
+  p_stage   public.crop_stage,
+  p_reason  text default null
+)
+returns public.crop_instances
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_farmer    uuid := public.current_farmer_id();
+  v_row       public.crop_instances;
+  v_old_stage public.crop_stage;
+  v_evidence  jsonb;
+begin
+  if v_farmer is null then
+    raise exception 'An identified farmer is required.' using errcode = 'insufficient_privilege';
+  end if;
+  if p_stage is null then
+    raise exception 'A stage is required.' using errcode = 'invalid_parameter_value';
+  end if;
+
+  select * into v_row
+    from public.crop_instances
+   where id = p_crop_id and farmer_id = v_farmer
+   for update;
+
+  if not found then
+    raise exception 'Crop % not found for this farmer.', p_crop_id using errcode = 'insufficient_privilege';
+  end if;
+  if v_row.closed_at is not null then
+    raise exception 'A closed crop cannot be confirmed.' using errcode = 'check_violation';
+  end if;
+
+  v_old_stage := v_row.stage;
+
+  if p_stage is distinct from v_old_stage
+     and p_stage <> 'failed'
+     and array_position(
+           array['planned','sown','germinating','vegetative','flowering','fruiting','maturity','harvested'],
+           p_stage::text
+         ) < array_position(
+           array['planned','sown','germinating','vegetative','flowering','fruiting','maturity','harvested'],
+           v_old_stage::text
+         )
+     and coalesce(btrim(p_reason), '') = '' then
+    raise exception 'A backward stage change requires a reason.' using errcode = 'check_violation';
+  end if;
+
+  perform set_config(
+    'app.stage_correction_reason',
+    coalesce(nullif(btrim(p_reason), ''), 'farmer confirmed stage'),
+    true
+  );
+
+  v_evidence := jsonb_strip_nulls(jsonb_build_object(
+    'reason', 'farmer_confirmation',
+    'confirmed_via', 'authenticated_farmer',
+    'note', nullif(btrim(p_reason), ''),
+    'confirmed_at', now()
+  ));
+
+  update public.crop_instances
+     set stage = p_stage,
+         stage_source = 'farmer_confirmed',
+         stage_confidence = 1,
+         stage_confirmed_at = now(),
+         stage_confirmed_by = public.current_party_id(),
+         stage_estimated_at = null,
+         stage_rule_version = null,
+         stage_evidence = v_evidence,
+         stage_inputs_hash = null,
+         stage_calculated_at = null
+   where id = p_crop_id
+   returning * into v_row;
+
+  -- A confirmation of the same stage is still a provenance change; the stage
+  -- trigger correctly stays silent, so record the confirmation here.
+  if v_old_stage = p_stage then
+    insert into public.crop_stage_history (
+      crop_id, from_stage, to_stage, changed_by, reason,
+      stage_source, confidence, evidence
+    ) values (
+      p_crop_id, v_old_stage, p_stage, public.current_party_id(),
+      coalesce(nullif(btrim(p_reason), ''), 'farmer confirmed stage'),
+      'farmer_confirmed', 1, v_evidence
+    );
+  end if;
+
+  perform public.write_audit(
+    'crop.stage_confirmed', 'crop_instances', p_crop_id, v_row.crop_code,
+    v_old_stage::text, p_stage::text,
+    jsonb_build_object('source', 'farmer', 'reason', nullif(btrim(p_reason), '')),
+    public.current_party_id(), 'farmer'
+  );
+
+  return v_row;
+end;
+$$;
+
+comment on function public.confirm_crop_stage(uuid, public.crop_stage, text) is
+  'Farmer-confirmed stage. Always overwrites an estimate, never the reverse; history and audit record the actor and reason.';
+
+create or replace function public.correct_crop_stage(
+  p_crop_id uuid,
+  p_stage   public.crop_stage,
+  p_reason  text
+)
+returns public.crop_instances
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  if coalesce(btrim(p_reason), '') = '' then
+    raise exception 'A stage correction requires a reason.' using errcode = 'check_violation';
+  end if;
+  return public.confirm_crop_stage(p_crop_id, p_stage, p_reason);
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- Input-change triggers and the scheduled batch seam
+-- ---------------------------------------------------------------------------
+create or replace function public.agri_crop_inputs_changed()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  perform public.agri_recalculate_crop_stage(new.id);
+  return null;
+end;
+$$;
+
+create trigger crop_instances_lifecycle_inputs
+  after update of sown_on, variety on public.crop_instances
+  for each row when (new.closed_at is null)
+  execute function public.agri_crop_inputs_changed();
+
+create or replace function public.agri_crop_fact_changed()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  if new.fact_key in ('sown_on', 'variety') then
+    perform public.agri_recalculate_crop_stage(new.crop_id);
+  end if;
+  return null;
+end;
+$$;
+
+create trigger crop_facts_lifecycle_inputs
+  after insert or update of fact_key, value_text, value_date on public.crop_facts
+  for each row when (new.superseded_at is null)
+  execute function public.agri_crop_fact_changed();
+
+-- Superseding a live sowing date or variety must also recalculate, because the
+-- estimator may need to fall back to another live fact or to unknown.
+create trigger crop_facts_lifecycle_superseded
+  after update of superseded_at on public.crop_facts
+  for each row when (new.superseded_at is not null and old.superseded_at is null)
+  execute function public.agri_crop_fact_changed();
+
+create or replace function public.job_refresh_crop_stages()
+returns integer
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_id    uuid;
+  v_count integer := 0;
+  v_res   jsonb;
+begin
+  for v_id in
+    select c.id
+      from public.crop_instances c
+     where c.closed_at is null
+       and c.stage_source not in ('farmer_confirmed', 'agronomist_confirmed')
+       and (
+         c.sown_on is not null
+         or exists (
+           select 1 from public.crop_facts f
+            where f.crop_id = c.id
+              and f.fact_key = 'sown_on'
+              and f.superseded_at is null
+         )
+       )
+     order by c.id
+  loop
+    v_res := public.agri_recalculate_crop_stage(v_id);
+    if v_res->>'status' = 'estimated' then
+      v_count := v_count + 1;
+    end if;
+  end loop;
+  return v_count;
+end;
+$$;
+
+comment on function public.job_refresh_crop_stages() is
+  'Service-only daily seam for recalculating open unconfirmed crops. The estimator is idempotent, so running it more often is safe.';
+
+create or replace function public.farmer_intelligence_context(p_farmer_id uuid default null)
+returns jsonb
+language plpgsql
+stable
+security invoker
+set search_path = public, pg_temp
+as $$
+declare
+  v_farmer uuid := coalesce(p_farmer_id, public.current_farmer_id());
+  v_profile public.farmer_intelligence_profiles;
+begin
+  if v_farmer is null then
+    raise exception 'An identified farmer is required.' using errcode = 'insufficient_privilege';
+  end if;
+
+  if p_farmer_id is not null
+     and p_farmer_id <> public.current_farmer_id()
+     and not public.has_capability('admin') then
+    raise exception 'A farmer may read only their own context.' using errcode = 'insufficient_privilege';
+  end if;
+
+  select * into v_profile from public.farmer_intelligence_profiles where farmer_id = v_farmer;
+
+  return jsonb_build_object(
+    'farmer_id', v_farmer,
+    'language', coalesce(
+      (select value #>> '{}' from public.farmer_preferences where farmer_id = v_farmer and key = 'language'),
+      v_profile.language,
+      'en'
+    ),
+    'district', v_profile.district,
+    'engagement_level', coalesce(v_profile.engagement_level, 'new'),
+    'primary_crop', (
+      select jsonb_build_object(
+        'crop_id', ci.id,
+        'crop_code', ci.crop_code,
+        'stage', case when ci.stage_source = 'unknown' then 'stage_unknown' else ci.stage::text end,
+        'stage_source', ci.stage_source,
+        'stage_confidence', ci.stage_confidence,
+        'stage_is_unknown', (ci.stage_source = 'unknown'),
+        'stage_estimated_at', ci.stage_estimated_at,
+        'stage_confirmed_at', ci.stage_confirmed_at,
+        'stage_rule_version', ci.stage_rule_version
+      )
+        from public.crop_instances ci
+       where ci.farmer_id = v_farmer and ci.is_primary and ci.closed_at is null
+       limit 1
+    ),
+    'crops', coalesce((
+      select jsonb_agg(jsonb_build_object(
+        'crop_id', ci.id,
+        'crop_code', ci.crop_code,
+        'stage', case when ci.stage_source = 'unknown' then 'stage_unknown' else ci.stage::text end,
+        'stage_source', ci.stage_source,
+        'stage_confidence', ci.stage_confidence,
+        'stage_is_unknown', (ci.stage_source = 'unknown'),
+        'stage_estimated_at', ci.stage_estimated_at,
+        'stage_confirmed_at', ci.stage_confirmed_at,
+        'stage_rule_version', ci.stage_rule_version,
+        'primary', ci.is_primary
+      ) order by ci.is_primary desc, ci.created_at)
+        from public.crop_instances ci
+       where ci.farmer_id = v_farmer and ci.closed_at is null
+    ), '[]'::jsonb),
+    'location', (
+      select jsonb_build_object('label', fp.default_location_label, 'area_id', fp.default_area_id)
+        from public.farmer_profiles fp where fp.party_id = v_farmer
+    ),
+    'interests', coalesce((
+      select jsonb_agg(jsonb_build_object(
+        'topic', i.topic,
+        'weight', round(i.weight, 3),
+        'source', i.source,
+        'pinned', i.pinned,
+        'crop_code', i.crop_code
+      ) order by i.pinned desc, i.weight desc)
+        from (
+          select topic, weight, source, pinned, crop_code from public.farmer_interests
+           where farmer_id = v_farmer and dismissed_at is null
+           order by pinned desc, weight desc limit 10
+        ) i
+    ), '[]'::jsonb),
+    'preferences', coalesce((
+      select jsonb_object_agg(p.key, p.value)
+        from public.farmer_preferences p where p.farmer_id = v_farmer
+    ), '{}'::jsonb),
+    'recent_signals', (
+      select count(*) from public.behaviour_signals s
+       where s.farmer_id = v_farmer
+         and coalesce(s.occurred_at, s.observed_at) > now() - interval '30 days'
+    ),
+    'scoring_version', coalesce(
+      (select (value #>> '{}')::integer from public.intelligence_config where key = 'scoring_version'),
+      1
+    )
+  );
+end;
+$$;
+
+create or replace function public.refresh_farmer_recommendations(p_farmer_id uuid)
+returns integer
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_ttl         integer := 21;
+  v_rule        integer := 1;
+  v_max         integer := 12;
+  v_count       integer := 0;
+  v_weather     record;
+  v_weather_body text;
+  v_weather_body_ur text;
+  v_min_conf    numeric := 0.7;
+begin
+  if p_farmer_id is null then
+    raise exception 'A farmer is required.' using errcode = 'invalid_parameter_value';
+  end if;
+
+  select coalesce((value #>> '{}')::integer, 21) into v_ttl
+    from public.intelligence_config where key = 'recommendation_ttl_days';
+  select coalesce((value #>> '{}')::integer, 1) into v_rule
+    from public.intelligence_config where key = 'recommendation_rule_version';
+  select coalesce((value #>> '{}')::numeric, 0.7) into v_min_conf
+    from public.intelligence_config where key = 'stage_confidence_min_for_advice';
+  select coalesce((value #>> '{}')::integer, 12) into v_max
+    from public.intelligence_config where key = 'max_recommendations_per_farmer';
+
+  with crops as (
+    select c.id, c.crop_code, c.stage, c.is_primary, c.stage_source, c.stage_confidence
+      from public.crop_instances c
+     where c.farmer_id = p_farmer_id
+       and c.closed_at is null
+  ),
+  profile as (
+    select f.district, f.primary_crop_code
+      from public.farmer_intelligence_profiles f
+     where f.farmer_id = p_farmer_id
+  ),
+  crop_matches as (
+    select
+      c.id as crop_id,
+      c.crop_code,
+      c.stage::text as stage,
+      c.is_primary,
+      e.id as entry_id,
+      e.slug,
+      e.version,
+      e.title_en,
+      e.title_ur,
+      e.body_en,
+      e.body_ur,
+      e.topic,
+      e.problem_type,
+      e.evidence_tier,
+      e.source_code,
+      e.source_url,
+      e.provenance,
+      public.agri_stage_matches(c.stage_source, c.stage_confidence, c.stage, e.applies_to_stages, v_min_conf) as stage_match,
+      c.stage_source,
+      c.stage_confidence,
+      coalesce(i.weight, 0) as interest_weight,
+      coalesce(i.pinned, false) as interest_pinned,
+      (
+        e.regions is null
+        or cardinality(e.regions) = 0
+        or 'Punjab' = any (e.regions)
+        or exists (
+          select 1 from profile p
+           where p.district is not null and p.district = any (e.regions)
+        )
+      ) as region_match
+    from crops c
+    join public.agri_knowledge_entries e
+      on e.crop_code = c.crop_code
+     and e.is_published
+     and e.evidence_tier in ('verified', 'supplementary')
+     and (e.applies_to_stages is null or cardinality(e.applies_to_stages) = 0
+          or public.agri_stage_matches(c.stage_source, c.stage_confidence, c.stage, e.applies_to_stages, v_min_conf))
+    left join lateral (
+      select max(fi.weight) as weight, bool_or(fi.pinned) as pinned
+        from public.farmer_interests fi
+       where fi.farmer_id = p_farmer_id
+         and fi.dismissed_at is null
+         and (
+           fi.topic = 'crop:' || c.crop_code
+           or fi.topic = 'topic:' || e.topic
+         )
+    ) i on true
+  ),
+  general_matches as (
+    select
+      null::uuid as crop_id,
+      null::text as crop_code,
+      null::text as stage,
+      false as is_primary,
+      e.id as entry_id,
+      e.slug,
+      e.version,
+      e.title_en,
+      e.title_ur,
+      e.body_en,
+      e.body_ur,
+      e.topic,
+      e.problem_type,
+      e.evidence_tier,
+      e.source_code,
+      e.source_url,
+      e.provenance,
+      false as stage_match,
+      null::text as stage_source,
+      null::numeric as stage_confidence,
+      coalesce(i.weight, 0) as interest_weight,
+      coalesce(i.pinned, false) as interest_pinned,
+      (
+        e.regions is null
+        or cardinality(e.regions) = 0
+        or 'Punjab' = any (e.regions)
+        or exists (
+          select 1 from profile p
+           where p.district is not null and p.district = any (e.regions)
+        )
+      ) as region_match
+    from public.agri_knowledge_entries e
+    left join lateral (
+      select max(fi.weight) as weight, bool_or(fi.pinned) as pinned
+        from public.farmer_interests fi
+       where fi.farmer_id = p_farmer_id
+         and fi.dismissed_at is null
+         and fi.topic = 'topic:' || e.topic
+    ) i on true
+    where e.crop_code is null
+      and e.is_published
+      and e.evidence_tier in ('verified', 'supplementary')
+      and i.weight is not null
+  ),
+  matches as (
+    select * from crop_matches
+    union all
+    select * from general_matches
+  ),
+  shaped as (
+    select
+      m.*,
+      case
+        when m.topic = 'pest' or m.problem_type = 'pest' then 'pest'
+        when m.topic = 'disease' or m.problem_type = 'disease' then 'disease'
+        when m.topic in ('weather', 'rain') then 'weather'
+        when m.topic = 'market' then 'market'
+        when m.topic in ('irrigation', 'water', 'nutrition', 'agronomy') then 'crop_stage'
+        else 'general'
+      end as kind,
+      case
+        when m.interest_pinned then 'pinned_interest'
+        when m.stage_match then 'crop_stage'
+        when m.crop_id is not null then 'crop'
+        else 'interest'
+      end as reason_code,
+      case
+        when m.evidence_tier = 'verified' then 0.95
+        else 0.65
+      end as confidence,
+      case
+        when m.evidence_tier = 'verified' then 10
+        else 25
+      end
+      + case
+          when m.topic in ('pest', 'disease') then 0
+          when m.topic in ('irrigation', 'water', 'nutrition', 'agronomy') then 5
+          else 15
+        end as priority
+    from matches m
+  )
+  insert into public.recommendations (
+    farmer_id, crop_id, kind, title, title_ur, body, body_ur,
+    action_label, action_label_ur, action_kind, action_ref,
+    source, source_ref, source_label, source_url,
+    confidence, knowledge_version, valid_until, priority, dedupe_key,
+    evidence_tier, reason_code, reason_context, rule_version
+  )
+  select
+    p_farmer_id,
+    s.crop_id,
+    s.kind,
+    s.title_en,
+    s.title_ur,
+    s.body_en,
+    s.body_ur,
+    case s.kind
+      when 'pest' then 'Scan the crop'
+      when 'disease' then 'Scan the crop'
+      when 'weather' then 'Check weather'
+      else 'Open crop'
+    end,
+    case s.kind
+      when 'pest' then 'فصل اسکین کریں'
+      when 'disease' then 'فصل اسکین کریں'
+      when 'weather' then 'موسم دیکھیں'
+      else 'فصل کھولیں'
+    end,
+    case s.kind
+      when 'pest' then 'open_scan'
+      when 'disease' then 'open_scan'
+      when 'weather' then 'open_weather'
+      else 'open_crop'
+    end,
+    s.slug,
+    'knowledge_base'::public.recommendation_source,
+    s.slug,
+    coalesce(src.publisher, src.name, s.provenance, 'Farmer App editorial notes'),
+    coalesce(s.source_url, src.url),
+    s.confidence,
+    s.version,
+    now() + make_interval(days => greatest(1, least(v_ttl, 90))),
+    s.priority,
+    'rec:knowledge:' || s.slug || ':v' || s.version || ':' || coalesce(s.crop_code, 'general'),
+    s.evidence_tier,
+    s.reason_code,
+    jsonb_strip_nulls(jsonb_build_object(
+      'crop_code', s.crop_code,
+      'stage', s.stage,
+      'topic', s.topic,
+      'region_match', s.region_match
+    )),
+    v_rule
+  from shaped s
+  left join public.agri_knowledge_sources src on src.code = s.source_code
+  order by s.priority, s.slug
+  limit greatest(1, least(v_max, 30))
+  on conflict (farmer_id, dedupe_key) where withdrawn_at is null do update
+    set crop_id = excluded.crop_id,
+        kind = excluded.kind,
+        title = excluded.title,
+        title_ur = excluded.title_ur,
+        body = excluded.body,
+        body_ur = excluded.body_ur,
+        action_label = excluded.action_label,
+        action_label_ur = excluded.action_label_ur,
+        action_kind = excluded.action_kind,
+        action_ref = excluded.action_ref,
+        source_label = excluded.source_label,
+        source_url = excluded.source_url,
+        confidence = excluded.confidence,
+        knowledge_version = excluded.knowledge_version,
+        valid_until = excluded.valid_until,
+        priority = excluded.priority,
+        evidence_tier = excluded.evidence_tier,
+        reason_code = excluded.reason_code,
+        reason_context = excluded.reason_context,
+        rule_version = excluded.rule_version;
+
+  get diagnostics v_count = row_count;
+
+  -- Weather advice is grounded in the existing, freshness-gated weather read.
+  -- If there is no usable reading for the farmer's saved coordinates, no weather
+  -- recommendation is invented.
+  select w.* into v_weather
+    from public.farmer_profiles fp
+    cross join lateral public.latest_weather(fp.default_lat, fp.default_lon) w
+   where fp.default_lat is not null
+     and fp.default_lon is not null
+     and fp.party_id = p_farmer_id
+     and w.is_usable
+   order by w.observed_at desc
+   limit 1;
+
+  if found and v_weather.is_usable then
+    v_weather_body := concat_ws(
+      ' ',
+      'Current reading:',
+      case when v_weather.temp_c is not null then round(v_weather.temp_c)::text || '°C.' else null end,
+      case when v_weather.humidity_pct is not null then 'Humidity ' || v_weather.humidity_pct || '%.' else null end,
+      case when v_weather.wind_kph is not null then 'Wind ' || round(v_weather.wind_kph)::text || ' km/h.' else null end,
+      'Check the weather card before spraying or irrigating.'
+    );
+    v_weather_body_ur := concat_ws(
+      ' ',
+      'موجودہ پڑھائی:',
+      case when v_weather.temp_c is not null then round(v_weather.temp_c)::text || ' ڈگری۔' else null end,
+      case when v_weather.humidity_pct is not null then 'نمی ' || v_weather.humidity_pct || '٪۔' else null end,
+      case when v_weather.wind_kph is not null then 'ہوا ' || round(v_weather.wind_kph)::text || ' کلومیٹر فی گھنٹہ۔' else null end,
+      'سپرے یا آبپاشی سے پہلے موسم کا کارڈ دیکھیں۔'
+    );
+
+    insert into public.recommendations (
+      farmer_id, kind, title, title_ur, body, body_ur, action_label, action_label_ur,
+      action_kind, source, source_ref, source_label, confidence, valid_until, priority,
+      dedupe_key, reason_code, reason_context, rule_version
+    ) values (
+      p_farmer_id,
+      'weather',
+      'Check the weather before field work',
+      'کھیت کے کام سے پہلے موسم دیکھیں',
+      v_weather_body,
+      v_weather_body_ur,
+      'Check weather',
+      'موسم دیکھیں',
+      'open_weather',
+      'weather',
+      'weather:' || v_weather.provider_code,
+      v_weather.provider_name,
+      0.85,
+      now() + interval '6 hours',
+      5,
+      'rec:weather:' || v_weather.provider_code || ':' || to_char(v_weather.observed_at, 'YYYYMMDD'),
+      'weather_now',
+      jsonb_build_object('observed_at', v_weather.observed_at, 'freshness', v_weather.freshness),
+      v_rule
+    )
+    on conflict (farmer_id, dedupe_key) where withdrawn_at is null do update
+      set title = excluded.title,
+          title_ur = excluded.title_ur,
+          body = excluded.body,
+          body_ur = excluded.body_ur,
+          source_label = excluded.source_label,
+          confidence = excluded.confidence,
+          valid_until = excluded.valid_until,
+          reason_context = excluded.reason_context,
+          rule_version = excluded.rule_version;
+
+    v_count := v_count + 1;
+  end if;
+
+  return v_count;
+end;
+$$;
+
+create or replace function public.refresh_farmer_alerts(p_farmer_id uuid)
+returns integer
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_pair       uuid;
+  v_pref       jsonb := '{}'::jsonb;
+  v_in_app     boolean := true;
+  v_push       boolean := false;
+  v_categories text[];
+  v_lat        double precision;
+  v_lon        double precision;
+  v_area       text;
+  v_district   text;
+  v_crop       record;
+  v_weather    record;
+  v_rule       public.alert_rules%rowtype;
+  v_match      record;
+  v_adv        record;
+  v_risk       record;
+  v_rec        uuid;
+  v_count      integer := 0;
+  v_live       integer := 0;
+  v_max        integer := 3;
+  v_refresh    integer := 15;
+  v_rule_ver   integer := 1;
+  v_last       timestamptz;
+  v_code       integer;
+  v_dedupe     text;
+  v_body_en    text;
+  v_body_ur    text;
+  v_title_en   text;
+  v_title_ur   text;
+  v_kind       text;
+  v_source_url text;
+  v_source_label text;
+  v_valid_until timestamptz;
+  v_source_kind text;
+  v_risk_confidence numeric;
+  v_min_conf   numeric := 0.7;
+begin
+  if p_farmer_id is null then
+    raise exception 'A farmer is required.' using errcode = 'invalid_parameter_value';
+  end if;
+
+  perform pg_advisory_xact_lock(hashtextextended('alerts:' || p_farmer_id::text, 0));
+
+  select coalesce((value #>> '{}')::integer, 3) into v_max
+    from public.intelligence_config where key = 'alert_max_per_farmer';
+  select coalesce((value #>> '{}')::integer, 15) into v_refresh
+    from public.intelligence_config where key = 'alert_refresh_minutes';
+  select coalesce((value #>> '{}')::integer, 1) into v_rule_ver
+    from public.intelligence_config where key = 'alert_rule_version';
+  select coalesce((value #>> '{}')::numeric, 0.7) into v_min_conf
+    from public.intelligence_config where key = 'stage_confidence_min_for_advice';
+
+  select value into v_pref
+    from public.farmer_preferences
+   where farmer_id = p_farmer_id and key = 'alerts';
+  if v_pref is null or jsonb_typeof(v_pref) <> 'object' then
+    v_pref := '{}'::jsonb;
+  end if;
+
+  v_in_app := coalesce((v_pref->>'in_app')::boolean, true);
+  v_push := coalesce((v_pref->>'push')::boolean, false);
+  if not v_in_app and not v_push then
+    return 0;
+  end if;
+
+  if jsonb_typeof(v_pref->'categories') = 'array' then
+    select coalesce(array_agg(value), array[]::text[])
+      into v_categories
+      from jsonb_array_elements_text(v_pref->'categories') value
+     where value in ('weather', 'pest', 'disease', 'crop_stage');
+  else
+    v_categories := array['weather', 'pest', 'disease', 'crop_stage']::text[];
+  end if;
+  if cardinality(v_categories) = 0 then
+    return 0;
+  end if;
+
+  select default_lat, default_lon, default_location_label
+    into v_lat, v_lon, v_area
+    from public.farmer_profiles
+   where party_id = p_farmer_id;
+
+  if v_lat is null or v_lon is null then
+    return 0;
+  end if;
+
+  -- A district is the region unit both official advisories and forecast risks
+  -- use. Prefer the explicit profile value; fall back to the saved area label so
+  -- a farmer whose district has not been separately captured is not silently
+  -- treated as regionless.
+  select nullif(btrim(ip.district), '')
+    into v_district
+    from public.farmer_intelligence_profiles ip
+   where ip.farmer_id = p_farmer_id;
+
+  if v_district is null and v_area is not null then
+    select d.name_en
+      into v_district
+      from public.districts d
+     where d.is_active
+       and (
+         v_area ilike '%' || d.name_en || '%'
+         or v_area ilike '%' || d.name_ur || '%'
+       )
+     order by length(d.name_en) desc
+     limit 1;
+  end if;
+
+  select id, crop_code, stage
+    into v_crop
+    from public.crop_instances
+   where farmer_id = p_farmer_id and closed_at is null
+   order by is_primary desc, created_at
+   limit 1;
+
+  if not found then
+    return 0;
+  end if;
+
+  select alerts_refreshed_at into v_last
+    from public.farmer_intelligence_profiles
+   where farmer_id = p_farmer_id;
+  if v_last is not null and v_last > now() - make_interval(mins => greatest(1, least(v_refresh, 360))) then
+    return 0;
+  end if;
+
+  -- Retire this farmer's expired alerts before counting the live cap. A stale
+  -- row must not keep a new observation out through the unique dedupe index.
+  update public.recommendations
+     set withdrawn_at = now(),
+         withdraw_reason = 'alert validity window passed'
+   where farmer_id = p_farmer_id
+     and alert_level is not null
+     and withdrawn_at is null
+     and valid_until is not null
+     and valid_until <= now();
+
+  select count(*) into v_live
+    from public.recommendations
+   where farmer_id = p_farmer_id
+     and alert_level is not null
+     and withdrawn_at is null
+     and (valid_until is null or valid_until > now());
+
+  -- Direct observed weather. This is a WMO condition, not an inferred pest
+  -- outbreak and not a threshold claimed to be agronomic advice.
+  select w.*, wr.condition_code
+    into v_weather
+    from public.farmer_profiles fp
+    cross join lateral public.latest_weather(fp.default_lat, fp.default_lon) w
+    join public.weather_readings wr
+      on wr.provider_code = w.provider_code
+     and wr.observed_at = w.observed_at
+     and wr.lat_cell = round(fp.default_lat::numeric, 3)
+     and wr.lon_cell = round(fp.default_lon::numeric, 3)
+   where fp.party_id = p_farmer_id
+     and w.is_usable
+     and wr.condition_code ~ '^[0-9]{1,3}$'
+   order by wr.observed_at desc
+   limit 1;
+
+  if found and v_live < v_max then
+    v_code := v_weather.condition_code::integer;
+
+    select * into v_rule
+      from public.alert_rules r
+     where r.is_active
+       and r.source_kind = 'weather_observation'
+       and r.category = any (v_categories)
+       and exists (
+         select 1
+           from jsonb_array_elements_text(r.condition->'condition_codes') elem
+          where elem::integer = v_code
+       )
+     order by r.priority
+     limit 1;
+
+    if found then
+      v_dedupe := 'alert:weather:' || v_rule.code || ':' || v_weather.provider_code || ':'
+        || v_code::text || ':' || to_char(v_weather.observed_at at time zone 'Asia/Karachi', 'YYYYMMDDHH24');
+
+      if not exists (
+        select 1 from public.recommendations r
+         where r.farmer_id = p_farmer_id
+           and r.alert_rule_code = v_rule.code
+           and r.withdrawn_at is null
+           and (r.valid_until is null or r.valid_until > now())
+      ) and not exists (
+        select 1 from public.recommendations r
+         where r.farmer_id = p_farmer_id
+           and r.alert_rule_code = v_rule.code
+           and r.alert_at > now() - make_interval(mins => v_rule.cooldown_minutes)
+      ) and (
+        select count(*) from public.recommendations r
+         where r.farmer_id = p_farmer_id
+           and r.alert_rule_code = v_rule.code
+           and r.alert_at > now() - interval '24 hours'
+      ) < v_rule.daily_cap then
+        v_title_en := v_rule.title_en;
+        v_title_ur := v_rule.title_ur;
+        v_body_en := format(v_rule.body_en, coalesce(v_weather.condition_text, 'Weather'), to_char(v_weather.observed_at at time zone 'Asia/Karachi', 'DD/MM HH24:MI'));
+        v_body_ur := format(v_rule.body_ur, coalesce(v_weather.condition_text, 'موسم'), to_char(v_weather.observed_at at time zone 'Asia/Karachi', 'DD/MM HH24:MI'));
+        v_valid_until := now() + make_interval(mins => v_rule.valid_for_minutes);
+
+        v_rec := null;
+        insert into public.recommendations (
+          farmer_id, crop_id, kind, title, title_ur, body, body_ur,
+          action_label, action_label_ur, action_kind,
+          source, source_ref, source_label, source_url,
+          confidence, valid_until, priority, dedupe_key,
+          evidence_tier, reason_code, reason_context, rule_version,
+          alert_level, alert_at, alert_rule_code, alert_source_kind
+        ) values (
+          p_farmer_id, v_crop.id, 'weather', v_title_en, v_title_ur, v_body_en, v_body_ur,
+          'Check weather', 'موسم دیکھیں', 'open_weather',
+          'weather', 'weather:' || v_weather.provider_code, v_weather.provider_name, null,
+          0.95, v_valid_until, v_rule.priority, v_dedupe,
+          null, 'weather_observation',
+          jsonb_strip_nulls(jsonb_build_object(
+            'crop_code', v_crop.crop_code,
+            'stage', v_crop.stage,
+            'condition_code', v_code,
+            'observed_at', v_weather.observed_at,
+            'area_label', left(coalesce(v_area, ''), 120)
+          )),
+          v_rule_ver, v_rule.level, now(), v_rule.code, 'weather_observation'
+        )
+        on conflict (farmer_id, dedupe_key) where withdrawn_at is null do nothing
+        returning id into v_rec;
+
+        if v_rec is not null then
+          v_count := v_count + 1;
+          v_live := v_live + 1;
+          if v_in_app then
+            insert into public.notification_events (
+              party_id, kind, recommendation_id, delivered_channels
+            ) values (
+              p_farmer_id, 'weather_alert', v_rec, array['in_app']::text[]
+            )
+            on conflict do nothing;
+          end if;
+          perform public.write_audit(
+            'alert.generated', 'recommendations', v_rec, v_rule.code,
+            null, v_rule.level,
+            jsonb_build_object('source', 'weather_observation', 'condition_code', v_code)
+          );
+        end if;
+      end if;
+    end if;
+  end if;
+
+  -- Time-bound, reviewed knowledge campaigns. This loop can only see a rule a
+  -- reviewer created with a start and end; a published entry alone never fires.
+  if v_live < v_max then
+    for v_match in
+      select
+        r.code as rule_code,
+        r.level,
+        r.category,
+        r.priority,
+        r.valid_for_minutes,
+        r.cooldown_minutes,
+        r.daily_cap,
+        r.ends_at,
+        r.version as rule_version,
+        e.slug,
+        e.version as entry_version,
+        e.title_en,
+        e.title_ur,
+        e.body_en,
+        e.body_ur,
+        e.topic,
+        e.problem_type,
+        e.evidence_tier,
+        e.regions,
+        c.id as crop_id,
+        c.crop_code,
+        c.stage,
+        e.source_url as entry_source_url,
+        src.publisher,
+        src.name as source_name,
+        src.url as source_url
+      from public.alert_rules r
+      join public.agri_knowledge_entries e on e.id = r.knowledge_entry_id
+      join public.crop_instances c
+        on c.farmer_id = p_farmer_id
+       and c.closed_at is null
+       and (r.crop_code is null or r.crop_code = c.crop_code)
+       and public.agri_stage_matches(c.stage_source, c.stage_confidence, c.stage, array[r.stage], v_min_conf)
+      left join public.agri_knowledge_sources src on src.code = e.source_code
+     where r.is_active
+       and r.source_kind = 'knowledge'
+       and r.starts_at <= now()
+       and r.ends_at > now()
+       and r.category = any (v_categories)
+       and e.is_published
+       and e.evidence_tier = 'verified'
+       and (
+         e.regions is null
+         or cardinality(e.regions) = 0
+         or 'Punjab' = any (e.regions)
+         or exists (
+           select 1 from public.farmer_intelligence_profiles ip
+            where ip.farmer_id = p_farmer_id
+              and ip.district is not null
+              and ip.district = any (e.regions)
+         )
+       )
+     order by r.priority, e.slug, c.id
+    loop
+      exit when v_live >= v_max;
+
+      if not exists (
+        select 1 from public.recommendations r
+         where r.farmer_id = p_farmer_id
+           and r.alert_rule_code = v_match.rule_code
+           and r.withdrawn_at is null
+           and (r.valid_until is null or r.valid_until > now())
+      ) and not exists (
+        select 1 from public.recommendations r
+         where r.farmer_id = p_farmer_id
+           and r.alert_rule_code = v_match.rule_code
+           and r.alert_at > now() - make_interval(mins => v_match.cooldown_minutes)
+      ) then
+        -- The curated rule's category is authoritative for feed filtering and
+        -- for the action we offer; the knowledge topic is supporting context.
+        v_kind := case v_match.category
+          when 'pest' then 'pest'
+          when 'disease' then 'disease'
+          when 'weather' then 'weather'
+          else 'crop_stage'
+        end;
+
+        v_dedupe := 'alert:knowledge:' || v_match.rule_code || ':' || v_match.crop_id::text
+          || ':v' || v_match.rule_version::text;
+        v_source_url := case
+          when coalesce(v_match.entry_source_url, v_match.source_url) ~ '^https://'
+            then coalesce(v_match.entry_source_url, v_match.source_url)
+          else null
+        end;
+        v_source_label := coalesce(v_match.publisher, v_match.source_name, 'Farmer App editorial notes');
+        v_valid_until := least(v_match.ends_at, now() + make_interval(mins => v_match.valid_for_minutes));
+
+        v_rec := null;
+        insert into public.recommendations (
+          farmer_id, crop_id, kind, title, title_ur, body, body_ur,
+          action_label, action_label_ur, action_kind,
+          source, source_ref, source_label, source_url,
+          confidence, knowledge_version, valid_until, priority, dedupe_key,
+          evidence_tier, reason_code, reason_context, rule_version,
+          alert_level, alert_at, alert_rule_code, alert_source_kind
+        ) values (
+          p_farmer_id, v_match.crop_id, v_kind, v_match.title_en, v_match.title_ur,
+          v_match.body_en, v_match.body_ur,
+          case when v_kind in ('pest', 'disease') then 'Scan the crop' else 'Open crop' end,
+          case when v_kind in ('pest', 'disease') then 'فصل اسکین کریں' else 'فصل کھولیں' end,
+          case when v_kind in ('pest', 'disease') then 'open_scan' else 'open_crop' end,
+          'knowledge_base', v_match.slug, v_source_label, v_source_url,
+          0.95, v_match.entry_version, v_valid_until, v_match.priority, v_dedupe,
+          v_match.evidence_tier, 'crop_stage',
+          jsonb_strip_nulls(jsonb_build_object(
+            'crop_code', v_match.crop_code,
+            'stage', v_match.stage,
+            'topic', v_match.topic,
+            'rule', v_match.rule_code
+          )),
+          v_match.rule_version, v_match.level, now(), v_match.rule_code, 'knowledge'
+        )
+        on conflict (farmer_id, dedupe_key) where withdrawn_at is null do nothing
+        returning id into v_rec;
+
+        if v_rec is not null then
+          v_count := v_count + 1;
+          v_live := v_live + 1;
+          if v_in_app then
+            insert into public.notification_events (
+              party_id, kind, recommendation_id, delivered_channels
+            ) values (
+              p_farmer_id, 'recommendation', v_rec, array['in_app']::text[]
+            )
+            on conflict do nothing;
+          end if;
+          perform public.write_audit(
+            'alert.generated', 'recommendations', v_rec, v_match.rule_code,
+            null, v_match.level,
+            jsonb_build_object('source', 'knowledge', 'slug', v_match.slug)
+          );
+        end if;
+      end if;
+    end loop;
+  end if;
+
+  -- Verified official advisories. Unverified rows are invisible at the table
+  -- read policy and are filtered here again; the review act is admin-only and
+  -- requires the source URL, district and future validity window.
+  if v_district is not null and v_live < v_max then
+    for v_adv in
+      select
+        a.id as advisory_id,
+        a.title,
+        a.title_ur,
+        a.summary,
+        a.summary_ur,
+        a.topic,
+        a.alert_level,
+        a.source_code,
+        a.source_ref,
+        a.source_url,
+        a.published_at,
+        a.valid_until,
+        c.id as crop_id,
+        c.crop_code,
+        c.stage,
+        src.name as source_name
+      from public.agri_advisories a
+      join public.intel_sources src
+        on src.code = a.source_code
+       and src.is_active
+       and src.kind = 'official_advisory'
+      join public.crop_instances c
+        on c.farmer_id = p_farmer_id
+       and c.closed_at is null
+       and (a.crop_code is null or a.crop_code = c.crop_code)
+     where a.is_active
+       and a.verification_status = 'verified'
+       and a.published_at <= now()
+       and a.valid_until is not null
+       and a.valid_until > now()
+       and a.district is not null
+       and lower(btrim(a.district)) = lower(btrim(v_district))
+       and a.alert_level is not null
+       and (case a.topic
+         when 'pest' then 'pest'
+         when 'disease' then 'disease'
+         when 'weather_damage' then 'weather'
+         when 'water' then 'weather'
+         else 'crop_stage'
+       end) = any (v_categories)
+     order by
+       case a.alert_level when 'urgent' then 0 when 'watch' then 1 else 2 end,
+       a.published_at desc,
+       c.id
+    loop
+      exit when v_live >= v_max;
+
+      v_dedupe := 'alert:advisory:' || v_adv.advisory_id::text || ':' || v_adv.crop_id::text;
+
+      if not exists (
+        select 1 from public.recommendations r
+         where r.farmer_id = p_farmer_id
+           and r.dedupe_key = v_dedupe
+      ) then
+        v_kind := case v_adv.topic
+          when 'pest' then 'pest'
+          when 'disease' then 'disease'
+          when 'weather_damage' then 'weather'
+          when 'water' then 'weather'
+          else 'crop_stage'
+        end;
+        v_source_url := case
+          when v_adv.source_url ~ '^https://[^[:space:]]+$' then v_adv.source_url
+          else null
+        end;
+        v_source_label := v_adv.source_name;
+        v_valid_until := v_adv.valid_until;
+
+        v_rec := null;
+        insert into public.recommendations (
+          farmer_id, crop_id, kind, title, title_ur, body, body_ur,
+          action_label, action_label_ur, action_kind,
+          source, source_ref, source_label, source_url,
+          confidence, valid_until, priority, dedupe_key,
+          evidence_tier, reason_code, reason_context, rule_version,
+          alert_level, alert_at, alert_rule_code, alert_source_kind
+        ) values (
+          p_farmer_id, v_adv.crop_id, v_kind, v_adv.title, coalesce(v_adv.title_ur, v_adv.title),
+          v_adv.summary, coalesce(v_adv.summary_ur, v_adv.summary),
+          'Open crop', 'فصل کھولیں', 'open_crop',
+          'knowledge_base', 'official_advisory:' || v_adv.advisory_id::text,
+          v_source_label, v_source_url,
+          null, v_valid_until, 10, v_dedupe,
+          'verified', 'official_advisory',
+          jsonb_strip_nulls(jsonb_build_object(
+            'crop_code', v_adv.crop_code,
+            'stage', v_adv.stage,
+            'topic', v_adv.topic,
+            'district', v_district,
+            'source_code', v_adv.source_code,
+            'source_ref', v_adv.source_ref,
+            'published_at', v_adv.published_at,
+            'advisory_id', v_adv.advisory_id
+          )),
+          v_rule_ver, v_adv.alert_level, now(),
+          'advisory:' || v_adv.advisory_id::text, 'official_advisory'
+        )
+        on conflict (farmer_id, dedupe_key) where withdrawn_at is null do nothing
+        returning id into v_rec;
+
+        if v_rec is not null then
+          v_count := v_count + 1;
+          v_live := v_live + 1;
+          if v_in_app then
+            insert into public.notification_events (
+              party_id, kind, recommendation_id, delivered_channels
+            ) values (
+              p_farmer_id, 'recommendation', v_rec, array['in_app']::text[]
+            )
+            on conflict do nothing;
+          end if;
+          perform public.write_audit(
+            'alert.generated', 'recommendations', v_rec,
+            'advisory:' || v_adv.advisory_id::text,
+            null, v_adv.alert_level,
+            jsonb_build_object(
+              'source', 'official_advisory',
+              'source_code', v_adv.source_code,
+              'advisory_id', v_adv.advisory_id,
+              'district', v_district
+            )
+          );
+        end if;
+      end if;
+    end loop;
+  end if;
+
+  -- Model-derived risks. A row is eligible only when its rule is active, the
+  -- rule's cited knowledge is published and verified, the source is an active
+  -- forecast source, and district/crop/stage match this farmer. An inactive rule
+  -- (the only state this repository ships) cannot produce an alert even if a
+  -- stale risk row exists.
+  if v_district is not null and v_live < v_max then
+    for v_risk in
+      select
+        k.id as risk_id,
+        k.rule_code,
+        k.topic,
+        k.title,
+        k.title_ur,
+        k.summary,
+        k.summary_ur,
+        k.risk_on,
+        k.issued_on,
+        k.expires_at,
+        k.confidence,
+        k.metric,
+        k.operator,
+        k.threshold,
+        k.observed_value,
+        k.basis,
+        k.district_code,
+        r.source_code,
+        e.slug as entry_slug,
+        e.evidence_tier,
+        e.applies_to_stages,
+        e.source_url as entry_source_url,
+        src.name as source_name,
+        src.endpoint_url as source_endpoint_url,
+        d.name_en as district_name,
+        c.id as crop_id,
+        c.crop_code,
+        c.stage
+      from public.forecast_risks k
+      join public.forecast_risk_rules r
+        on r.code = k.rule_code
+       and r.is_active
+      join public.agri_knowledge_entries e
+        on e.id = r.knowledge_entry_id
+       and e.is_published
+       and e.evidence_tier = 'verified'
+      join public.intel_sources src
+        on src.code = r.source_code
+       and src.is_active
+       and src.kind = 'forecast_risk'
+      join public.districts d
+        on d.code = k.district_code
+       and d.is_active
+      join public.crop_instances c
+        on c.farmer_id = p_farmer_id
+       and c.closed_at is null
+       and (k.crop_code is null or k.crop_code = c.crop_code)
+       and (
+         e.applies_to_stages is null
+         or cardinality(e.applies_to_stages) = 0
+         or public.agri_stage_matches(c.stage_source, c.stage_confidence, c.stage, e.applies_to_stages, v_min_conf)
+       )
+     where k.expires_at > now()
+       and k.observed_at <= now()
+       and (
+         lower(d.name_en) = lower(btrim(v_district))
+         or lower(d.name_ur) = lower(btrim(v_district))
+       )
+       and (case k.topic
+         when 'pest' then 'pest'
+         when 'disease' then 'disease'
+         when 'weather_damage' then 'weather'
+         when 'water' then 'weather'
+         else 'crop_stage'
+       end) = any (v_categories)
+     order by k.risk_on, k.expires_at, c.id
+    loop
+      exit when v_live >= v_max;
+
+      v_dedupe := 'alert:forecast:' || v_risk.risk_id::text;
+
+      if not exists (
+        select 1 from public.recommendations r
+         where r.farmer_id = p_farmer_id
+           and r.dedupe_key = v_dedupe
+      ) then
+        v_kind := case v_risk.topic
+          when 'pest' then 'pest'
+          when 'disease' then 'disease'
+          when 'weather_damage' then 'weather'
+          when 'water' then 'weather'
+          else 'crop_stage'
+        end;
+        v_source_url := case
+          when v_risk.entry_source_url ~ '^https://[^[:space:]]+$' then v_risk.entry_source_url
+          when v_risk.source_endpoint_url ~ '^https://[^[:space:]]+$' then v_risk.source_endpoint_url
+          else null
+        end;
+        v_source_label := v_risk.source_name;
+        v_valid_until := v_risk.expires_at;
+        v_risk_confidence := v_risk.confidence;
+        v_title_en := v_risk.title;
+        v_title_ur := coalesce(v_risk.title_ur, v_risk.title);
+        v_body_en := v_risk.summary;
+        v_body_ur := coalesce(v_risk.summary_ur, v_risk.summary);
+
+        v_rec := null;
+        insert into public.recommendations (
+          farmer_id, crop_id, kind, title, title_ur, body, body_ur,
+          action_label, action_label_ur, action_kind,
+          source, source_ref, source_label, source_url,
+          confidence, valid_until, priority, dedupe_key,
+          evidence_tier, reason_code, reason_context, rule_version,
+          alert_level, alert_at, alert_rule_code, alert_source_kind
+        ) values (
+          p_farmer_id, v_risk.crop_id, v_kind, v_title_en, v_title_ur, v_body_en, v_body_ur,
+          case when v_kind = 'weather' then 'Check weather' else 'Open crop' end,
+          case when v_kind = 'weather' then 'موسم دیکھیں' else 'فصل کھولیں' end,
+          case when v_kind = 'weather' then 'open_weather' else 'open_crop' end,
+          'weather', 'forecast_risk:' || v_risk.rule_code,
+          v_source_label, v_source_url,
+          v_risk_confidence, v_valid_until, 20, v_dedupe,
+          null, 'forecast_risk',
+          jsonb_strip_nulls(jsonb_build_object(
+            'crop_code', v_risk.crop_code,
+            'stage', v_risk.stage,
+            'topic', v_risk.topic,
+            'district_code', v_risk.district_code,
+            'district', v_risk.district_name,
+            'risk_on', v_risk.risk_on,
+            'issued_on', v_risk.issued_on,
+            'metric', v_risk.metric,
+            'operator', v_risk.operator,
+            'threshold', v_risk.threshold,
+            'observed_value', v_risk.observed_value,
+            'basis', v_risk.basis,
+            'rule', v_risk.rule_code,
+            'knowledge', v_risk.entry_slug
+          )),
+          v_rule_ver, 'watch', now(),
+          'forecast:' || v_risk.rule_code, 'forecast_risk'
+        )
+        on conflict (farmer_id, dedupe_key) where withdrawn_at is null do nothing
+        returning id into v_rec;
+
+        if v_rec is not null then
+          v_count := v_count + 1;
+          v_live := v_live + 1;
+          if v_in_app then
+            insert into public.notification_events (
+              party_id, kind, recommendation_id, delivered_channels
+            ) values (
+              p_farmer_id, 'recommendation', v_rec, array['in_app']::text[]
+            )
+            on conflict do nothing;
+          end if;
+          perform public.write_audit(
+            'alert.generated', 'recommendations', v_rec,
+            'forecast:' || v_risk.rule_code,
+            null, 'watch',
+            jsonb_build_object(
+              'source', 'forecast_risk',
+              'risk_id', v_risk.risk_id,
+              'district_code', v_risk.district_code,
+              'knowledge', v_risk.entry_slug
+            )
+          );
+        end if;
+      end if;
+    end loop;
+  end if;
+
+  insert into public.farmer_intelligence_profiles (farmer_id, alerts_refreshed_at)
+  values (p_farmer_id, now())
+  on conflict (farmer_id) do update
+    set alerts_refreshed_at = excluded.alerts_refreshed_at,
+        updated_at = now();
+
+  perform public.write_audit(
+    'alerts.refreshed', 'farmer_intelligence_profiles', p_farmer_id, null,
+    null, v_count::text,
+    jsonb_build_object('generated', v_count, 'live', v_live, 'rule_version', v_rule_ver)
+  );
+
+  return v_count;
+end;
+$$;
+
+-- Synchronization now carries sowing date, variety and provenance
+-- ---------------------------------------------------------------------------
+create or replace function public.sync_my_crops(p_crops jsonb default '[]'::jsonb)
+returns integer
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_farmer          uuid := public.current_farmer_id();
+  v_item            jsonb;
+  v_code            text;
+  v_stage_text      text;
+  v_stage           public.crop_stage;
+  v_stage_given     boolean;
+  v_primary         boolean;
+  v_primary_code    text;
+  v_current_primary text;
+  v_row             public.crop_instances;
+  v_codes           text[] := '{}'::text[];
+  v_changed         boolean := false;
+  v_count           integer := 0;
+  v_sown_on         date;
+  v_variety         text;
+begin
+  if v_farmer is null then
+    raise exception 'An identified farmer is required.' using errcode = 'insufficient_privilege';
+  end if;
+
+  if p_crops is null or jsonb_typeof(p_crops) <> 'array' then
+    raise exception 'Crop context must be a JSON array.' using errcode = 'check_violation';
+  end if;
+
+  if jsonb_array_length(p_crops) > 12 then
+    raise exception 'At most 12 active crops may be synchronized.' using errcode = 'check_violation';
+  end if;
+
+  perform set_config('app.stage_correction_reason', 'active crop list synchronized from the app', true);
+
+  select crop_code into v_current_primary
+    from public.crop_instances
+   where farmer_id = v_farmer
+     and closed_at is null
+     and is_primary
+   limit 1;
+
+  for v_item in select value from jsonb_array_elements(p_crops) loop
+    if jsonb_typeof(v_item) <> 'object' then
+      raise exception 'Each crop must be an object.' using errcode = 'check_violation';
+    end if;
+
+    v_code := nullif(btrim(v_item->>'crop_code'), '');
+    if v_code is null or v_code !~ '^[a-z][a-z0-9_]{1,40}$'
+       or not exists (select 1 from public.crop_catalog c where c.code = v_code and c.is_active) then
+      raise exception 'Unknown crop code: %', coalesce(v_code, '(null)') using errcode = 'check_violation';
+    end if;
+
+    if v_code = any (v_codes) then
+      raise exception 'Crop % appears more than once in the context.', v_code using errcode = 'check_violation';
+    end if;
+    v_codes := array_append(v_codes, v_code);
+
+    v_stage_text := nullif(btrim(v_item->>'stage'), '');
+    v_stage_given := v_stage_text is not null;
+    if v_stage_given then
+      if v_stage_text not in
+         ('planned','sown','germinating','vegetative','flowering','fruiting','maturity','harvested','failed') then
+        raise exception 'Unknown crop stage: %', v_stage_text using errcode = 'check_violation';
+      end if;
+      v_stage := v_stage_text::public.crop_stage;
+    else
+      v_stage := null;
+    end if;
+
+    v_sown_on := null;
+    if nullif(btrim(v_item->>'sown_on'), '') is not null then
+      begin
+        v_sown_on := (v_item->>'sown_on')::date;
+      exception when others then
+        raise exception 'sown_on must be an ISO date.' using errcode = 'check_violation';
+      end;
+      if v_sown_on > current_date then
+        raise exception 'sown_on may not be in the future.' using errcode = 'check_violation';
+      end if;
+      if v_sown_on < current_date - 1500 then
+        raise exception 'sown_on is too far in the past.' using errcode = 'check_violation';
+      end if;
+    end if;
+
+    v_variety := nullif(btrim(v_item->>'variety'), '');
+    if v_variety is not null and length(v_variety) > 80 then
+      raise exception 'variety must be 80 characters or fewer.' using errcode = 'check_violation';
+    end if;
+
+    v_primary := case
+      when jsonb_typeof(v_item->'primary') = 'boolean' then (v_item->>'primary')::boolean
+      else false
+    end;
+    if v_primary then
+      if v_primary_code is not null then
+        raise exception 'Only one crop may be primary.' using errcode = 'check_violation';
+      end if;
+      v_primary_code := v_code;
+    end if;
+
+    select * into v_row
+      from public.crop_instances
+     where farmer_id = v_farmer
+       and crop_code = v_code
+       and closed_at is null
+     order by created_at, id
+     limit 1;
+
+    if found then
+      if v_row.stage is distinct from coalesce(v_stage, v_row.stage)
+         or v_row.sown_on is distinct from coalesce(v_sown_on, v_row.sown_on)
+         or v_row.variety is distinct from coalesce(v_variety, v_row.variety)
+         or not v_row.app_synced then
+        v_changed := true;
+      end if;
+
+      update public.crop_instances
+         set stage = coalesce(v_stage, stage),
+             stage_source = case when v_stage_given then 'farmer_confirmed' else stage_source end,
+             stage_confidence = case when v_stage_given then 1 else stage_confidence end,
+             stage_confirmed_at = case when v_stage_given then now() else stage_confirmed_at end,
+             stage_confirmed_by = case when v_stage_given then public.current_party_id() else stage_confirmed_by end,
+             sown_on = coalesce(v_sown_on, sown_on),
+             variety = coalesce(v_variety, variety),
+             app_synced = true,
+             is_primary = false
+       where id = v_row.id;
+    else
+      insert into public.crop_instances (
+        farmer_id, crop_code, stage, stage_source, stage_confidence,
+        stage_confirmed_at, stage_confirmed_by, sown_on, variety,
+        is_primary, app_synced
+      ) values (
+        v_farmer, v_code, coalesce(v_stage, 'planned'),
+        case when v_stage_given then 'farmer_confirmed' else 'unknown' end,
+        case when v_stage_given then 1 else null end,
+        case when v_stage_given then now() else null end,
+        case when v_stage_given then public.current_party_id() else null end,
+        v_sown_on, v_variety, false, true
+      ) returning * into v_row;
+      v_changed := true;
+    end if;
+
+    v_count := v_count + 1;
+  end loop;
+
+  if exists (
+    select 1 from public.crop_instances c
+     where c.farmer_id = v_farmer
+       and c.app_synced
+       and c.closed_at is null
+       and not (c.crop_code = any (v_codes))
+  ) then
+    v_changed := true;
+    update public.crop_instances
+       set closed_at = now(), is_primary = false
+     where farmer_id = v_farmer
+       and app_synced
+       and closed_at is null
+       and not (crop_code = any (v_codes));
+  end if;
+
+  if v_primary_code is null and array_length(v_codes, 1) is not null then
+    v_primary_code := v_codes[1];
+  end if;
+
+  if v_current_primary is distinct from v_primary_code then
+    v_changed := true;
+  end if;
+
+  if array_length(v_codes, 1) is not null then
+    update public.crop_instances
+       set is_primary = false
+     where farmer_id = v_farmer
+       and closed_at is null
+       and is_primary;
+
+    update public.crop_instances
+       set is_primary = true
+     where farmer_id = v_farmer
+       and crop_code = v_primary_code
+       and closed_at is null;
+  end if;
+
+  insert into public.farmer_intelligence_profiles (
+    farmer_id, primary_crop_code, recommendations_refreshed_at
+  ) values (
+    v_farmer, v_primary_code, null
+  )
+  on conflict (farmer_id) do update
+    set primary_crop_code = excluded.primary_crop_code,
+        recommendations_refreshed_at = case
+          when v_changed then null
+          else public.farmer_intelligence_profiles.recommendations_refreshed_at
+        end,
+        updated_at = now();
+
+  return v_count;
+end;
+$$;
+
+comment on function public.sync_my_crops(jsonb) is
+  'Validated, JWT-owned synchronization of the app crop list into the canonical crop table. A supplied stage is a farmer confirmation; an omitted stage is never invented. Carries sowing date and variety, and closes only app-owned stale rows.';
+
+-- ---------------------------------------------------------------------------
+-- Privileges
+-- ---------------------------------------------------------------------------
+revoke execute on function public.agri_recalculate_crop_stage(uuid, timestamptz) from public, anon, authenticated;
+revoke execute on function public.job_refresh_crop_stages() from public, anon, authenticated;
+revoke execute on function public.agri_crop_inputs_changed() from public, anon, authenticated;
+revoke execute on function public.agri_crop_fact_changed() from public, anon, authenticated;
+
+revoke execute on function public.recalculate_my_crop_stage(uuid) from public, anon;
+revoke execute on function public.confirm_crop_stage(uuid, public.crop_stage, text) from public, anon;
+revoke execute on function public.correct_crop_stage(uuid, public.crop_stage, text) from public, anon;
+revoke execute on function public.sync_my_crops(jsonb) from public, anon;
+
+grant execute on function public.recalculate_my_crop_stage(uuid) to authenticated;
+grant execute on function public.confirm_crop_stage(uuid, public.crop_stage, text) to authenticated;
+grant execute on function public.correct_crop_stage(uuid, public.crop_stage, text) to authenticated;
+grant execute on function public.sync_my_crops(jsonb) to authenticated;
+grant execute on function public.agri_stage_matches(text, numeric, public.crop_stage, public.crop_stage[], numeric) to authenticated;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261103001600_crop_lifecycle_fix.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Phase 5.3 fix · stage-gated recommendation CTE
+--
+-- Migration 015 is already applied to staging with a column-order mismatch in
+-- the crop_matches/general_matches UNION. This replaces the function with the
+-- corrected definition. Fresh installs apply 015 and then this; both are safe.
+
+create or replace function public.refresh_farmer_recommendations(p_farmer_id uuid)
+returns integer
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_ttl         integer := 21;
+  v_rule        integer := 1;
+  v_max         integer := 12;
+  v_count       integer := 0;
+  v_weather     record;
+  v_weather_body text;
+  v_weather_body_ur text;
+  v_min_conf    numeric := 0.7;
+begin
+  if p_farmer_id is null then
+    raise exception 'A farmer is required.' using errcode = 'invalid_parameter_value';
+  end if;
+
+  select coalesce((value #>> '{}')::integer, 21) into v_ttl
+    from public.intelligence_config where key = 'recommendation_ttl_days';
+  select coalesce((value #>> '{}')::integer, 1) into v_rule
+    from public.intelligence_config where key = 'recommendation_rule_version';
+  select coalesce((value #>> '{}')::numeric, 0.7) into v_min_conf
+    from public.intelligence_config where key = 'stage_confidence_min_for_advice';
+  select coalesce((value #>> '{}')::integer, 12) into v_max
+    from public.intelligence_config where key = 'max_recommendations_per_farmer';
+
+  with crops as (
+    select c.id, c.crop_code, c.stage, c.is_primary, c.stage_source, c.stage_confidence
+      from public.crop_instances c
+     where c.farmer_id = p_farmer_id
+       and c.closed_at is null
+  ),
+  profile as (
+    select f.district, f.primary_crop_code
+      from public.farmer_intelligence_profiles f
+     where f.farmer_id = p_farmer_id
+  ),
+  crop_matches as (
+    select
+      c.id as crop_id,
+      c.crop_code,
+      c.stage::text as stage,
+      c.is_primary,
+      e.id as entry_id,
+      e.slug,
+      e.version,
+      e.title_en,
+      e.title_ur,
+      e.body_en,
+      e.body_ur,
+      e.topic,
+      e.problem_type,
+      e.evidence_tier,
+      e.source_code,
+      e.source_url,
+      e.provenance,
+      public.agri_stage_matches(c.stage_source, c.stage_confidence, c.stage, e.applies_to_stages, v_min_conf) as stage_match,
+      c.stage_source,
+      c.stage_confidence,
+      coalesce(i.weight, 0) as interest_weight,
+      coalesce(i.pinned, false) as interest_pinned,
+      (
+        e.regions is null
+        or cardinality(e.regions) = 0
+        or 'Punjab' = any (e.regions)
+        or exists (
+          select 1 from profile p
+           where p.district is not null and p.district = any (e.regions)
+        )
+      ) as region_match
+    from crops c
+    join public.agri_knowledge_entries e
+      on e.crop_code = c.crop_code
+     and e.is_published
+     and e.evidence_tier in ('verified', 'supplementary')
+     and (e.applies_to_stages is null or cardinality(e.applies_to_stages) = 0
+          or public.agri_stage_matches(c.stage_source, c.stage_confidence, c.stage, e.applies_to_stages, v_min_conf))
+    left join lateral (
+      select max(fi.weight) as weight, bool_or(fi.pinned) as pinned
+        from public.farmer_interests fi
+       where fi.farmer_id = p_farmer_id
+         and fi.dismissed_at is null
+         and (
+           fi.topic = 'crop:' || c.crop_code
+           or fi.topic = 'topic:' || e.topic
+         )
+    ) i on true
+  ),
+  general_matches as (
+    select
+      null::uuid as crop_id,
+      null::text as crop_code,
+      null::text as stage,
+      false as is_primary,
+      e.id as entry_id,
+      e.slug,
+      e.version,
+      e.title_en,
+      e.title_ur,
+      e.body_en,
+      e.body_ur,
+      e.topic,
+      e.problem_type,
+      e.evidence_tier,
+      e.source_code,
+      e.source_url,
+      e.provenance,
+      false as stage_match,
+      null::text as stage_source,
+      null::numeric as stage_confidence,
+      coalesce(i.weight, 0) as interest_weight,
+      coalesce(i.pinned, false) as interest_pinned,
+      (
+        e.regions is null
+        or cardinality(e.regions) = 0
+        or 'Punjab' = any (e.regions)
+        or exists (
+          select 1 from profile p
+           where p.district is not null and p.district = any (e.regions)
+        )
+      ) as region_match
+    from public.agri_knowledge_entries e
+    left join lateral (
+      select max(fi.weight) as weight, bool_or(fi.pinned) as pinned
+        from public.farmer_interests fi
+       where fi.farmer_id = p_farmer_id
+         and fi.dismissed_at is null
+         and fi.topic = 'topic:' || e.topic
+    ) i on true
+    where e.crop_code is null
+      and e.is_published
+      and e.evidence_tier in ('verified', 'supplementary')
+      and i.weight is not null
+  ),
+  matches as (
+    select * from crop_matches
+    union all
+    select * from general_matches
+  ),
+  shaped as (
+    select
+      m.*,
+      case
+        when m.topic = 'pest' or m.problem_type = 'pest' then 'pest'
+        when m.topic = 'disease' or m.problem_type = 'disease' then 'disease'
+        when m.topic in ('weather', 'rain') then 'weather'
+        when m.topic = 'market' then 'market'
+        when m.topic in ('irrigation', 'water', 'nutrition', 'agronomy') then 'crop_stage'
+        else 'general'
+      end as kind,
+      case
+        when m.interest_pinned then 'pinned_interest'
+        when m.stage_match then 'crop_stage'
+        when m.crop_id is not null then 'crop'
+        else 'interest'
+      end as reason_code,
+      case
+        when m.evidence_tier = 'verified' then 0.95
+        else 0.65
+      end as confidence,
+      case
+        when m.evidence_tier = 'verified' then 10
+        else 25
+      end
+      + case
+          when m.topic in ('pest', 'disease') then 0
+          when m.topic in ('irrigation', 'water', 'nutrition', 'agronomy') then 5
+          else 15
+        end as priority
+    from matches m
+  )
+  insert into public.recommendations (
+    farmer_id, crop_id, kind, title, title_ur, body, body_ur,
+    action_label, action_label_ur, action_kind, action_ref,
+    source, source_ref, source_label, source_url,
+    confidence, knowledge_version, valid_until, priority, dedupe_key,
+    evidence_tier, reason_code, reason_context, rule_version
+  )
+  select
+    p_farmer_id,
+    s.crop_id,
+    s.kind,
+    s.title_en,
+    s.title_ur,
+    s.body_en,
+    s.body_ur,
+    case s.kind
+      when 'pest' then 'Scan the crop'
+      when 'disease' then 'Scan the crop'
+      when 'weather' then 'Check weather'
+      else 'Open crop'
+    end,
+    case s.kind
+      when 'pest' then 'فصل اسکین کریں'
+      when 'disease' then 'فصل اسکین کریں'
+      when 'weather' then 'موسم دیکھیں'
+      else 'فصل کھولیں'
+    end,
+    case s.kind
+      when 'pest' then 'open_scan'
+      when 'disease' then 'open_scan'
+      when 'weather' then 'open_weather'
+      else 'open_crop'
+    end,
+    s.slug,
+    'knowledge_base'::public.recommendation_source,
+    s.slug,
+    coalesce(src.publisher, src.name, s.provenance, 'Farmer App editorial notes'),
+    coalesce(s.source_url, src.url),
+    s.confidence,
+    s.version,
+    now() + make_interval(days => greatest(1, least(v_ttl, 90))),
+    s.priority,
+    'rec:knowledge:' || s.slug || ':v' || s.version || ':' || coalesce(s.crop_code, 'general'),
+    s.evidence_tier,
+    s.reason_code,
+    jsonb_strip_nulls(jsonb_build_object(
+      'crop_code', s.crop_code,
+      'stage', s.stage,
+      'topic', s.topic,
+      'region_match', s.region_match
+    )),
+    v_rule
+  from shaped s
+  left join public.agri_knowledge_sources src on src.code = s.source_code
+  order by s.priority, s.slug
+  limit greatest(1, least(v_max, 30))
+  on conflict (farmer_id, dedupe_key) where withdrawn_at is null do update
+    set crop_id = excluded.crop_id,
+        kind = excluded.kind,
+        title = excluded.title,
+        title_ur = excluded.title_ur,
+        body = excluded.body,
+        body_ur = excluded.body_ur,
+        action_label = excluded.action_label,
+        action_label_ur = excluded.action_label_ur,
+        action_kind = excluded.action_kind,
+        action_ref = excluded.action_ref,
+        source_label = excluded.source_label,
+        source_url = excluded.source_url,
+        confidence = excluded.confidence,
+        knowledge_version = excluded.knowledge_version,
+        valid_until = excluded.valid_until,
+        priority = excluded.priority,
+        evidence_tier = excluded.evidence_tier,
+        reason_code = excluded.reason_code,
+        reason_context = excluded.reason_context,
+        rule_version = excluded.rule_version;
+
+  get diagnostics v_count = row_count;
+
+  -- Weather advice is grounded in the existing, freshness-gated weather read.
+  -- If there is no usable reading for the farmer's saved coordinates, no weather
+  -- recommendation is invented.
+  select w.* into v_weather
+    from public.farmer_profiles fp
+    cross join lateral public.latest_weather(fp.default_lat, fp.default_lon) w
+   where fp.default_lat is not null
+     and fp.default_lon is not null
+     and fp.party_id = p_farmer_id
+     and w.is_usable
+   order by w.observed_at desc
+   limit 1;
+
+  if found and v_weather.is_usable then
+    v_weather_body := concat_ws(
+      ' ',
+      'Current reading:',
+      case when v_weather.temp_c is not null then round(v_weather.temp_c)::text || '°C.' else null end,
+      case when v_weather.humidity_pct is not null then 'Humidity ' || v_weather.humidity_pct || '%.' else null end,
+      case when v_weather.wind_kph is not null then 'Wind ' || round(v_weather.wind_kph)::text || ' km/h.' else null end,
+      'Check the weather card before spraying or irrigating.'
+    );
+    v_weather_body_ur := concat_ws(
+      ' ',
+      'موجودہ پڑھائی:',
+      case when v_weather.temp_c is not null then round(v_weather.temp_c)::text || ' ڈگری۔' else null end,
+      case when v_weather.humidity_pct is not null then 'نمی ' || v_weather.humidity_pct || '٪۔' else null end,
+      case when v_weather.wind_kph is not null then 'ہوا ' || round(v_weather.wind_kph)::text || ' کلومیٹر فی گھنٹہ۔' else null end,
+      'سپرے یا آبپاشی سے پہلے موسم کا کارڈ دیکھیں۔'
+    );
+
+    insert into public.recommendations (
+      farmer_id, kind, title, title_ur, body, body_ur, action_label, action_label_ur,
+      action_kind, source, source_ref, source_label, confidence, valid_until, priority,
+      dedupe_key, reason_code, reason_context, rule_version
+    ) values (
+      p_farmer_id,
+      'weather',
+      'Check the weather before field work',
+      'کھیت کے کام سے پہلے موسم دیکھیں',
+      v_weather_body,
+      v_weather_body_ur,
+      'Check weather',
+      'موسم دیکھیں',
+      'open_weather',
+      'weather',
+      'weather:' || v_weather.provider_code,
+      v_weather.provider_name,
+      0.85,
+      now() + interval '6 hours',
+      5,
+      'rec:weather:' || v_weather.provider_code || ':' || to_char(v_weather.observed_at, 'YYYYMMDD'),
+      'weather_now',
+      jsonb_build_object('observed_at', v_weather.observed_at, 'freshness', v_weather.freshness),
+      v_rule
+    )
+    on conflict (farmer_id, dedupe_key) where withdrawn_at is null do update
+      set title = excluded.title,
+          title_ur = excluded.title_ur,
+          body = excluded.body,
+          body_ur = excluded.body_ur,
+          source_label = excluded.source_label,
+          confidence = excluded.confidence,
+          valid_until = excluded.valid_until,
+          reason_context = excluded.reason_context,
+          rule_version = excluded.rule_version;
+
+    v_count := v_count + 1;
+  end if;
+
+  return v_count;
+end;
+$$;
+
+comment on function public.refresh_farmer_recommendations(uuid) is
+  'Generates canonical recommendations from published evidence-tiered knowledge and a fresh weather reading. Stage-specific entries additionally require a confirmed stage or an estimate at or above the configured confidence floor.';
+
+revoke execute on function public.refresh_farmer_recommendations(uuid) from public, anon, authenticated;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261103001700_recommendation_preferences.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Phase 6: farmer-controlled recommendation types.
+--
+-- The foundation already has `farmer_preferences` for explicit choices and a
+-- single ranked recommendation feed. What was missing was a write/read contract
+-- for recommendation types and any effect on the feed. This migration adds only
+-- that: a bounded mute list, stored as `farmer_preferences.key = 'recommendations'`.
+--
+-- Deliberate limits:
+--   · This is explicit state. Learning and feedback never write this row.
+--   · The canonical recommendation rows are retained; muting is a serving
+--     filter, so unmuting restores existing advice without regenerating it.
+--   · Interests continue to control ranking. They are not copied into this
+--     preference and this preference does not rewrite an interest weight.
+--   · Alerts keep their existing separate `alerts` preference. Muting a
+--     recommendation type does not silently change alert categories.
+
+create or replace function public.farmer_recommendation_preferences()
+returns table (
+  muted_kinds text[],
+  updated_at  timestamptz
+)
+language sql
+stable
+security invoker
+set search_path = public, pg_temp
+as $$
+  with me as (
+    select public.current_farmer_id() as farmer_id
+  )
+  select
+    coalesce((
+      select array_agg(muted_value order by muted_value)
+        from jsonb_array_elements_text(
+          case
+            when jsonb_typeof(p.value->'muted_kinds') = 'array'
+            then p.value->'muted_kinds'
+            else '[]'::jsonb
+          end
+        ) muted_value
+    ), '{}'::text[]),
+    p.updated_at
+  from me
+  left join public.farmer_preferences p
+    on p.farmer_id = me.farmer_id
+   and p.key = 'recommendations'
+  where me.farmer_id is not null;
+$$;
+
+comment on function public.farmer_recommendation_preferences() is
+  'The caller''s explicit recommendation-type mute list. An absent row means every type is enabled.';
+
+create or replace function public.set_farmer_recommendation_preferences(
+  p_muted_kinds text[]
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_farmer uuid := public.current_farmer_id();
+  v_kinds  text[];
+  v_value  jsonb;
+begin
+  if v_farmer is null then
+    raise exception 'An identified farmer is required.' using errcode = 'insufficient_privilege';
+  end if;
+
+  if p_muted_kinds is null then
+    raise exception 'A recommendation type list is required.' using errcode = 'check_violation';
+  end if;
+
+  if cardinality(p_muted_kinds) > 32 then
+    raise exception 'Too many recommendation types.' using errcode = 'check_violation';
+  end if;
+
+  -- Only the kinds the existing producers actually emit are accepted. This
+  -- keeps a typo from silently muting nothing.
+  if exists (
+    select 1
+      from unnest(p_muted_kinds) muted_value
+     where muted_value is null
+        or muted_value <> btrim(muted_value)
+        or muted_value not in (
+          'pest', 'disease', 'weather', 'market', 'crop_stage', 'general'
+        )
+  ) then
+    raise exception 'Unknown recommendation type.' using errcode = 'check_violation';
+  end if;
+
+  select coalesce(array_agg(distinct muted_value order by muted_value), '{}'::text[])
+    into v_kinds
+    from unnest(p_muted_kinds) muted_value;
+
+  v_value := jsonb_build_object('muted_kinds', to_jsonb(v_kinds));
+
+  insert into public.farmer_preferences (farmer_id, key, value)
+  values (v_farmer, 'recommendations', v_value)
+  on conflict (farmer_id, key) do update
+    set value = excluded.value,
+        updated_at = now();
+
+  perform public.write_audit(
+    'intelligence.recommendation_preferences_updated',
+    'farmer_preferences',
+    v_farmer,
+    'recommendations',
+    null,
+    v_value::text,
+    jsonb_build_object('muted_kinds', v_kinds)
+  );
+
+  return v_value;
+end;
+$$;
+
+comment on function public.set_farmer_recommendation_preferences(text[]) is
+  'Replaces the caller''s explicit recommendation-type mute list. The farmer is derived from the session; duplicate types are removed.';
+
+-- The ranked feed remains the single scorer. Keep it as an internal base and
+-- apply the explicit mute filter in a thin wrapper, so muting does not fork the
+-- scoring engine or require copying its SQL.
+alter function public.intelligence_recommendation_feed(integer)
+  rename to intelligence_recommendation_feed_base;
+
+comment on function public.intelligence_recommendation_feed_base(integer) is
+  'Internal ranked feed. Apply the authenticated intelligence_recommendation_feed() wrapper so explicit type preferences are respected.';
+
+revoke execute on function public.intelligence_recommendation_feed_base(integer)
+  from public, anon, authenticated;
+grant execute on function public.intelligence_recommendation_feed_base(integer)
+  to service_role;
+
+create function public.intelligence_recommendation_feed(p_limit integer default 20)
+returns table (
+  recommendation_id uuid,
+  crop_id           uuid,
+  crop_code         text,
+  kind              text,
+  title             text,
+  title_ur          text,
+  body              text,
+  body_ur           text,
+  source            public.recommendation_source,
+  source_label      text,
+  source_url        text,
+  evidence_tier     text,
+  confidence        numeric,
+  priority          integer,
+  score             numeric,
+  components        jsonb,
+  reason_code       text,
+  reason_context    jsonb,
+  rule_version      integer,
+  valid_until       timestamptz,
+  created_at        timestamptz
+)
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+  with mine as (
+    select public.current_farmer_id() as farmer_id
+  ),
+  muted as (
+    select coalesce(array_agg(distinct muted_value order by muted_value), '{}'::text[]) as kinds
+      from public.farmer_preferences p
+      cross join lateral jsonb_array_elements_text(
+        case
+          when jsonb_typeof(p.value->'muted_kinds') = 'array'
+          then p.value->'muted_kinds'
+          else '[]'::jsonb
+        end
+      ) muted_value
+     where p.farmer_id = (select farmer_id from mine)
+       and p.key = 'recommendations'
+  )
+  select b.*
+    from public.intelligence_recommendation_feed_base(50) b
+   where b.kind <> all(coalesce((select kinds from muted), '{}'::text[]))
+   order by b.score desc, b.priority, b.created_at desc
+   limit greatest(1, least(coalesce(p_limit, 20), 50));
+$$;
+
+comment on function public.intelligence_recommendation_feed(integer) is
+  'Ranks canonical recommendations through the existing scorer, then removes the caller''s explicitly muted types. Missing preference means no filtering.';
+
+revoke execute on function public.intelligence_recommendation_feed(integer)
+  from public, anon;
+grant execute on function public.intelligence_recommendation_feed(integer)
+  to authenticated;
+
+revoke execute on function public.farmer_recommendation_preferences()
+  from public, anon;
+revoke execute on function public.set_farmer_recommendation_preferences(text[])
+  from public, anon;
+grant execute on function public.farmer_recommendation_preferences()
+  to authenticated;
+grant execute on function public.set_farmer_recommendation_preferences(text[])
+  to authenticated;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261103001800_personalization_completion.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Phase 6 completion: explicit crop/topic personalization.
+--
+-- Phase 6A added recommendation-type muting. This migration closes the remaining
+-- backend gap: a farmer can explicitly prioritise or suppress a crop or topic,
+-- including a topic that has not appeared in learned behaviour yet.
+--
+-- Reused, not duplicated:
+--   · farmer_interests is still the single interest store.
+--   · source='explicit', pinned=true and dismissed_at are the existing state.
+--   · intelligence_recommendation_feed() is still the one ranked feed.
+--
+-- Semantics:
+--   · A prioritised crop/topic is source='explicit', pinned=true and has a
+--     bounded weight (normal 0.65, high 1.00). Learning and feedback never move
+--     a pinned weight. A clear removes the explicit row so ordinary learning can
+--     take over again.
+--   · A suppressed crop/topic is source='explicit', pinned=true, weight 0 and
+--     dismissed_at set. The feed excludes matching recommendations, but the
+--     canonical recommendation rows and their feedback history remain.
+--   · The old dismiss RPC still removes a learned interest; for an explicit row
+--     it now clears the explicit preference instead of leaving a suppression
+--     behind. Suppression is therefore always an intentional, named operation.
+--   · Alert categories remain governed by the separate `alerts` preference.
+--     Suppression filters the recommendation feed, not alert delivery.
+
+create or replace function public.farmer_interest_preferences()
+returns table (
+  topic       text,
+  crop_code   text,
+  weight      numeric,
+  pinned      boolean,
+  suppressed  boolean,
+  updated_at  timestamptz
+)
+language sql
+stable
+security invoker
+set search_path = public, pg_temp
+as $$
+  select
+    i.topic,
+    i.crop_code,
+    i.weight,
+    i.pinned,
+    (i.dismissed_at is not null),
+    i.updated_at
+  from public.farmer_interests i
+  where i.farmer_id = public.current_farmer_id()
+    and i.source = 'explicit'
+  order by (i.dismissed_at is not null), i.topic;
+$$;
+
+comment on function public.farmer_interest_preferences() is
+  'The caller''s explicit crop/topic choices, including suppressed rows. Learned interests are intentionally excluded.';
+
+create or replace function public.set_farmer_interest_preference(
+  p_topic    text,
+  p_priority text default 'normal'
+)
+returns public.farmer_interests
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_farmer    uuid := public.current_farmer_id();
+  v_topic     text := lower(btrim(coalesce(p_topic, '')));
+  v_priority  text := lower(btrim(coalesce(p_priority, 'normal')));
+  v_crop_code text;
+  v_weight    numeric;
+  v_row       public.farmer_interests;
+begin
+  if v_farmer is null then
+    raise exception 'An identified farmer is required.' using errcode = 'insufficient_privilege';
+  end if;
+
+  if v_topic !~ '^(crop|topic):[a-z0-9_-]{1,60}$' then
+    raise exception 'Interest topic must be crop:<code> or topic:<slug>.'
+      using errcode = 'check_violation';
+  end if;
+
+  if v_priority not in ('normal', 'high') then
+    raise exception 'Interest priority must be normal or high.'
+      using errcode = 'check_violation';
+  end if;
+
+  if v_topic like 'crop:%' then
+    v_crop_code := split_part(v_topic, ':', 2);
+    if not exists (
+      select 1 from public.crop_catalog c
+       where c.code = v_crop_code and c.is_active
+    ) then
+      raise exception 'Unknown or inactive crop.' using errcode = 'check_violation';
+    end if;
+  end if;
+
+  v_weight := case when v_priority = 'high' then 1.00 else 0.65 end;
+
+  insert into public.farmer_interests (
+    farmer_id, topic, crop_code, weight, confidence, source, pinned, dismissed_at, last_seen_at
+  ) values (
+    v_farmer, v_topic, v_crop_code, v_weight, 1, 'explicit', true, null, now()
+  )
+  on conflict (farmer_id, topic) do update
+    set crop_code    = excluded.crop_code,
+        weight       = excluded.weight,
+        confidence   = 1,
+        source       = 'explicit',
+        pinned       = true,
+        dismissed_at = null,
+        last_seen_at = now(),
+        updated_at   = now()
+  returning * into v_row;
+
+  perform public.write_audit(
+    'intelligence.interest_preference_set',
+    'farmer_interests',
+    v_row.id,
+    v_topic,
+    null,
+    v_row::text,
+    jsonb_build_object(
+      'priority', v_priority,
+      'crop_code', v_crop_code,
+      'weight', v_weight
+    )
+  );
+
+  return v_row;
+end;
+$$;
+
+comment on function public.set_farmer_interest_preference(text, text) is
+  'Creates or replaces an explicit crop/topic priority. Normal weight is 0.65, high is 1.00; both are pinned against learning.';
+
+create or replace function public.suppress_farmer_interest(
+  p_topic  text,
+  p_reason text default null
+)
+returns public.farmer_interests
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_farmer    uuid := public.current_farmer_id();
+  v_topic     text := lower(btrim(coalesce(p_topic, '')));
+  v_reason    text := nullif(btrim(p_reason), '');
+  v_crop_code text;
+  v_row       public.farmer_interests;
+begin
+  if v_farmer is null then
+    raise exception 'An identified farmer is required.' using errcode = 'insufficient_privilege';
+  end if;
+
+  if v_topic !~ '^(crop|topic):[a-z0-9_-]{1,60}$' then
+    raise exception 'Interest topic must be crop:<code> or topic:<slug>.'
+      using errcode = 'check_violation';
+  end if;
+
+  if v_reason is not null and length(v_reason) > 500 then
+    raise exception 'Suppression reason is too long.' using errcode = 'check_violation';
+  end if;
+
+  if v_topic like 'crop:%' then
+    v_crop_code := split_part(v_topic, ':', 2);
+    if not exists (
+      select 1 from public.crop_catalog c
+       where c.code = v_crop_code and c.is_active
+    ) then
+      raise exception 'Unknown or inactive crop.' using errcode = 'check_violation';
+    end if;
+  end if;
+
+  insert into public.farmer_interests (
+    farmer_id, topic, crop_code, weight, confidence, source, pinned, dismissed_at, last_seen_at
+  ) values (
+    v_farmer, v_topic, v_crop_code, 0, 1, 'explicit', true, now(), now()
+  )
+  on conflict (farmer_id, topic) do update
+    set crop_code    = excluded.crop_code,
+        weight       = 0,
+        confidence   = 1,
+        source       = 'explicit',
+        pinned       = true,
+        dismissed_at = now(),
+        last_seen_at = now(),
+        updated_at   = now()
+  returning * into v_row;
+
+  perform public.write_audit(
+    'intelligence.interest_preference_suppressed',
+    'farmer_interests',
+    v_row.id,
+    v_topic,
+    null,
+    v_row::text,
+    jsonb_build_object('reason', v_reason, 'crop_code', v_crop_code)
+  );
+
+  return v_row;
+end;
+$$;
+
+comment on function public.suppress_farmer_interest(text, text) is
+  'Creates an explicit suppression for a crop or topic, even when no learned interest exists. The feed excludes matching recommendations.';
+
+create or replace function public.clear_farmer_interest_preference(p_topic text)
+returns boolean
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_farmer uuid := public.current_farmer_id();
+  v_topic  text := lower(btrim(coalesce(p_topic, '')));
+  v_row    public.farmer_interests;
+begin
+  if v_farmer is null then
+    raise exception 'An identified farmer is required.' using errcode = 'insufficient_privilege';
+  end if;
+
+  if v_topic !~ '^(crop|topic):[a-z0-9_-]{1,60}$' then
+    raise exception 'Interest topic must be crop:<code> or topic:<slug>.'
+      using errcode = 'check_violation';
+  end if;
+
+  delete from public.farmer_interests
+   where farmer_id = v_farmer
+     and topic = v_topic
+     and source = 'explicit'
+  returning * into v_row;
+
+  if not found then
+    return false;
+  end if;
+
+  perform public.write_audit(
+    'intelligence.interest_preference_cleared',
+    'farmer_interests',
+    v_row.id,
+    v_topic,
+    v_row::text,
+    null,
+    jsonb_build_object('crop_code', v_row.crop_code)
+  );
+
+  return true;
+end;
+$$;
+
+comment on function public.clear_farmer_interest_preference(text) is
+  'Removes only the caller''s explicit crop/topic row, restoring ordinary learning. Idempotent: false when no explicit row exists.';
+
+-- Existing farmers may have used the old removal RPC on an explicit row. Make
+-- the meaning consistent: removing an explicit choice clears it; only the named
+-- suppression RPC leaves a suppressing row.
+create or replace function public.dismiss_farmer_interest(p_topic text)
+returns boolean
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_farmer uuid := public.current_farmer_id();
+  v_topic  text := lower(btrim(coalesce(p_topic, '')));
+  v_row    public.farmer_interests;
+begin
+  if v_farmer is null then
+    raise exception 'An identified farmer is required.' using errcode = 'insufficient_privilege';
+  end if;
+
+  if v_topic !~ '^(crop|topic):[a-z0-9_-]{1,60}$' then
+    raise exception 'Interest topic must be crop:<code> or topic:<slug>.'
+      using errcode = 'check_violation';
+  end if;
+
+  select * into v_row
+    from public.farmer_interests
+   where farmer_id = v_farmer
+     and topic = v_topic
+     and dismissed_at is null
+   for update;
+
+  if not found then
+    raise exception 'Interest not found.' using errcode = 'no_data_found';
+  end if;
+
+  if v_row.source = 'explicit' then
+    delete from public.farmer_interests where id = v_row.id;
+
+    perform public.write_audit(
+      'intelligence.interest_preference_cleared',
+      'farmer_interests',
+      v_row.id,
+      v_topic,
+      v_row::text,
+      null,
+      jsonb_build_object('via', 'dismiss_farmer_interest')
+    );
+  else
+    update public.farmer_interests
+       set dismissed_at = now(),
+           updated_at = now()
+     where id = v_row.id;
+
+    perform public.write_audit(
+      'intelligence.interest_dismissed',
+      'farmer_interests',
+      v_row.id,
+      v_topic,
+      v_row::text,
+      null,
+      jsonb_build_object('via', 'dismiss_farmer_interest')
+    );
+  end if;
+
+  return true;
+end;
+$$;
+
+comment on function public.dismiss_farmer_interest(text) is
+  'Removes a learned interest softly; clears an explicit preference outright so it cannot become an unintended suppression.';
+
+create or replace function public.clear_farmer_recommendation_preferences()
+returns boolean
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_farmer uuid := public.current_farmer_id();
+  v_value  jsonb;
+begin
+  if v_farmer is null then
+    raise exception 'An identified farmer is required.' using errcode = 'insufficient_privilege';
+  end if;
+
+  delete from public.farmer_preferences
+   where farmer_id = v_farmer
+     and key = 'recommendations'
+  returning value into v_value;
+
+  if not found then
+    return false;
+  end if;
+
+  perform public.write_audit(
+    'intelligence.recommendation_preferences_cleared',
+    'farmer_preferences',
+    v_farmer,
+    'recommendations',
+    v_value::text,
+    null,
+    jsonb_build_object('cleared', true)
+  );
+
+  return true;
+end;
+$$;
+
+comment on function public.clear_farmer_recommendation_preferences() is
+  'Deletes the caller''s explicit recommendation-type row, restoring the all-types-enabled default. Idempotent.';
+
+-- Extend the existing feed wrapper with crop/topic suppression. The internal
+-- scorer remains unchanged; this is still a serving filter over canonical rows.
+create or replace function public.intelligence_recommendation_feed(p_limit integer default 20)
+returns table (
+  recommendation_id uuid,
+  crop_id           uuid,
+  crop_code         text,
+  kind              text,
+  title             text,
+  title_ur          text,
+  body              text,
+  body_ur           text,
+  source            public.recommendation_source,
+  source_label      text,
+  source_url        text,
+  evidence_tier     text,
+  confidence        numeric,
+  priority          integer,
+  score             numeric,
+  components        jsonb,
+  reason_code       text,
+  reason_context    jsonb,
+  rule_version      integer,
+  valid_until       timestamptz,
+  created_at        timestamptz
+)
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+  with mine as (
+    select public.current_farmer_id() as farmer_id
+  ),
+  muted as (
+    select coalesce(array_agg(distinct muted_value order by muted_value), '{}'::text[]) as kinds
+      from public.farmer_preferences p
+      cross join lateral jsonb_array_elements_text(
+        case
+          when jsonb_typeof(p.value->'muted_kinds') = 'array'
+          then p.value->'muted_kinds'
+          else '[]'::jsonb
+        end
+      ) muted_value
+     where p.farmer_id = (select farmer_id from mine)
+       and p.key = 'recommendations'
+  ),
+  suppressed as (
+    select
+      coalesce(array_agg(distinct split_part(i.topic, ':', 2))
+        filter (where i.topic like 'crop:%'), '{}'::text[]) as crops,
+      coalesce(array_agg(distinct split_part(i.topic, ':', 2))
+        filter (where i.topic like 'topic:%'), '{}'::text[]) as topics
+      from public.farmer_interests i
+     where i.farmer_id = (select farmer_id from mine)
+       and i.source = 'explicit'
+       and i.dismissed_at is not null
+  )
+  select b.*
+    from public.intelligence_recommendation_feed_base(50) b
+   where b.kind <> all(coalesce((select kinds from muted), '{}'::text[]))
+     and not (
+       coalesce(b.crop_code, '') = any(
+         coalesce((select crops from suppressed), '{}'::text[])
+       )
+       or coalesce(b.kind, '') = any(
+         coalesce((select topics from suppressed), '{}'::text[])
+       )
+       or coalesce(b.reason_context->>'topic', '') = any(
+         coalesce((select topics from suppressed), '{}'::text[])
+       )
+     )
+   order by b.score desc, b.priority, b.created_at desc
+   limit greatest(1, least(coalesce(p_limit, 20), 50));
+$$;
+
+comment on function public.intelligence_recommendation_feed(integer) is
+  'Ranks canonical recommendations, then removes explicitly muted types and explicitly suppressed crops/topics. Missing preferences mean no filtering.';
+
+revoke execute on function public.farmer_interest_preferences() from public, anon;
+revoke execute on function public.set_farmer_interest_preference(text, text) from public, anon;
+revoke execute on function public.suppress_farmer_interest(text, text) from public, anon;
+revoke execute on function public.clear_farmer_interest_preference(text) from public, anon;
+revoke execute on function public.clear_farmer_recommendation_preferences() from public, anon;
+
+grant execute on function public.farmer_interest_preferences() to authenticated;
+grant execute on function public.set_farmer_interest_preference(text, text) to authenticated;
+grant execute on function public.suppress_farmer_interest(text, text) to authenticated;
+grant execute on function public.clear_farmer_interest_preference(text) to authenticated;
+grant execute on function public.clear_farmer_recommendation_preferences() to authenticated;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261104001900_knowledge_withdrawal_guard.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Phase 8 launch hardening: withdraw recommendations when their source is unpublished.
+--
+-- `agri_expire_due_evidence()` already unpublishes an expired knowledge target,
+-- but an already-issued recommendation is a snapshot: it has its own validity
+-- window and does not re-read the source. Without this trigger, a recommendation
+-- made from a verified entry could remain in the feed for up to its TTL after the
+-- source was withdrawn. That is an active-advice integrity failure, not merely a
+-- stale cache.
+--
+-- The trigger is deliberately narrow:
+--   · only knowledge-base recommendations are affected;
+--   · only the version that was unpublished is withdrawn;
+--   · already-withdrawn rows are left untouched; and
+--   · re-publishing the same version does not revive an old row — the generator
+--     creates a fresh canonical row, so the history remains auditable.
+--
+-- Advisory and forecast-risk recommendations have their own activation and
+-- expiry paths. This migration does not change their semantics.
+
+create or replace function public.agri_withdraw_unpublished_knowledge_recommendations()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  if old.is_published and not new.is_published then
+    update public.recommendations r
+       set withdrawn_at = now(),
+           withdraw_reason = 'knowledge source unpublished'
+     where r.source = 'knowledge_base'
+       and r.source_ref = new.slug
+       and coalesce(r.knowledge_version, new.version) = new.version
+       and r.withdrawn_at is null;
+  end if;
+
+  return null;
+end;
+$$;
+
+comment on function public.agri_withdraw_unpublished_knowledge_recommendations() is
+  'Withdraws live recommendations generated from the exact knowledge version that was unpublished. A withdrawn row is never silently revived; regeneration creates a new row.';
+
+drop trigger if exists agri_knowledge_withdraw_recommendations
+  on public.agri_knowledge_entries;
+
+create trigger agri_knowledge_withdraw_recommendations
+  after update of is_published on public.agri_knowledge_entries
+  for each row
+  when (old.is_published is distinct from new.is_published)
+  execute function public.agri_withdraw_unpublished_knowledge_recommendations();
+
+-- The function is trigger-only. Do not expose it as a callable RPC.
+revoke execute on function public.agri_withdraw_unpublished_knowledge_recommendations()
+  from public, anon, authenticated;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261104002000_intelligence_schedule.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Phase 8 launch hardening: run the existing intelligence jobs on a schedule.
+--
+-- The job wrappers already exist and are service-only; nothing scheduled them.
+-- As a result crop stages, recommendations, alert production and learned
+-- interests only advanced when a farmer opened the app or an operator called the
+-- functions by hand. That is not a proactive intelligence system.
+--
+-- Every function below is bounded and idempotent:
+--   · crop stages only recalculate open, unconfirmed crops;
+--   · recommendations upsert by dedupe key and use each farmer's cooldown;
+--   · alerts are independently cooled down and capped per farmer;
+--   · interest learning only refreshes derived interests.
+--
+-- The schedules are staggered away from the existing retention/expiry jobs so a
+-- small deployment does not pile every task onto the same minute. pg_cron may be
+-- absent in local development; in that case the functions remain callable and no
+-- schedule is invented.
+
+do $$
+begin
+  if exists (select 1 from pg_extension where extname = 'pg_cron') then
+    if exists (select 1 from cron.job where jobname = 'farmer-refresh-crop-stages') then
+      perform cron.unschedule('farmer-refresh-crop-stages');
+    end if;
+    perform cron.schedule(
+      'farmer-refresh-crop-stages',
+      '19 2 * * *',
+      'select public.job_refresh_crop_stages();'
+    );
+
+    if exists (select 1 from cron.job where jobname = 'farmer-refresh-recommendations') then
+      perform cron.unschedule('farmer-refresh-recommendations');
+    end if;
+    perform cron.schedule(
+      'farmer-refresh-recommendations',
+      '17 * * * *',
+      'select public.job_refresh_all_recommendations();'
+    );
+
+    if exists (select 1 from cron.job where jobname = 'farmer-refresh-alerts') then
+      perform cron.unschedule('farmer-refresh-alerts');
+    end if;
+    perform cron.schedule(
+      'farmer-refresh-alerts',
+      '2,17,32,47 * * * *',
+      'select public.job_refresh_all_alerts();'
+    );
+
+    if exists (select 1 from cron.job where jobname = 'farmer-refresh-intelligence') then
+      perform cron.unschedule('farmer-refresh-intelligence');
+    end if;
+    perform cron.schedule(
+      'farmer-refresh-intelligence',
+      '29 2 * * *',
+      'select public.job_refresh_farmer_intelligence(90);'
+    );
+  end if;
+end;
+$$;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261104002100_remove_unbacked_verified_claims.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Phase 8 evidence integrity: do not serve a legacy "verified" claim without a dossier.
+--
+-- The Phase 5.2 publication guard requires a published evidence dossier before a
+-- knowledge entry may be published. One seeded entry predates that guard and is
+-- still marked verified with evidence_item_id NULL. The recommendation trace
+-- exposed the contradiction honestly (`verified_guidance: false`), but the feed
+-- still labelled the advice as verified. That is exactly the claim this platform
+-- must not make without evidence.
+--
+-- This migration unpublishes only verified entries that lack a published,
+-- authoritative dossier. Supplementary editorial entries are left alone; they
+-- are already labelled as supplementary and are not represented as verified.
+-- The existing knowledge withdrawal trigger then withdraws any active
+-- recommendation generated from the affected version.
+--
+-- This is a content correction, not a new verification. No dossier is invented,
+-- no reviewer is fabricated, and the entry is not relabelled. It can be
+-- published again only through the normal evidence workflow after real review.
+
+update public.agri_knowledge_entries e
+   set is_published = false
+ where e.is_published
+   and e.evidence_tier = 'verified'
+   and not exists (
+     select 1
+       from public.agri_evidence_items i
+      where i.id = e.evidence_item_id
+        and i.status = 'published'
+        and i.target_kind = 'knowledge_entry'
+        and i.target_ref = e.id::text
+        and i.classification in (
+          'official_government', 'peer_reviewed_research', 'qualified_expert'
+        )
+        and i.source_check_status = 'authentic'
+        and i.applicability_status = 'applicable'
+        and i.agronomic_status = 'approved'
+   );
+
+comment on table public.agri_knowledge_entries is
+  'Published verified entries require a published, authoritative evidence dossier. Legacy verified rows without one are unpublished rather than presented as verified; supplementary editorial rows remain separately labelled.';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261104002200_data_and_model_infrastructure.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Phase 9 · External data and model infrastructure
+--
+-- This migration adds the missing operational layer around the existing
+-- intelligence system. It does not create a second weather, crop, advice or
+-- alert model.
+--
+--   · Weather observations become idempotent per provider/cell/kind/time. A
+--     repeated adapter run updates the reading instead of duplicating it.
+--   · The farmer locations that actually need a weather fetch are exposed as a
+--     service-only target list, so a scheduler fetches cells rather than one
+--     cell per app open.
+--   · SoilGrids observations are stored with the units and uncertainty the
+--     provider publishes. They are a modelled prior at 250 m, never field truth.
+--   · Forecast calibration is a first-class, versioned model artifact. An active
+--     model can only be activated when it has a holdout win and enough test
+--     rows; activation is admin-only and reversible.
+--   · Source health reports the last attempt, success, failure and freshness of
+--     every external source. It never prints a credential.
+--
+-- The data are only useful if the failure states are visible. Every table and
+-- function below records "not attempted", "failed" and "stale" separately.
+
+-- ---------------------------------------------------------------------------
+-- 1. Weather idempotency
+-- ---------------------------------------------------------------------------
+-- The existing adapter inserted a new row on every fetch. Two runs inside the
+-- same observation hour therefore produced two readings for one cell. The
+-- unique key makes the adapter's upsert meaningful and makes a retry safe.
+with ranked as (
+  select id,
+         row_number() over (
+           partition by provider_code, lat_cell, lon_cell, kind, observed_at
+           order by fetched_at desc, id desc
+         ) as rn
+    from public.weather_readings
+)
+delete from public.weather_readings w
+ using ranked r
+ where w.id = r.id
+   and r.rn > 1;
+
+create unique index if not exists weather_readings_event_uidx
+  on public.weather_readings (provider_code, lat_cell, lon_cell, kind, observed_at);
+
+comment on index public.weather_readings_event_uidx is
+  'One reading per provider, cell, kind and observation time. Adapters must upsert on this key; a retry may correct a reading but may not duplicate it.';
+
+-- ---------------------------------------------------------------------------
+-- 2. Cells that actually need a current weather fetch
+-- ---------------------------------------------------------------------------
+create or replace function public.weather_ingestion_targets(
+  p_limit integer default 200
+)
+returns table (
+  lat_cell        numeric,
+  lon_cell        numeric,
+  farmer_count    integer,
+  last_observed_at timestamptz,
+  due             boolean
+)
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+  with cells as (
+    select
+      round(fp.default_lat::numeric, 3) as lat_cell,
+      round(fp.default_lon::numeric, 3) as lon_cell,
+      count(*)::integer as farmer_count
+    from public.farmer_profiles fp
+    where fp.default_lat is not null
+      and fp.default_lon is not null
+      and fp.default_lat between -90 and 90
+      and fp.default_lon between -180 and 180
+    group by 1, 2
+  ),
+  latest as (
+    select
+      c.lat_cell,
+      c.lon_cell,
+      c.farmer_count,
+      (
+        select max(wr.observed_at)
+        from public.weather_readings wr
+        where wr.lat_cell = c.lat_cell
+          and wr.lon_cell = c.lon_cell
+          and wr.kind = 'current'
+          and wr.fetch_error is null
+      ) as last_observed_at
+    from cells c
+  )
+  select
+    l.lat_cell,
+    l.lon_cell,
+    l.farmer_count,
+    l.last_observed_at,
+    (l.last_observed_at is null or l.last_observed_at < now() - interval '75 minutes') as due
+  from latest l
+  order by due desc, l.farmer_count desc, l.lat_cell, l.lon_cell
+  limit greatest(1, least(coalesce(p_limit, 200), 500));
+$$;
+
+comment on function public.weather_ingestion_targets(integer) is
+  'Cells with at least one farmer location, whether the current reading is due, and how many farmers share the cell. Service-only: it can reveal a village-scale location.';
+
+revoke execute on function public.weather_ingestion_targets(integer)
+  from public, anon, authenticated;
+grant execute on function public.weather_ingestion_targets(integer) to service_role;
+
+-- ---------------------------------------------------------------------------
+-- 3. Real SoilGrids observations
+-- ---------------------------------------------------------------------------
+-- SoilGrids 2.0 is a 250 m global model (CC BY 4.0). Values are modelled priors
+-- with published uncertainty, not a soil test. The provider returns mapped
+-- integers; the adapter divides by d_factor before writing, and this table keeps
+-- the 90% interval as uncertainty.
+insert into public.intel_sources (
+  code, name, kind, endpoint_url, license, commercial_ok, coverage,
+  update_cadence, access_method, status, notes
+) values (
+  'soilgrids',
+  'ISRIC SoilGrids 250m',
+  'soil_feed',
+  'https://rest.isric.org/soilgrids/v2.0/properties/query',
+  'CC BY 4.0; cite Poggio et al. 2021, SOIL 7:217-240',
+  true,
+  'global, 250 m model; 0-5, 5-15, 15-30, 30-60, 60-100, 100-200 cm',
+  'static model release with periodic revisions',
+  'api',
+  'verified_api',
+  'Point queries are live. Values are modelled, not sampled: treat them as a prior and retain the published 90% interval. Use a 2-decimal cell (~1.1 km) rather than a farm coordinate.'
+)
+on conflict (code) do update set
+  name = excluded.name,
+  kind = excluded.kind,
+  endpoint_url = excluded.endpoint_url,
+  license = excluded.license,
+  commercial_ok = excluded.commercial_ok,
+  coverage = excluded.coverage,
+  update_cadence = excluded.update_cadence,
+  access_method = excluded.access_method,
+  status = excluded.status,
+  notes = excluded.notes,
+  is_active = true;
+
+create table public.soil_observations (
+  id             bigserial primary key,
+  source_code    text not null default 'soilgrids' references public.intel_sources (code),
+  -- Deliberately coarser than the weather cell. A 250 m soil model at a farm
+  -- coordinate would imply field precision the source does not have.
+  lat_cell       numeric(8,2) not null check (lat_cell between -90 and 90),
+  lon_cell       numeric(8,2) not null check (lon_cell between -180 and 180),
+  depth_top_cm   smallint not null check (depth_top_cm >= 0),
+  depth_bottom_cm smallint not null check (depth_bottom_cm > depth_top_cm),
+  clay_pct       numeric(5,2) check (clay_pct is null or clay_pct between 0 and 100),
+  sand_pct       numeric(5,2) check (sand_pct is null or sand_pct between 0 and 100),
+  silt_pct       numeric(5,2) check (silt_pct is null or silt_pct between 0 and 100),
+  ph             numeric(3,1) check (ph is null or ph between 0 and 14),
+  soc_g_kg       numeric(6,2) check (soc_g_kg is null or soc_g_kg >= 0),
+  cec_cmol_kg    numeric(6,2) check (cec_cmol_kg is null or cec_cmol_kg >= 0),
+  bulk_density_g_cm3 numeric(4,2) check (bulk_density_g_cm3 is null or bulk_density_g_cm3 > 0),
+  -- The provider's interval widths, in the same units as the value. JSON keeps
+  -- the source's own statistic names visible instead of compressing them into a
+  -- number that looks more certain than it is.
+  uncertainty    jsonb not null default '{}'::jsonb,
+  source_url     text check (source_url is null or source_url ~ '^https://[^[:space:]]+$'),
+  fetched_at     timestamptz not null default now(),
+  raw            jsonb not null default '{}'::jsonb,
+  unique (source_code, lat_cell, lon_cell, depth_top_cm, depth_bottom_cm)
+);
+
+create index soil_observations_cell_idx
+  on public.soil_observations (lat_cell, lon_cell, depth_top_cm);
+
+comment on table public.soil_observations is
+  'Modelled SoilGrids priors by ~1.1 km cell and depth. Never a soil test and never field-level truth. Missing properties stay NULL; the provider uncertainty is retained.';
+
+create table public.soil_ingestion_runs (
+  id             bigserial primary key,
+  source_code    text not null default 'soilgrids' references public.intel_sources (code),
+  started_at     timestamptz not null default now(),
+  finished_at    timestamptz,
+  status         text not null default 'running' check (status in ('running', 'ok', 'partial', 'failed')),
+  cells_requested integer not null default 0,
+  cells_written  integer not null default 0,
+  error          text
+);
+
+alter table public.soil_observations enable row level security;
+alter table public.soil_ingestion_runs enable row level security;
+
+revoke all on public.soil_observations from anon, authenticated;
+revoke all on public.soil_ingestion_runs from anon, authenticated;
+
+create or replace function public.soil_context(
+  p_lat double precision,
+  p_lon double precision
+)
+returns table (
+  depth_top_cm smallint,
+  depth_bottom_cm smallint,
+  clay_pct numeric,
+  sand_pct numeric,
+  silt_pct numeric,
+  ph numeric,
+  soc_g_kg numeric,
+  cec_cmol_kg numeric,
+  bulk_density_g_cm3 numeric,
+  uncertainty jsonb,
+  fetched_at timestamptz,
+  source_name text,
+  source_url text
+)
+language plpgsql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_lat numeric;
+  v_lon numeric;
+begin
+  if p_lat is null or p_lat < -90 or p_lat > 90 or p_lon is null or p_lon < -180 or p_lon > 180 then
+    raise exception 'soil_context requires valid lat/lon.' using errcode = 'check_violation';
+  end if;
+
+  v_lat := round(p_lat::numeric, 2);
+  v_lon := round(p_lon::numeric, 2);
+
+  return query
+  select
+    s.depth_top_cm,
+    s.depth_bottom_cm,
+    s.clay_pct,
+    s.sand_pct,
+    s.silt_pct,
+    s.ph,
+    s.soc_g_kg,
+    s.cec_cmol_kg,
+    s.bulk_density_g_cm3,
+    s.uncertainty,
+    s.fetched_at,
+    i.name,
+    s.source_url
+  from public.soil_observations s
+  join public.intel_sources i on i.code = s.source_code
+  where s.lat_cell = v_lat
+    and s.lon_cell = v_lon
+  order by s.depth_top_cm;
+end;
+$$;
+
+comment on function public.soil_context(double precision, double precision) is
+  'Returns modelled soil properties for the ~1.1 km cell containing the point. No coordinates are returned; absence of rows means no observation, not a zero.';
+
+grant execute on function public.soil_context(double precision, double precision)
+  to anon, authenticated;
+
+-- ---------------------------------------------------------------------------
+-- 4. Forecast calibration schema
+-- ---------------------------------------------------------------------------
+-- A forecast model is a versioned artifact. It is registered as shadow first;
+-- activation is an explicit administrator action, and only when the holdout
+-- result beats the raw forecast and the test sample is large enough.
+create table public.ml_models (
+  id                    uuid primary key default gen_random_uuid(),
+  model_code            text not null,
+  version               integer not null check (version > 0),
+  target                text not null check (target in (
+                          'forecast_tmax_c', 'forecast_tmin_c', 'pest_risk',
+                          'crop_stage', 'market_price'
+                        )),
+  algorithm             text not null,
+  status                text not null default 'shadow'
+                          check (status in ('shadow', 'active', 'retired', 'rejected')),
+  provider_code         text references public.weather_providers (code),
+  district_code         text references public.districts (code),
+  feature_schema_version integer not null default 1 check (feature_schema_version > 0),
+  feature_names         text[] not null check (cardinality(feature_names) > 0),
+  coefficients          jsonb not null,
+  metrics               jsonb not null,
+  provenance            jsonb not null,
+  confidence            numeric check (confidence is null or (confidence >= 0 and confidence <= 1)),
+  train_rows            integer check (train_rows is null or train_rows >= 0),
+  test_rows             integer check (test_rows is null or test_rows >= 0),
+  training_start        date,
+  training_end          date,
+  trained_at            timestamptz not null,
+  activated_at          timestamptz,
+  retired_at            timestamptz,
+  created_at            timestamptz not null default now(),
+  unique (model_code, version, target, provider_code, district_code),
+  constraint ml_models_training_window
+    check (training_start is null or training_end is null or training_end >= training_start)
+);
+
+comment on table public.ml_models is
+  'Versioned model artifacts. A model is not active merely because it exists: activation requires an admin, a positive holdout improvement and at least 30 test rows. Coefficients and metrics are immutable evidence of what was trained.';
+
+create unique index ml_models_one_active_idx
+  on public.ml_models (
+    target,
+    coalesce(provider_code, ''),
+    coalesce(district_code, '')
+  )
+  where status = 'active';
+
+create index ml_models_target_idx
+  on public.ml_models (target, status, trained_at desc);
+
+create table public.ml_training_runs (
+  id            uuid primary key default gen_random_uuid(),
+  model_code    text not null,
+  target        text not null,
+  provider_code text,
+  district_code text,
+  started_at    timestamptz not null default now(),
+  finished_at   timestamptz,
+  status        text not null default 'running'
+                  check (status in ('running', 'ok', 'rejected', 'failed')),
+  train_rows    integer not null default 0,
+  test_rows     integer not null default 0,
+  metrics       jsonb not null default '{}'::jsonb,
+  artifact      jsonb not null default '{}'::jsonb,
+  source_urls   text[] not null default '{}'::text[],
+  error         text
+);
+
+create table public.ml_forecast_backtests (
+  id              bigserial primary key,
+  model_id        uuid not null references public.ml_models (id) on delete cascade,
+  evaluated_at    timestamptz not null default now(),
+  sample_rows     integer not null default 0,
+  raw_mae         numeric,
+  calibrated_mae  numeric,
+  improvement_pct numeric,
+  detail          jsonb not null default '{}'::jsonb
+);
+
+create index ml_forecast_backtests_model_idx
+  on public.ml_forecast_backtests (model_id, evaluated_at desc);
+
+alter table public.ml_models enable row level security;
+alter table public.ml_training_runs enable row level security;
+alter table public.ml_forecast_backtests enable row level security;
+
+create policy ml_models_admin_read on public.ml_models
+  for select to authenticated using (public.has_capability('admin'));
+
+create policy ml_training_runs_admin_read on public.ml_training_runs
+  for select to authenticated using (public.has_capability('admin'));
+
+create policy ml_forecast_backtests_admin_read on public.ml_forecast_backtests
+  for select to authenticated using (public.has_capability('admin'));
+
+grant select on public.ml_models to authenticated;
+grant select on public.ml_training_runs to authenticated;
+grant select on public.ml_forecast_backtests to authenticated;
+revoke insert, update, delete on public.ml_models from authenticated;
+revoke insert, update, delete on public.ml_training_runs from authenticated;
+revoke insert, update, delete on public.ml_forecast_backtests from authenticated;
+
+alter table public.climate_forecasts
+  add column calibrated_tmax_c numeric,
+  add column calibrated_tmin_c numeric,
+  add column tmax_model_id uuid references public.ml_models (id),
+  add column tmin_model_id uuid references public.ml_models (id),
+  add column calibrated_at timestamptz;
+
+comment on column public.climate_forecasts.calibrated_tmax_c is
+  'Bias-corrected daily maximum temperature from the active model for this provider/district. NULL means no active model produced a calibration; it is not zero.';
+comment on column public.climate_forecasts.calibrated_tmin_c is
+  'Bias-corrected daily minimum temperature from the active model for this provider/district. NULL means no active model produced a calibration; it is not zero.';
+
+-- A small, auditable linear correction. The feature set is deliberately fixed:
+-- raw value, lead day, and a smooth annual cycle. Adding a feature changes the
+-- model schema version, not this function's assumptions.
+create or replace function public.ml_apply_linear(
+  p_coefficients jsonb,
+  p_raw numeric,
+  p_lead integer,
+  p_month integer
+)
+returns numeric
+language sql
+immutable
+set search_path = public, pg_temp
+as $$
+  select round(
+    coalesce((p_coefficients->>'intercept')::numeric, 0)
+    + p_raw * coalesce((p_coefficients->>'raw')::numeric, 1)
+    + coalesce(p_lead, 0) * coalesce((p_coefficients->>'lead_day')::numeric, 0)
+    + sin(2 * pi() * (coalesce(p_month, 1) - 1) / 12.0)::numeric
+      * coalesce((p_coefficients->>'month_sin')::numeric, 0)
+    + cos(2 * pi() * (coalesce(p_month, 1) - 1) / 12.0)::numeric
+      * coalesce((p_coefficients->>'month_cos')::numeric, 0),
+    2
+  );
+$$;
+
+comment on function public.ml_apply_linear(jsonb, numeric, integer, integer) is
+  'Applies the registered linear artifact. It is a correction of the raw provider value, not an independent weather simulation.';
+
+create or replace function public.agri_apply_forecast_model()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_tmax public.ml_models;
+  v_tmin public.ml_models;
+  v_lead integer;
+  v_month integer;
+  v_value numeric;
+begin
+  v_lead := greatest(0, least(16, new.forecast_on - new.issued_on));
+  v_month := extract(month from new.forecast_on)::integer;
+
+  select * into v_tmax
+    from public.ml_models m
+   where m.status = 'active'
+     and m.target = 'forecast_tmax_c'
+     and (m.provider_code is null or m.provider_code = new.provider_code)
+     and (m.district_code is null or m.district_code = new.district_code)
+   order by (m.district_code is not null) desc,
+            (m.provider_code is not null) desc,
+            m.version desc
+   limit 1;
+
+  select * into v_tmin
+    from public.ml_models m
+   where m.status = 'active'
+     and m.target = 'forecast_tmin_c'
+     and (m.provider_code is null or m.provider_code = new.provider_code)
+     and (m.district_code is null or m.district_code = new.district_code)
+   order by (m.district_code is not null) desc,
+            (m.provider_code is not null) desc,
+            m.version desc
+   limit 1;
+
+  new.calibrated_tmax_c := null;
+  new.calibrated_tmin_c := null;
+  new.tmax_model_id := null;
+  new.tmin_model_id := null;
+  new.calibrated_at := null;
+
+  if v_tmax.id is not null and new.tmax_c is not null then
+    v_value := public.ml_apply_linear(v_tmax.coefficients, new.tmax_c, v_lead, v_month);
+    if v_value between -20 and 60 then
+      new.calibrated_tmax_c := v_value;
+      new.tmax_model_id := v_tmax.id;
+      new.calibrated_at := now();
+    end if;
+  end if;
+
+  if v_tmin.id is not null and new.tmin_c is not null then
+    v_value := public.ml_apply_linear(v_tmin.coefficients, new.tmin_c, v_lead, v_month);
+    if v_value between -30 and 50 then
+      new.calibrated_tmin_c := v_value;
+      new.tmin_model_id := v_tmin.id;
+      new.calibrated_at := now();
+    end if;
+  end if;
+
+  return new;
+end;
+$$;
+
+create trigger climate_forecasts_apply_model
+  before insert or update of tmax_c, tmin_c, forecast_on, issued_on, provider_code, district_code
+  on public.climate_forecasts
+  for each row execute function public.agri_apply_forecast_model();
+
+-- ---------------------------------------------------------------------------
+-- 5. Model lifecycle
+-- ---------------------------------------------------------------------------
+create or replace function public.activate_ml_model(p_model_id uuid)
+returns public.ml_models
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_actor public.ml_models;
+  v_model public.ml_models;
+  v_improvement numeric;
+  v_test_rows integer;
+begin
+  if not public.has_capability('admin') then
+    raise exception 'Model activation requires admin capability.' using errcode = 'insufficient_privilege';
+  end if;
+
+  select * into v_model from public.ml_models where id = p_model_id;
+  if v_model.id is null then
+    raise exception 'Model % does not exist.', p_model_id using errcode = 'no_data_found';
+  end if;
+  if v_model.status not in ('shadow', 'active') then
+    raise exception 'A retired or rejected model cannot be activated.' using errcode = 'check_violation';
+  end if;
+
+  v_improvement := coalesce((v_model.metrics->>'improvement_pct')::numeric, 0);
+  v_test_rows := coalesce((v_model.metrics->>'test_rows')::integer, 0);
+  if v_test_rows < 30 then
+    raise exception 'Model has % holdout rows; at least 30 are required.', v_test_rows
+      using errcode = 'check_violation';
+  end if;
+  if v_improvement <= 0 then
+    raise exception 'Model does not beat the raw baseline on holdout data (improvement %).',
+      v_improvement using errcode = 'check_violation';
+  end if;
+
+  update public.ml_models
+     set status = 'retired', retired_at = now()
+   where status = 'active'
+     and target = v_model.target
+     and coalesce(provider_code, '') = coalesce(v_model.provider_code, '')
+     and coalesce(district_code, '') = coalesce(v_model.district_code, '');
+
+  update public.ml_models
+     set status = 'active', activated_at = now(), retired_at = null
+   where id = v_model.id
+   returning * into v_model;
+
+  perform public.write_audit(
+    'ml.model.activated', 'ml_models', v_model.id, v_model.model_code,
+    null, null,
+    jsonb_build_object(
+      'target', v_model.target,
+      'version', v_model.version,
+      'improvement_pct', v_improvement,
+      'test_rows', v_test_rows
+    ),
+    public.current_party_id(), 'admin'
+  );
+
+  return v_model;
+end;
+$$;
+
+comment on function public.activate_ml_model(uuid) is
+  'Admin-only activation. Refuses a model without at least 30 holdout rows and a positive improvement over the raw baseline. Demotes the previously active model for the same target/provider/district.';
+
+create or replace function public.retire_ml_model(p_model_id uuid)
+returns public.ml_models
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_model public.ml_models;
+begin
+  if not public.has_capability('admin') then
+    raise exception 'Model retirement requires admin capability.' using errcode = 'insufficient_privilege';
+  end if;
+
+  update public.ml_models
+     set status = 'retired', retired_at = now()
+   where id = p_model_id
+   returning * into v_model;
+
+  if v_model.id is null then
+    raise exception 'Model % does not exist.', p_model_id using errcode = 'no_data_found';
+  end if;
+
+  perform public.write_audit(
+    'ml.model.retired', 'ml_models', v_model.id, v_model.model_code,
+    null, null,
+    jsonb_build_object('target', v_model.target, 'version', v_model.version),
+    public.current_party_id(), 'admin'
+  );
+
+  return v_model;
+end;
+$$;
+
+create or replace function public.ml_model_health()
+returns table (
+  model_id uuid,
+  model_code text,
+  version integer,
+  target text,
+  provider_code text,
+  district_code text,
+  status text,
+  confidence numeric,
+  trained_at timestamptz,
+  activated_at timestamptz,
+  train_rows integer,
+  test_rows integer,
+  holdout_metrics jsonb,
+  latest_backtest jsonb,
+  age_days integer
+)
+language plpgsql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  if not public.has_capability('admin') then
+    raise exception 'Model health requires admin capability.' using errcode = 'insufficient_privilege';
+  end if;
+
+  return query
+  select
+    m.id,
+    m.model_code,
+    m.version,
+    m.target,
+    m.provider_code,
+    m.district_code,
+    m.status,
+    m.confidence,
+    m.trained_at,
+    m.activated_at,
+    m.train_rows,
+    m.test_rows,
+    m.metrics,
+    (
+      select jsonb_build_object(
+        'evaluated_at', b.evaluated_at,
+        'sample_rows', b.sample_rows,
+        'raw_mae', b.raw_mae,
+        'calibrated_mae', b.calibrated_mae,
+        'improvement_pct', b.improvement_pct
+      )
+      from public.ml_forecast_backtests b
+      where b.model_id = m.id
+      order by b.evaluated_at desc
+      limit 1
+    ) as latest_backtest,
+    greatest(0, floor(extract(epoch from (now() - m.trained_at)) / 86400))::integer as age_days
+  from public.ml_models m
+  order by (m.status = 'active') desc, m.trained_at desc;
+end;
+$$;
+
+comment on function public.ml_model_health() is
+  'Admin-only model registry view with holdout metrics, latest live backtest and artifact age. It reports missing live samples as null rather than inventing a score.';
+
+-- Live monitoring: compare a model's calibrated forecasts with NASA POWER
+-- observations once the forecast day has passed. No future data is used.
+create or replace function public.record_ml_forecast_backtest(p_model_id uuid)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_role text := coalesce(nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'role', '');
+  v_model public.ml_models;
+  v_rows integer := 0;
+  v_raw_mae numeric;
+  v_cal_mae numeric;
+  v_improvement numeric;
+begin
+  if v_role <> 'service_role' and not public.has_capability('admin') then
+    raise exception 'Forecast backtesting requires the service role or admin.' using errcode = 'insufficient_privilege';
+  end if;
+
+  select * into v_model from public.ml_models where id = p_model_id;
+  if v_model.id is null then
+    raise exception 'Model % does not exist.', p_model_id using errcode = 'no_data_found';
+  end if;
+  if v_model.target not in ('forecast_tmax_c', 'forecast_tmin_c') then
+    raise exception 'Only forecast temperature models have a live backtest.' using errcode = 'check_violation';
+  end if;
+
+  if v_model.target = 'forecast_tmax_c' then
+    select
+      count(*),
+      avg(abs(f.tmax_c - o.tmax_c)),
+      avg(abs(f.calibrated_tmax_c - o.tmax_c))
+    into v_rows, v_raw_mae, v_cal_mae
+    from public.climate_forecasts f
+    join public.climate_observations o
+      on o.provider_code = 'nasa_power'
+     and o.district_code = f.district_code
+     and o.observed_on = f.forecast_on
+    where f.provider_code = v_model.provider_code
+      and f.district_code = v_model.district_code
+      and f.forecast_on < current_date
+      and f.tmax_c is not null
+      and f.calibrated_tmax_c is not null
+      and o.tmax_c is not null;
+  else
+    select
+      count(*),
+      avg(abs(f.tmin_c - o.tmin_c)),
+      avg(abs(f.calibrated_tmin_c - o.tmin_c))
+    into v_rows, v_raw_mae, v_cal_mae
+    from public.climate_forecasts f
+    join public.climate_observations o
+      on o.provider_code = 'nasa_power'
+     and o.district_code = f.district_code
+     and o.observed_on = f.forecast_on
+    where f.provider_code = v_model.provider_code
+      and f.district_code = v_model.district_code
+      and f.forecast_on < current_date
+      and f.tmin_c is not null
+      and f.calibrated_tmin_c is not null
+      and o.tmin_c is not null;
+  end if;
+
+  v_improvement := case
+    when v_rows > 0 and v_raw_mae is not null and v_raw_mae > 0 and v_cal_mae is not null
+      then round((1 - (v_cal_mae / v_raw_mae)) * 100, 2)
+    else null
+  end;
+
+  insert into public.ml_forecast_backtests (
+    model_id, sample_rows, raw_mae, calibrated_mae, improvement_pct, detail
+  ) values (
+    v_model.id, v_rows, v_raw_mae, v_cal_mae, v_improvement,
+    jsonb_build_object(
+      'target', v_model.target,
+      'provider', v_model.provider_code,
+      'district', v_model.district_code,
+      'reference', 'NASA POWER reanalysis',
+      'note', 'Not a station observation; this is a model-to-model comparison.'
+    )
+  );
+
+  return jsonb_build_object(
+    'model_id', v_model.id,
+    'sample_rows', v_rows,
+    'raw_mae', v_raw_mae,
+    'calibrated_mae', v_cal_mae,
+    'improvement_pct', v_improvement
+  );
+end;
+$$;
+
+comment on function public.record_ml_forecast_backtest(uuid) is
+  'Compares a temperature model with NASA POWER reanalysis after the forecast day has passed. Zero rows returns zero samples and null metrics, not a fake accuracy.';
+
+revoke execute on function public.activate_ml_model(uuid) from public, anon;
+revoke execute on function public.retire_ml_model(uuid) from public, anon;
+revoke execute on function public.ml_model_health() from public, anon;
+revoke execute on function public.record_ml_forecast_backtest(uuid) from public, anon;
+grant execute on function public.activate_ml_model(uuid) to authenticated;
+grant execute on function public.retire_ml_model(uuid) to authenticated;
+grant execute on function public.ml_model_health() to authenticated;
+grant execute on function public.record_ml_forecast_backtest(uuid) to service_role;
+grant execute on function public.record_ml_forecast_backtest(uuid) to authenticated;
+
+-- ---------------------------------------------------------------------------
+-- 6. One source-health read path
+-- ---------------------------------------------------------------------------
+create or replace function public.ingestion_health()
+returns table (
+  source_code text,
+  source_name text,
+  source_kind text,
+  access_status text,
+  last_attempt_at timestamptz,
+  last_success_at timestamptz,
+  last_status text,
+  rows_written integer,
+  freshness text,
+  detail jsonb
+)
+language plpgsql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  if not public.has_capability('admin') then
+    raise exception 'Ingestion health requires admin capability.' using errcode = 'insufficient_privilege';
+  end if;
+
+  return query
+  with
+  weather_run as (
+    select * from public.weather_ingestion_runs
+     where provider_code = 'open_meteo'
+     order by started_at desc limit 1
+  ),
+  weather_last as (
+    select max(observed_at) as observed_at from public.weather_readings
+     where provider_code = 'open_meteo' and kind = 'current' and fetch_error is null
+  ),
+  climate_run as (
+    select * from public.climate_ingestion_runs
+     where provider_code = 'nasa_power'
+     order by started_at desc limit 1
+  ),
+  climate_last as (
+    select max(observed_on)::timestamptz as observed_at from public.climate_observations
+     where provider_code = 'nasa_power'
+  ),
+  forecast_run as (
+    select * from public.climate_ingestion_runs
+     where provider_code in ('weatherapi', 'open_meteo')
+     order by started_at desc limit 1
+  ),
+  forecast_last as (
+    select max(issued_on)::timestamptz as issued_at from public.climate_forecasts
+     where provider_code in ('weatherapi', 'open_meteo')
+  ),
+  market_run as (
+    select * from public.market_ingestion_runs
+     order by started_at desc limit 1
+  ),
+  market_last as (
+    select max(observed_on)::timestamptz as observed_at from public.market_observations
+  ),
+  advisory_run as (
+    select * from public.advisory_import_runs
+     order by started_at desc limit 1
+  ),
+  soil_run as (
+    select r.* from public.soil_ingestion_runs r
+     where r.source_code = 'soilgrids'
+     order by r.started_at desc limit 1
+  ),
+  soil_last as (
+    select max(o.fetched_at) as fetched_at from public.soil_observations o
+     where o.source_code = 'soilgrids'
+  )
+  select
+    'open_meteo', coalesce(i.name, 'Open-Meteo'), 'weather', i.status,
+    w.started_at,
+    (select max(finished_at) from public.weather_ingestion_runs where provider_code = 'open_meteo' and status = 'ok'),
+    w.status, coalesce(w.cells_written, 0),
+    case
+      when wl.observed_at is null then 'empty'
+      when wl.observed_at > now() - interval '90 minutes' then 'fresh'
+      when wl.observed_at > now() - interval '6 hours' then 'stale'
+      else 'expired'
+    end,
+    jsonb_build_object('last_observed_at', wl.observed_at, 'cells_requested', w.cells_requested)
+  from weather_run w
+  left join public.intel_sources i on i.code = 'open_meteo'
+  cross join weather_last wl
+  union all
+  select
+    'nasa_power', coalesce(i.name, 'NASA POWER'), 'climate', i.status,
+    c.started_at,
+    (select max(finished_at) from public.climate_ingestion_runs where provider_code = 'nasa_power' and status = 'ok'),
+    c.status, coalesce(c.rows_written, 0),
+    case
+      when cl.observed_at is null then 'empty'
+      when cl.observed_at > (current_date - 7)::timestamptz then 'current'
+      when cl.observed_at > (current_date - 30)::timestamptz then 'stale'
+      else 'expired'
+    end,
+    jsonb_build_object('last_observed_on', cl.observed_at, 'range', jsonb_build_array(c.range_start, c.range_end))
+  from climate_run c
+  left join public.intel_sources i on i.code = 'nasa_power'
+  cross join climate_last cl
+  union all
+  select
+    f.provider_code, coalesce(wp.name, f.provider_code), 'forecast',
+    coalesce(i.status, 'unverified'),
+    f.started_at,
+    (select max(finished_at) from public.climate_ingestion_runs where provider_code = f.provider_code and status = 'ok'),
+    f.status, coalesce(f.rows_written, 0),
+    case
+      when fl.issued_at is null then 'empty'
+      when fl.issued_at >= current_date::timestamptz then 'fresh'
+      when fl.issued_at >= (current_date - 2)::timestamptz then 'stale'
+      else 'expired'
+    end,
+    jsonb_build_object('last_issued_on', fl.issued_at, 'error', f.error)
+  from forecast_run f
+  left join public.weather_providers wp on wp.code = f.provider_code
+  left join public.intel_sources i on i.code = f.provider_code
+  cross join forecast_last fl
+  union all
+  select
+    m.source_code, coalesce(ms.name, m.source_code), 'market',
+    coalesce(i.status, 'unverified'),
+    m.started_at,
+    (select max(mr.finished_at) from public.market_ingestion_runs mr where mr.source_code = m.source_code and mr.status = 'ok'),
+    m.status, coalesce(m.rows_written, 0),
+    case
+      when ml.observed_at is null then 'empty'
+      when ml.observed_at >= (current_date - 36 * interval '1 hour')::timestamptz then 'fresh'
+      when ml.observed_at >= (current_date - 7)::timestamptz then 'stale'
+      else 'expired'
+    end,
+    jsonb_build_object('last_observed_on', ml.observed_at, 'rows_rejected', m.rows_rejected)
+  from market_run m
+  left join public.market_sources ms on ms.code = m.source_code
+  left join public.intel_sources i on i.code = m.source_code
+  cross join market_last ml
+  union all
+  select
+    'punjab_advisory', coalesce(i.name, 'Punjab Agriculture advisories'), 'advisory', i.status,
+    a.started_at,
+    (select max(finished_at) from public.advisory_import_runs where status = 'ok'),
+    a.status, coalesce(a.rows_written, 0),
+    case when exists (
+      select 1 from public.agri_advisories ad
+       where ad.is_active and ad.verification_status = 'verified'
+         and (ad.valid_until is null or ad.valid_until > now())
+    ) then 'current' else 'empty' end,
+    jsonb_build_object('last_error', a.error, 'rows_rejected', a.rows_rejected)
+  from advisory_run a
+  left join public.intel_sources i on i.code = 'punjab_advisory'
+  union all
+  select
+    'soilgrids', coalesce(i.name, 'ISRIC SoilGrids'), 'soil', i.status,
+    s.started_at,
+    (select max(sr.finished_at) from public.soil_ingestion_runs sr where sr.source_code = 'soilgrids' and sr.status = 'ok'),
+    s.status, coalesce(s.cells_written, 0),
+    case
+      when sl.fetched_at is null then 'empty'
+      when sl.fetched_at > now() - interval '180 days' then 'current'
+      else 'stale'
+    end,
+    jsonb_build_object('last_fetched_at', sl.fetched_at, 'cells_requested', s.cells_requested)
+  from soil_run s
+  left join public.intel_sources i on i.code = 'soilgrids'
+  cross join soil_last sl;
+end;
+$$;
+
+comment on function public.ingestion_health() is
+  'Admin-only operational read: last attempt, last success, current freshness and rejection details for every external source. No credentials or raw payloads are returned.';
+
+revoke execute on function public.ingestion_health() from public, anon;
+grant execute on function public.ingestion_health() to authenticated;
+
+-- The first soil provider is registered but has not been run. Registering it is
+-- not an ingestion success; the source-health row will say so until rows exist.
+comment on table public.soil_observations is
+  'Modelled SoilGrids priors by ~1.1 km cell and depth. Never a soil test and never field-level truth. Missing properties stay NULL; the provider uncertainty is retained.';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261104002300_forecast_bias_model.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Phase 9 · Forecast bias model, service operations and calibrated risks
+--
+-- The two models below were trained by `scripts/train-forecast-bias.mjs` on
+-- archived ECMWF IFS 00 UTC runs and NASA POWER MERRA-2 daily reanalysis. The
+-- split is chronological, not random: 455 runs train, the last 193 rows test.
+-- The artifact is committed beside this migration; these rows are generated
+-- from it, not hand-edited.
+--
+-- Registration is not activation. Both rows start as `shadow`; an operator with
+-- admin or service authority must call `activate_ml_model`, which still checks
+-- the holdout row count and improvement. The model applies only to Layyah and
+-- only to Open-Meteo ECMWF forecasts, so a different provider or district keeps
+-- its raw value rather than borrowing a correction that was not trained for it.
+--
+-- This migration also makes the operational functions callable by the service
+-- role. That is not a widening of farmer access: the service role is the
+-- scheduler/deployment identity, and the alternative is an admin-only function
+-- that no automation can run. The model checks remain in force.
+
+-- ---------------------------------------------------------------------------
+-- 1. Activation authority
+-- ---------------------------------------------------------------------------
+create or replace function public.activate_ml_model(p_model_id uuid)
+returns public.ml_models
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_role text := coalesce(
+    nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'role',
+    ''
+  );
+  v_model public.ml_models;
+  v_improvement numeric;
+  v_test_rows integer;
+begin
+  if v_role <> 'service_role' and not public.has_capability('admin') then
+    raise exception 'Model activation requires admin or service authority.'
+      using errcode = 'insufficient_privilege';
+  end if;
+
+  select * into v_model from public.ml_models where id = p_model_id;
+  if v_model.id is null then
+    raise exception 'Model % does not exist.', p_model_id using errcode = 'no_data_found';
+  end if;
+  if v_model.status not in ('shadow', 'active') then
+    raise exception 'A retired or rejected model cannot be activated.' using errcode = 'check_violation';
+  end if;
+
+  v_improvement := coalesce((v_model.metrics->>'improvement_pct')::numeric, 0);
+  v_test_rows := coalesce((v_model.metrics->>'test_rows')::integer, 0);
+  if v_test_rows < 30 then
+    raise exception 'Model has % holdout rows; at least 30 are required.', v_test_rows
+      using errcode = 'check_violation';
+  end if;
+  if v_improvement <= 0 then
+    raise exception 'Model does not beat the raw baseline on holdout data (improvement %).',
+      v_improvement using errcode = 'check_violation';
+  end if;
+
+  update public.ml_models
+     set status = 'retired', retired_at = now()
+   where status = 'active'
+     and target = v_model.target
+     and coalesce(provider_code, '') = coalesce(v_model.provider_code, '')
+     and coalesce(district_code, '') = coalesce(v_model.district_code, '');
+
+  update public.ml_models
+     set status = 'active', activated_at = now(), retired_at = null
+   where id = v_model.id
+   returning * into v_model;
+
+  perform public.write_audit(
+    'ml.model.activated', 'ml_models', v_model.id, v_model.model_code,
+    null, null,
+    jsonb_build_object(
+      'target', v_model.target,
+      'version', v_model.version,
+      'improvement_pct', v_improvement,
+      'test_rows', v_test_rows,
+      'authority', case when v_role = 'service_role' then 'service' else 'admin' end
+    ),
+    public.current_party_id(), 'admin'
+  );
+
+  return v_model;
+end;
+$$;
+
+comment on function public.activate_ml_model(uuid) is
+  'Admin-or-service activation. Refuses a model without at least 30 holdout rows and a positive improvement over the raw baseline. Demotes the previously active model for the same target/provider/district.';
+
+revoke execute on function public.activate_ml_model(uuid) from public, anon;
+grant execute on function public.activate_ml_model(uuid) to authenticated, service_role;
+
+-- ---------------------------------------------------------------------------
+-- 2. Model health for the operator, not only for an admin session
+-- ---------------------------------------------------------------------------
+create or replace function public.ml_model_health()
+returns table (
+  model_id uuid,
+  model_code text,
+  version integer,
+  target text,
+  provider_code text,
+  district_code text,
+  status text,
+  confidence numeric,
+  trained_at timestamptz,
+  activated_at timestamptz,
+  train_rows integer,
+  test_rows integer,
+  holdout_metrics jsonb,
+  latest_backtest jsonb,
+  age_days integer
+)
+language plpgsql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_role text := coalesce(
+    nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'role',
+    ''
+  );
+begin
+  if v_role <> 'service_role' and not public.has_capability('admin') then
+    raise exception 'Model health requires admin or service authority.'
+      using errcode = 'insufficient_privilege';
+  end if;
+
+  return query
+  select
+    m.id,
+    m.model_code,
+    m.version,
+    m.target,
+    m.provider_code,
+    m.district_code,
+    m.status,
+    m.confidence,
+    m.trained_at,
+    m.activated_at,
+    m.train_rows,
+    m.test_rows,
+    m.metrics,
+    (
+      select jsonb_build_object(
+        'evaluated_at', b.evaluated_at,
+        'sample_rows', b.sample_rows,
+        'raw_mae', b.raw_mae,
+        'calibrated_mae', b.calibrated_mae,
+        'improvement_pct', b.improvement_pct
+      )
+      from public.ml_forecast_backtests b
+      where b.model_id = m.id
+      order by b.evaluated_at desc
+      limit 1
+    ) as latest_backtest,
+    greatest(0, floor(extract(epoch from (now() - m.trained_at)) / 86400))::integer as age_days
+  from public.ml_models m
+  order by (m.status = 'active') desc, m.trained_at desc;
+end;
+$$;
+
+comment on function public.ml_model_health() is
+  'Admin-or-service model registry view with holdout metrics, latest live backtest and artifact age. It reports missing live samples as null rather than inventing a score.';
+
+revoke execute on function public.ml_model_health() from public, anon;
+grant execute on function public.ml_model_health() to authenticated, service_role;
+
+-- ---------------------------------------------------------------------------
+-- 3. Risks read the calibrated value when one exists
+-- ---------------------------------------------------------------------------
+-- The risk rule's threshold was written against the raw forecast vocabulary.
+-- Applying it to a calibrated value is still the same rule: the calibration is a
+-- correction of that provider value, not a different metric. The basis records
+-- which temperature was actually used, so a served warning can be traced back to
+-- the model rather than silently looking like a raw forecast.
+create or replace function public.generate_forecast_risks(
+  p_from date default current_date,
+  p_to   date default current_date + 2
+)
+returns integer
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_written integer := 0;
+  v_role text := coalesce(nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'role', '');
+begin
+  if v_role <> 'service_role' and not public.has_capability('admin') then
+    raise exception 'Generating forecast risks requires the service role or admin.' using errcode = 'insufficient_privilege';
+  end if;
+
+  with rule_metric as (
+    select
+      r.code, r.crop_code, r.topic, r.metric, r.operator, r.threshold, r.unit,
+      r.label_en, r.label_ur, r.knowledge_entry_id, r.source_code,
+      f.provider_code, f.district_code, f.forecast_on, f.issued_on,
+      case r.metric
+        when 'tmax_c'       then coalesce(f.calibrated_tmax_c, f.tmax_c)
+        when 'tmin_c'       then coalesce(f.calibrated_tmin_c, f.tmin_c)
+        when 'precip_mm'    then f.precip_mm
+        when 'humidity_pct' then f.humidity_pct
+        when 'wind_kph'     then f.wind_kph
+      end as observed,
+      case r.metric
+        when 'tmax_c' then f.calibrated_tmax_c is not null
+        when 'tmin_c' then f.calibrated_tmin_c is not null
+        else false
+      end as calibrated,
+      case r.metric
+        when 'tmax_c' then f.tmax_model_id
+        when 'tmin_c' then f.tmin_model_id
+        else null
+      end as model_id
+    from public.forecast_risk_rules r
+    join public.climate_forecasts f on true
+    where r.is_active
+      and f.forecast_on between p_from and p_to
+  ),
+  fired as (
+    select *
+    from rule_metric
+    where observed is not null
+      and case operator
+        when 'gt'  then observed >  threshold
+        when 'gte' then observed >= threshold
+        when 'lt'  then observed <  threshold
+        when 'lte' then observed <= threshold
+      end
+  ),
+  written as (
+    insert into public.forecast_risks (
+      rule_code, provider_code, district_code, crop_code, topic, risk_on, issued_on,
+      metric, operator, threshold, observed_value, basis, title, title_ur, summary, summary_ur, expires_at
+    )
+    select
+      code, provider_code, district_code, crop_code, topic, forecast_on, issued_on,
+      metric, operator, threshold, observed,
+      jsonb_build_object(
+        'metric', metric,
+        'observed', observed,
+        'threshold', threshold,
+        'unit', unit,
+        'source_row', 'climate_forecasts',
+        'calibrated', calibrated,
+        'model_id', model_id
+      ),
+      format(label_en, round(observed, 1), forecast_on),
+      format(label_ur, round(observed, 1), forecast_on),
+      format('%s Published guidance: %s Risk, not an outbreak: this is what the forecast suggests, not what has been seen in a field.%s',
+             unit,
+             (select title_en from public.agri_knowledge_entries e where e.id = knowledge_entry_id),
+             case when calibrated then ' Temperature is bias-corrected by the active model.' else '' end),
+      format('%s شائع شدہ رہنمائی: %s خطرہ، وبا نہیں: یہ پیش گوئی ہے، کھیت میں دیکھی گئی چیز نہیں۔%s',
+             unit,
+             (select title_ur from public.agri_knowledge_entries e where e.id = knowledge_entry_id),
+             case when calibrated then ' درجہ حرارت فعال ماڈل سے درست کیا گیا ہے۔' else '' end),
+      (forecast_on + 1)::timestamptz
+    from fired
+    on conflict (rule_code, district_code, risk_on, issued_on) do update
+      set observed_value = excluded.observed_value,
+          basis          = excluded.basis,
+          title          = excluded.title,
+          title_ur       = excluded.title_ur,
+          summary        = excluded.summary,
+          summary_ur     = excluded.summary_ur,
+          expires_at     = excluded.expires_at,
+          observed_at    = now()
+    returning 1
+  )
+  select count(*) into v_written from written;
+
+  return v_written;
+end;
+$$;
+
+comment on function public.generate_forecast_risks(date, date) is
+  'Applies every active rule to the stored forecast for a window and upserts the resulting risk rows. Temperature metrics use the calibrated value when an active model produced one, and the basis records that. Idempotent per (rule, district, day, issue date). Every row it writes is a risk derived from a model, never an observation.';
+
+revoke execute on function public.generate_forecast_risks(date, date) from public, anon;
+grant execute on function public.generate_forecast_risks(date, date) to authenticated, service_role;
+
+-- ---------------------------------------------------------------------------
+-- 4. The real artifacts, registered as shadow
+-- ---------------------------------------------------------------------------
+-- Generated from artifacts/models/forecast-bias-layyah-seed.sql. The holdout
+-- comparison is ECMWF IFS against NASA POWER reanalysis, not a station record:
+-- these metrics measure a model-to-model correction, not field accuracy.
+insert into public.ml_models (
+  model_code, version, target, algorithm, status, provider_code, district_code,
+  feature_schema_version, feature_names, coefficients, metrics, provenance,
+  confidence, train_rows, test_rows, training_start, training_end, trained_at
+) values (
+  'ecmwf_ifs_forecast_bias_layyah', 1, 'forecast_tmax_c',
+  'ridge_linear_bias_correction', 'shadow', 'open_meteo', 'layyah',
+  1, array['intercept','raw','lead_day','month_sin','month_cos'],
+  '{"intercept":6.877793263917056,"raw":0.8721785949652248,"lead_day":-0.08844602860594315,"month_sin":0.6844755964720441,"month_cos":-0.7257473847938721}'::jsonb,
+  '{"test_rows":193,"train_rows":455,"raw_mae":3.598,"calibrated_mae":1.772,"improvement_pct":50.75,"raw_rmse":3.973,"calibrated_rmse":2.171,"raw_bias":-3.593,"calibrated_bias":-1.373,"train_raw_mae":2.994,"train_calibrated_mae":1.475,"test_start":"2026-04-11","test_end":"2026-10-24","train_start":"2025-01-04","train_end":"2026-04-04","reference":"NASA POWER daily reanalysis (0.5 degree)","forecast":"ECMWF IFS archived 00 UTC run via Open-Meteo Single Runs API","caveat":"Model-to-model comparison; not a station-observation validation."}'::jsonb,
+  '{"forecast_provider":"open_meteo","forecast_model":"ecmwf_ifs","forecast_run":"00 UTC archived run","reference_provider":"nasa_power","reference_product":"MERRA-2 daily reanalysis, 0.5 degree","license":"Open-Meteo CC BY 4.0 (free tier non-commercial); NASA POWER open data with attribution","limitation":"Reanalysis reference and global forecast grid; not a field or station measurement. Do not present holdout metrics as field accuracy."}'::jsonb,
+  0.95, 455, 193,
+  '2025-01-04'::date, '2026-10-24'::date,
+  '2026-11-04T19:44:53.200Z'::timestamptz
+) on conflict (model_code, version, target, provider_code, district_code) do nothing;
+
+insert into public.ml_models (
+  model_code, version, target, algorithm, status, provider_code, district_code,
+  feature_schema_version, feature_names, coefficients, metrics, provenance,
+  confidence, train_rows, test_rows, training_start, training_end, trained_at
+) values (
+  'ecmwf_ifs_forecast_bias_layyah', 1, 'forecast_tmin_c',
+  'ridge_linear_bias_correction', 'shadow', 'open_meteo', 'layyah',
+  1, array['intercept','raw','lead_day','month_sin','month_cos'],
+  '{"intercept":3.672275915341093,"raw":0.8662820463208103,"lead_day":0.016503879529202875,"month_sin":0.03530063705993436,"month_cos":-2.089702943462793}'::jsonb,
+  '{"test_rows":193,"train_rows":455,"raw_mae":2.011,"calibrated_mae":1.209,"improvement_pct":39.88,"raw_rmse":2.533,"calibrated_rmse":1.61,"raw_bias":-1.835,"calibrated_bias":-0.423,"train_raw_mae":1.426,"train_calibrated_mae":1.054,"test_start":"2026-04-11","test_end":"2026-10-24","train_start":"2025-01-04","train_end":"2026-04-04","reference":"NASA POWER daily reanalysis (0.5 degree)","forecast":"ECMWF IFS archived 00 UTC run via Open-Meteo Single Runs API","caveat":"Model-to-model comparison; not a station-observation validation."}'::jsonb,
+  '{"forecast_provider":"open_meteo","forecast_model":"ecmwf_ifs","forecast_run":"00 UTC archived run","reference_provider":"nasa_power","reference_product":"MERRA-2 daily reanalysis, 0.5 degree","license":"Open-Meteo CC BY 4.0 (free tier non-commercial); NASA POWER open data with attribution","limitation":"Reanalysis reference and global forecast grid; not a field or station measurement. Do not present holdout metrics as field accuracy."}'::jsonb,
+  0.95, 455, 193,
+  '2025-01-04'::date, '2026-10-24'::date,
+  '2026-11-04T19:44:53.200Z'::timestamptz
+) on conflict (model_code, version, target, provider_code, district_code) do nothing;
+
+insert into public.ml_training_runs (
+  model_code, target, provider_code, district_code, started_at, finished_at, status,
+  train_rows, test_rows, metrics, artifact, source_urls
+) values (
+  'ecmwf_ifs_forecast_bias_layyah', 'forecast_tmax_c', 'open_meteo', 'layyah',
+  '2026-11-04T19:44:53.200Z'::timestamptz, '2026-11-04T19:44:53.200Z'::timestamptz,
+  'ok', 455, 193,
+  '{"test_rows":193,"train_rows":455,"raw_mae":3.598,"calibrated_mae":1.772,"improvement_pct":50.75,"raw_rmse":3.973,"calibrated_rmse":2.171,"raw_bias":-3.593,"calibrated_bias":-1.373,"train_raw_mae":2.994,"train_calibrated_mae":1.475,"test_start":"2026-04-11","test_end":"2026-10-24","train_start":"2025-01-04","train_end":"2026-04-04","reference":"NASA POWER daily reanalysis (0.5 degree)","forecast":"ECMWF IFS archived 00 UTC run via Open-Meteo Single Runs API","caveat":"Model-to-model comparison; not a station-observation validation."}'::jsonb,
+  '{"coefficients":[6.877793263917056,0.8721785949652248,-0.08844602860594315,0.6844755964720441,-0.7257473847938721],"feature_names":["intercept","raw","lead_day","month_sin","month_cos"]}'::jsonb,
+  array['https://single-runs-api.open-meteo.com/v1/forecast', 'https://power.larc.nasa.gov/api/temporal/daily/point', 'https://open-meteo.com/en/docs/single-runs-api', 'https://power.larc.nasa.gov/docs/services/api/temporal/daily/']
+);
+
+insert into public.ml_training_runs (
+  model_code, target, provider_code, district_code, started_at, finished_at, status,
+  train_rows, test_rows, metrics, artifact, source_urls
+) values (
+  'ecmwf_ifs_forecast_bias_layyah', 'forecast_tmin_c', 'open_meteo', 'layyah',
+  '2026-11-04T19:44:53.200Z'::timestamptz, '2026-11-04T19:44:53.200Z'::timestamptz,
+  'ok', 455, 193,
+  '{"test_rows":193,"train_rows":455,"raw_mae":2.011,"calibrated_mae":1.209,"improvement_pct":39.88,"raw_rmse":2.533,"calibrated_rmse":1.61,"raw_bias":-1.835,"calibrated_bias":-0.423,"train_raw_mae":1.426,"train_calibrated_mae":1.054,"test_start":"2026-04-11","test_end":"2026-10-24","train_start":"2025-01-04","train_end":"2026-04-04","reference":"NASA POWER daily reanalysis (0.5 degree)","forecast":"ECMWF IFS archived 00 UTC run via Open-Meteo Single Runs API","caveat":"Model-to-model comparison; not a station-observation validation."}'::jsonb,
+  '{"coefficients":[3.672275915341093,0.8662820463208103,0.016503879529202875,0.03530063705993436,-2.089702943462793],"feature_names":["intercept","raw","lead_day","month_sin","month_cos"]}'::jsonb,
+  array['https://single-runs-api.open-meteo.com/v1/forecast', 'https://power.larc.nasa.gov/api/temporal/daily/point', 'https://open-meteo.com/en/docs/single-runs-api', 'https://power.larc.nasa.gov/docs/services/api/temporal/daily/']
+);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261104002400_historical_backtest.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Phase 9 · Historical climate provenance and independent backtesting
+--
+-- The live forecast adapter and the training script already exist. This
+-- migration adds the two missing pieces:
+--
+--   1. Every NASA POWER row can say what it is (gridded reanalysis, never a
+--      ground observation), where it came from, its units and its coordinates.
+--      Archived ECMWF rows can say the same, and are marked as archived so a
+--      historical load is not confused with today's live forecast.
+--   2. A model can be evaluated on forecasts issued *after* its training end,
+--      with matched NASA POWER observations. The evaluation is stored in the
+--      existing ml_forecast_backtests table, not in a second model system.
+--
+-- A backtest with too few matched rows, too few independent issue dates, or no
+-- independent period is recorded as `insufficient`. It is never labelled a
+-- success. The function computes the calibrated value from the registered
+-- coefficients, so evaluation does not depend on whether the model happens to
+-- be active when the archive is inserted.
+
+alter table public.climate_observations
+  add column source_url text,
+  add column units jsonb not null default '{}'::jsonb,
+  add column provenance jsonb not null default '{}'::jsonb,
+  add column data_kind text not null default 'reanalysis'
+    check (data_kind in ('reanalysis', 'station', 'satellite'));
+
+comment on column public.climate_observations.data_kind is
+  'reanalysis for NASA POWER. It is a gridded model product, not a ground-station observation.';
+comment on column public.climate_observations.provenance is
+  'Provider, product, coordinates, retrieval time, grid resolution and licence. Kept beside every row so a joined feature can be traced.';
+comment on column public.climate_observations.units is
+  'Units of the stored columns. NASA POWER temperatures are °C, precipitation mm, humidity %, wind km/h after conversion.';
+
+alter table public.climate_forecasts
+  add column source_url text,
+  add column provenance jsonb not null default '{}'::jsonb,
+  add column is_archived boolean not null default false;
+
+comment on column public.climate_forecasts.is_archived is
+  'True for a historical Single Runs archive load. Live ingestion leaves it false. Both use the same forecast table and the same issue/valid keys.';
+comment on column public.climate_forecasts.provenance is
+  'Provider, model, run time, coordinates, retrieval time and licence for this forecast issue.';
+
+alter table public.ml_forecast_backtests
+  add column district_code text references public.districts (code),
+  add column provider_code text references public.weather_providers (code),
+  add column period_start date,
+  add column period_end date,
+  add column issue_count integer not null default 0,
+  add column coverage_pct numeric,
+  add column raw_bias numeric,
+  add column calibrated_bias numeric,
+  add column horizon_metrics jsonb not null default '[]'::jsonb,
+  add column status text not null default 'insufficient'
+    check (status in ('insufficient', 'evaluated', 'failed')),
+  add column verdict text not null default 'insufficient_evidence'
+    check (verdict in ('insufficient_evidence', 'beats_raw', 'does_not_beat_raw', 'failed')),
+  add column independent boolean not null default false,
+  add column criteria jsonb not null default '{}'::jsonb;
+
+comment on table public.ml_forecast_backtests is
+  'One row per model evaluation. status=insufficient means the matched sample or independent issue count did not meet the stated criteria; metrics may still be shown for diagnosis, but must not be presented as validation success.';
+
+create index ml_forecast_backtests_status_idx
+  on public.ml_forecast_backtests (model_id, status, evaluated_at desc);
+
+-- The old one-argument function is replaced. Dropping it also removes its
+-- grants; they are restored explicitly below.
+drop function if exists public.record_ml_forecast_backtest(uuid);
+
+create or replace function public.record_ml_forecast_backtest(
+  p_model_id uuid,
+  p_from date default null,
+  p_to date default null,
+  p_min_samples integer default 30,
+  p_min_issues integer default 3
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_role text := coalesce(
+    nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'role',
+    ''
+  );
+  v_model public.ml_models;
+  v_from date;
+  v_to date;
+  v_independent boolean;
+  v_rows integer := 0;
+  v_eligible integer := 0;
+  v_issues integer := 0;
+  v_raw_mae numeric;
+  v_cal_mae numeric;
+  v_raw_bias numeric;
+  v_cal_bias numeric;
+  v_improvement numeric;
+  v_coverage numeric;
+  v_period_start date;
+  v_period_end date;
+  v_horizons jsonb := '[]'::jsonb;
+  v_status text;
+  v_verdict text;
+  v_detail jsonb;
+begin
+  if v_role <> 'service_role' and not public.has_capability('admin') then
+    raise exception 'Forecast backtesting requires the service role or admin.'
+      using errcode = 'insufficient_privilege';
+  end if;
+  if p_min_samples is null or p_min_samples < 1 or p_min_issues is null or p_min_issues < 1 then
+    raise exception 'p_min_samples and p_min_issues must both be at least 1.'
+      using errcode = 'check_violation';
+  end if;
+
+  select * into v_model from public.ml_models where id = p_model_id;
+  if v_model.id is null then
+    raise exception 'Model % does not exist.', p_model_id using errcode = 'no_data_found';
+  end if;
+  if v_model.target not in ('forecast_tmax_c', 'forecast_tmin_c') then
+    raise exception 'Only forecast temperature models have a historical backtest.'
+      using errcode = 'check_violation';
+  end if;
+
+  -- Independent means the forecast issue date is strictly after the model's
+  -- training end. A caller cannot request an earlier start and accidentally
+  -- turn training data into a validation result.
+  v_from := greatest(
+    coalesce(p_from, (v_model.training_end + 1)::date, current_date - 30),
+    coalesce((v_model.training_end + 1)::date, date '1900-01-01')
+  );
+  v_to := coalesce(p_to, current_date - 1);
+  v_independent := v_model.training_end is not null;
+
+  with forecast_scope as (
+    select
+      f.id,
+      f.issued_on,
+      f.forecast_on,
+      (f.forecast_on - f.issued_on) as lead_day,
+      case when v_model.target = 'forecast_tmax_c' then f.tmax_c else f.tmin_c end as raw_value,
+      case when v_model.target = 'forecast_tmax_c' then o.tmax_c else o.tmin_c end as observed_value
+    from public.climate_forecasts f
+    left join public.climate_observations o
+      on o.provider_code = 'nasa_power'
+     and o.district_code = f.district_code
+     and o.observed_on = f.forecast_on
+    where f.provider_code = v_model.provider_code
+      and f.district_code = v_model.district_code
+      and f.issued_on between v_from and v_to
+      and f.forecast_on < current_date
+  ),
+  eligible as (
+    select count(*)::integer as n
+    from forecast_scope
+    where raw_value is not null
+  ),
+  scored as (
+    select
+      s.*,
+      public.ml_apply_linear(
+        v_model.coefficients,
+        s.raw_value,
+        s.lead_day,
+        extract(month from s.forecast_on)::integer
+      ) as calibrated_value
+    from forecast_scope s
+    where s.raw_value is not null
+      and s.observed_value is not null
+  ),
+  summary as (
+    select
+      count(*)::integer as n,
+      count(distinct issued_on)::integer as issues,
+      avg(abs(raw_value - observed_value)) as raw_mae,
+      avg(abs(calibrated_value - observed_value)) as cal_mae,
+      avg(raw_value - observed_value) as raw_bias,
+      avg(calibrated_value - observed_value) as cal_bias,
+      min(issued_on) as period_start,
+      max(issued_on) as period_end
+    from scored
+  ),
+  horizons as (
+    select coalesce(jsonb_agg(
+      jsonb_build_object(
+        'lead_day', h.lead_day,
+        'sample_rows', h.sample_rows,
+        'raw_mae', h.raw_mae,
+        'calibrated_mae', h.calibrated_mae,
+        'improvement_pct', h.improvement_pct,
+        'raw_bias', h.raw_bias,
+        'calibrated_bias', h.calibrated_bias
+      ) order by h.lead_day
+    ), '[]'::jsonb) as value
+    from (
+      select
+        lead_day,
+        count(*)::integer as sample_rows,
+        round(avg(abs(raw_value - observed_value))::numeric, 3) as raw_mae,
+        round(avg(abs(calibrated_value - observed_value))::numeric, 3) as calibrated_mae,
+        case
+          when avg(abs(raw_value - observed_value)) > 0
+            then round((1 - avg(abs(calibrated_value - observed_value)) / avg(abs(raw_value - observed_value))) * 100, 2)
+          else null
+        end as improvement_pct,
+        round(avg(raw_value - observed_value)::numeric, 3) as raw_bias,
+        round(avg(calibrated_value - observed_value)::numeric, 3) as calibrated_bias
+      from scored
+      group by lead_day
+    ) h
+  )
+  select
+    s.n,
+    e.n,
+    s.issues,
+    round(s.raw_mae::numeric, 3),
+    round(s.cal_mae::numeric, 3),
+    round(s.raw_bias::numeric, 3),
+    round(s.cal_bias::numeric, 3),
+    s.period_start,
+    s.period_end,
+    h.value
+  into
+    v_rows, v_eligible, v_issues, v_raw_mae, v_cal_mae, v_raw_bias, v_cal_bias,
+    v_period_start, v_period_end, v_horizons
+  from summary s
+  cross join eligible e
+  cross join horizons h;
+
+  v_improvement := case
+    when v_rows > 0 and v_raw_mae is not null and v_raw_mae > 0 and v_cal_mae is not null
+      then round((1 - (v_cal_mae / v_raw_mae)) * 100, 2)
+    else null
+  end;
+  v_coverage := case
+    when v_eligible > 0 then round((v_rows::numeric / v_eligible) * 100, 2)
+    else null
+  end;
+  v_status := case
+    when not v_independent or v_rows < p_min_samples or v_issues < p_min_issues then 'insufficient'
+    else 'evaluated'
+  end;
+  v_verdict := case
+    when v_status = 'insufficient' then 'insufficient_evidence'
+    when v_improvement is not null and v_improvement > 0 then 'beats_raw'
+    else 'does_not_beat_raw'
+  end;
+
+  v_detail := jsonb_build_object(
+    'target', v_model.target,
+    'provider', v_model.provider_code,
+    'district', v_model.district_code,
+    'independent', v_independent,
+    'period_start', v_period_start,
+    'period_end', v_period_end,
+    'eligible_rows', v_eligible,
+    'matched_rows', v_rows,
+    'coverage_pct', v_coverage,
+    'issue_count', v_issues,
+    'criteria', jsonb_build_object(
+      'min_samples', p_min_samples,
+      'min_issues', p_min_issues,
+      'independent_after', v_model.training_end
+    ),
+    'reference', 'NASA POWER daily reanalysis (0.5 degree)',
+    'reference_kind', 'gridded reanalysis, not a ground observation',
+    'note', 'Model-to-model comparison. Insufficient evidence is not a success claim.'
+  );
+
+  insert into public.ml_forecast_backtests (
+    model_id, sample_rows, raw_mae, calibrated_mae, improvement_pct, detail,
+    district_code, provider_code, period_start, period_end, issue_count,
+    coverage_pct, raw_bias, calibrated_bias, horizon_metrics, status, verdict,
+    independent, criteria
+  ) values (
+    v_model.id, v_rows, v_raw_mae, v_cal_mae, v_improvement, v_detail,
+    v_model.district_code, v_model.provider_code, v_period_start, v_period_end, v_issues,
+    v_coverage, v_raw_bias, v_cal_bias, v_horizons, v_status, v_verdict,
+    v_independent,
+    jsonb_build_object('min_samples', p_min_samples, 'min_issues', p_min_issues)
+  );
+
+  return jsonb_build_object(
+    'model_id', v_model.id,
+    'target', v_model.target,
+    'status', v_status,
+    'verdict', v_verdict,
+    'independent', v_independent,
+    'period_start', v_period_start,
+    'period_end', v_period_end,
+    'eligible_rows', v_eligible,
+    'sample_rows', v_rows,
+    'issue_count', v_issues,
+    'coverage_pct', v_coverage,
+    'raw_mae', v_raw_mae,
+    'calibrated_mae', v_cal_mae,
+    'improvement_pct', v_improvement,
+    'raw_bias', v_raw_bias,
+    'calibrated_bias', v_cal_bias,
+    'horizon_metrics', v_horizons,
+    'criteria', v_detail->'criteria'
+  );
+end;
+$$;
+
+comment on function public.record_ml_forecast_backtest(uuid, date, date, integer, integer) is
+  'Evaluates a temperature model only on forecasts issued after its training end, matched to NASA POWER reanalysis. Refuses to label too-small or non-independent samples as evaluated. Returns coverage and per-horizon metrics.';
+
+revoke execute on function public.record_ml_forecast_backtest(uuid, date, date, integer, integer)
+  from public, anon;
+grant execute on function public.record_ml_forecast_backtest(uuid, date, date, integer, integer)
+  to authenticated, service_role;
+
+-- Keep the existing health view useful by exposing the evaluation status and
+-- coverage, not just the last row's MAE.
+create or replace function public.ml_model_health()
+returns table (
+  model_id uuid,
+  model_code text,
+  version integer,
+  target text,
+  provider_code text,
+  district_code text,
+  status text,
+  confidence numeric,
+  trained_at timestamptz,
+  activated_at timestamptz,
+  train_rows integer,
+  test_rows integer,
+  holdout_metrics jsonb,
+  latest_backtest jsonb,
+  age_days integer
+)
+language plpgsql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_role text := coalesce(
+    nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'role',
+    ''
+  );
+begin
+  if v_role <> 'service_role' and not public.has_capability('admin') then
+    raise exception 'Model health requires admin or service authority.'
+      using errcode = 'insufficient_privilege';
+  end if;
+
+  return query
+  select
+    m.id,
+    m.model_code,
+    m.version,
+    m.target,
+    m.provider_code,
+    m.district_code,
+    m.status,
+    m.confidence,
+    m.trained_at,
+    m.activated_at,
+    m.train_rows,
+    m.test_rows,
+    m.metrics,
+    (
+      select jsonb_build_object(
+        'evaluated_at', b.evaluated_at,
+        'sample_rows', b.sample_rows,
+        'issue_count', b.issue_count,
+        'coverage_pct', b.coverage_pct,
+        'raw_mae', b.raw_mae,
+        'calibrated_mae', b.calibrated_mae,
+        'improvement_pct', b.improvement_pct,
+        'raw_bias', b.raw_bias,
+        'calibrated_bias', b.calibrated_bias,
+        'status', b.status,
+        'verdict', b.verdict,
+        'independent', b.independent,
+        'horizon_metrics', b.horizon_metrics
+      )
+      from public.ml_forecast_backtests b
+      where b.model_id = m.id
+      order by b.evaluated_at desc
+      limit 1
+    ) as latest_backtest,
+    greatest(0, floor(extract(epoch from (now() - m.trained_at)) / 86400))::integer as age_days
+  from public.ml_models m
+  order by (m.status = 'active') desc, m.trained_at desc;
+end;
+$$;
+
+comment on function public.ml_model_health() is
+  'Admin-or-service model registry view with holdout metrics, latest independent backtest status, coverage and horizon detail.';
+
+revoke execute on function public.ml_model_health() from public, anon;
+grant execute on function public.ml_model_health() to authenticated, service_role;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261104002500_ingestion_scheduler.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Phase 9 · HTTP ingestion scheduling through the existing pg_cron + pg_net
+--
+-- The database already uses pg_cron for refresh jobs. pg_net is available on the
+-- project but was not installed. This migration installs it and schedules the
+-- deployed ingestion functions, so no second scheduler framework is introduced.
+--
+-- A small state table prevents a new dispatch from starting before the previous
+-- one's lock expires. It does not claim the function finished; the function's
+-- own run table is the authority for success/failure. If a dispatch throws or a
+-- function fails, the lock expires and the next scheduled run retries.
+--
+-- Secrets are read from Vault at dispatch time. No key is stored in this file.
+
+create extension if not exists pg_net;
+
+create table public.ingestion_schedule_state (
+  job_name         text primary key,
+  function_name    text not null,
+  cadence_seconds  integer not null check (cadence_seconds >= 60),
+  locked_until     timestamptz,
+  last_dispatch_at timestamptz,
+  last_status      text not null default 'never'
+                     check (last_status in ('never', 'dispatched', 'dispatch_failed')),
+  last_error       text,
+  dispatch_count   integer not null default 0,
+  updated_at       timestamptz not null default now()
+);
+
+comment on table public.ingestion_schedule_state is
+  'Dispatch lock and last-attempt state for HTTP ingestion. Source freshness remains in the per-provider run tables.';
+
+alter table public.ingestion_schedule_state enable row level security;
+create policy ingestion_schedule_state_admin_read on public.ingestion_schedule_state
+  for select to authenticated using (public.has_capability('admin'));
+revoke all on public.ingestion_schedule_state from anon, authenticated;
+grant select on public.ingestion_schedule_state to authenticated;
+
+create or replace function public.dispatch_ingestion_job(
+  p_job_name text,
+  p_url text,
+  p_body jsonb,
+  p_lock_seconds integer default 600
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_job text;
+  v_gateway_key text;
+  v_ingest_token text;
+begin
+  if p_job_name is null or p_job_name !~ '^[a-z0-9_-]{3,64}$' then
+    raise exception 'Invalid ingestion job name.' using errcode = 'check_violation';
+  end if;
+  if p_url is null or p_url !~ '^https://[^[:space:]]+$' then
+    raise exception 'Ingestion dispatch requires an HTTPS URL.' using errcode = 'check_violation';
+  end if;
+  if p_lock_seconds is null or p_lock_seconds < 60 or p_lock_seconds > 7200 then
+    raise exception 'Lock seconds must be between 60 and 7200.' using errcode = 'check_violation';
+  end if;
+
+  insert into public.ingestion_schedule_state (
+    job_name, function_name, cadence_seconds, locked_until, last_dispatch_at,
+    last_status, last_error, dispatch_count, updated_at
+  )
+  values (
+    p_job_name, regexp_replace(p_url, '^.*/', ''), 60,
+    now() + make_interval(secs => p_lock_seconds), now(),
+    'dispatched', null, 1, now()
+  )
+  on conflict (job_name) do update
+    set locked_until = excluded.locked_until,
+        last_dispatch_at = now(),
+        last_status = 'dispatched',
+        last_error = null,
+        dispatch_count = public.ingestion_schedule_state.dispatch_count + 1,
+        updated_at = now()
+    where public.ingestion_schedule_state.locked_until is null
+       or public.ingestion_schedule_state.locked_until < now()
+  returning job_name into v_job;
+
+  if v_job is null then
+    return false;
+  end if;
+
+  select decrypted_secret into v_gateway_key
+    from vault.decrypted_secrets
+   where name = 'ingest_gateway_key'
+   limit 1;
+  select decrypted_secret into v_ingest_token
+    from vault.decrypted_secrets
+   where name = 'ingest_token'
+   limit 1;
+  if v_gateway_key is null or v_ingest_token is null then
+    update public.ingestion_schedule_state
+       set last_status = 'dispatch_failed',
+           last_error = 'ingestion credentials are missing from Vault',
+           locked_until = now(),
+           updated_at = now()
+     where job_name = p_job_name;
+    raise exception 'Ingestion credentials are missing from Vault.'
+      using errcode = 'insufficient_privilege';
+  end if;
+
+  perform net.http_post(
+    url := p_url,
+    body := p_body,
+    headers := jsonb_build_object(
+      'Content-Type', 'application/json',
+      'Authorization', 'Bearer ' || v_gateway_key,
+      'x-ingest-key', v_ingest_token
+    ),
+    timeout_milliseconds := 60000
+  );
+
+  return true;
+exception when others then
+  update public.ingestion_schedule_state
+     set last_status = 'dispatch_failed',
+         last_error = sqlerrm,
+         locked_until = now(),
+         updated_at = now()
+   where job_name = p_job_name;
+  raise;
+end;
+$$;
+
+comment on function public.dispatch_ingestion_job(text, text, jsonb, integer) is
+  'Claims a dispatch lock and posts to a deployed ingestion function using Vault credentials. The per-function run table is the source of truth for completion.';
+
+revoke execute on function public.dispatch_ingestion_job(text, text, jsonb, integer) from public, anon, authenticated;
+grant execute on function public.dispatch_ingestion_job(text, text, jsonb, integer) to service_role;
+
+create or replace function public.ingestion_schedule_health()
+returns table (
+  job_name text,
+  function_name text,
+  cadence_seconds integer,
+  last_dispatch_at timestamptz,
+  last_status text,
+  last_error text,
+  locked_until timestamptz,
+  dispatch_count integer,
+  overdue boolean
+)
+language plpgsql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_role text := coalesce(
+    nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'role',
+    ''
+  );
+begin
+  if v_role <> 'service_role' and not public.has_capability('admin') then
+    raise exception 'Ingestion schedule health requires admin or service authority.'
+      using errcode = 'insufficient_privilege';
+  end if;
+
+  return query
+  select
+    s.job_name, s.function_name, s.cadence_seconds, s.last_dispatch_at,
+    s.last_status, s.last_error, s.locked_until, s.dispatch_count,
+    (s.last_dispatch_at is null or
+      s.last_dispatch_at < now() - make_interval(secs => greatest(s.cadence_seconds, 60) * 2)) as overdue
+  from public.ingestion_schedule_state s
+  order by s.job_name;
+end;
+$$;
+
+comment on function public.ingestion_schedule_health() is
+  'Admin-or-service dispatch health. Overdue means no dispatch within twice the cadence; it does not prove the provider succeeded.';
+
+revoke execute on function public.ingestion_schedule_health() from public, anon;
+grant execute on function public.ingestion_schedule_health() to authenticated, service_role;
+
+-- Seed state so cadence is available even before the first dispatch.
+insert into public.ingestion_schedule_state (job_name, function_name, cadence_seconds)
+values
+  ('weather',    'weather-ingest',              900),
+  ('forecast',   'forecast-ingest',             10800),
+  ('climate',    'climate-ingest',              86400),
+  ('historical', 'historical-forecast-ingest',  604800),
+  ('soil',       'soil-ingest',                 2592000)
+on conflict (job_name) do nothing;
+
+-- Five minute / three hourly / daily / weekly / monthly. The dispatch lock is
+-- shorter than the next cadence, so a normal run cannot overlap; a stuck run
+-- releases the lock for the next scheduled attempt.
+select cron.unschedule(jobname)
+from cron.job
+where jobname in (
+  'farmer-ingest-weather', 'farmer-ingest-forecast', 'farmer-ingest-climate',
+  'farmer-ingest-historical', 'farmer-ingest-soil'
+);
+
+select cron.schedule(
+  'farmer-ingest-weather', '*/15 * * * *',
+  $job$select public.dispatch_ingestion_job(
+    'weather',
+    'https://swmbmtvwgksicfnfsehg.supabase.co/functions/v1/weather-ingest',
+    '{"targets":true,"limit":20}'::jsonb,
+    240
+  );$job$
+);
+select cron.schedule(
+  'farmer-ingest-forecast', '5 */3 * * *',
+  $job$select public.dispatch_ingestion_job(
+    'forecast',
+    'https://swmbmtvwgksicfnfsehg.supabase.co/functions/v1/forecast-ingest',
+    '{"district":"layyah","days":7}'::jsonb,
+    600
+  );$job$
+);
+select cron.schedule(
+  'farmer-ingest-climate', '10 3 * * *',
+  $job$select public.dispatch_ingestion_job(
+    'climate',
+    'https://swmbmtvwgksicfnfsehg.supabase.co/functions/v1/climate-ingest',
+    jsonb_build_object('district','layyah','start',(current_date - 7)::text,'end',(current_date - 1)::text),
+    1800
+  );$job$
+);
+select cron.schedule(
+  'farmer-ingest-historical', '40 3 * * 0',
+  $job$select public.dispatch_ingestion_job(
+    'historical',
+    'https://swmbmtvwgksicfnfsehg.supabase.co/functions/v1/historical-forecast-ingest',
+    jsonb_build_object('district','layyah','start',(current_date - 14)::text,'end',(current_date - 1)::text),
+    3600
+  );$job$
+);
+select cron.schedule(
+  'farmer-ingest-soil', '20 4 1 * *',
+  $job$select public.dispatch_ingestion_job(
+    'soil',
+    'https://swmbmtvwgksicfnfsehg.supabase.co/functions/v1/soil-ingest',
+    '{"all":true}'::jsonb,
+    1800
+  );$job$
+);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261104002600_source_health_completeness.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Phase 9 · complete source-health inventory and actionable failures
+--
+-- The source-health read was run-row-driven. A source that had never run — AMIS
+-- Punjab and the Punjab advisory feed — therefore vanished instead of appearing
+-- as `never`, and the market branch showed only the latest run across all market
+-- sources rather than the latest run per source. Provider error text was also
+-- dropped for weather, climate, market and soil.
+--
+-- This replacement keeps the same admin-only signature and return shape, but
+-- starts the market and advisory branches from the registered source inventory,
+-- reads the latest run per source, and carries `last_error` in every detail.
+
+create or replace function public.ingestion_health()
+returns table (
+  source_code text,
+  source_name text,
+  source_kind text,
+  access_status text,
+  last_attempt_at timestamptz,
+  last_success_at timestamptz,
+  last_status text,
+  rows_written integer,
+  freshness text,
+  detail jsonb
+)
+language plpgsql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  if not public.has_capability('admin') then
+    raise exception 'Ingestion health requires admin capability.' using errcode = 'insufficient_privilege';
+  end if;
+
+  return query
+  with
+  weather_run as (
+    select r.* from public.weather_ingestion_runs r
+     where r.provider_code = 'open_meteo'
+     order by r.started_at desc, r.id desc limit 1
+  ),
+  weather_last as (
+    select max(r.observed_at) as observed_at from public.weather_readings r
+     where r.provider_code = 'open_meteo' and r.kind = 'current' and r.fetch_error is null
+  ),
+  climate_run as (
+    select r.* from public.climate_ingestion_runs r
+     where r.provider_code = 'nasa_power'
+     order by r.started_at desc, r.id desc limit 1
+  ),
+  climate_last as (
+    select max(o.observed_on)::timestamptz as observed_at from public.climate_observations o
+     where o.provider_code = 'nasa_power'
+  ),
+  forecast_run as (
+    select r.* from public.climate_ingestion_runs r
+     where r.provider_code in ('weatherapi', 'open_meteo')
+     order by r.started_at desc, r.id desc limit 1
+  ),
+  forecast_last as (
+    select max(f.issued_on)::timestamptz as issued_at from public.climate_forecasts f
+     where f.provider_code in ('weatherapi', 'open_meteo')
+  ),
+  market_run as (
+    select distinct on (r.source_code)
+      r.source_code, r.started_at, r.finished_at, r.status,
+      r.rows_seen, r.rows_written, r.rows_rejected, r.error
+      from public.market_ingestion_runs r
+     order by r.source_code, r.started_at desc, r.id desc
+  ),
+  market_success as (
+    select r.source_code, max(r.finished_at) as finished_at
+      from public.market_ingestion_runs r
+     where r.status = 'ok'
+     group by r.source_code
+  ),
+  market_last as (
+    select o.source_code, max(o.observed_on)::timestamptz as observed_at
+      from public.market_observations o
+     group by o.source_code
+  ),
+  advisory_run as (
+    select distinct on (r.source_code)
+      r.source_code, r.started_at, r.finished_at, r.status,
+      r.rows_written, r.rows_rejected, r.error
+      from public.advisory_import_runs r
+     order by r.source_code, r.started_at desc, r.id desc
+  ),
+  advisory_success as (
+    select r.source_code, max(r.finished_at) as finished_at
+      from public.advisory_import_runs r
+     where r.status = 'ok'
+     group by r.source_code
+  ),
+  soil_run as (
+    select r.* from public.soil_ingestion_runs r
+     where r.source_code = 'soilgrids'
+     order by r.started_at desc, r.id desc limit 1
+  ),
+  soil_last as (
+    select max(o.fetched_at) as fetched_at from public.soil_observations o
+     where o.source_code = 'soilgrids'
+  )
+  select
+    'open_meteo', coalesce(i.name, 'Open-Meteo'), 'weather', i.status,
+    w.started_at,
+    (select max(r.finished_at) from public.weather_ingestion_runs r where r.provider_code = 'open_meteo' and r.status = 'ok'),
+    w.status, coalesce(w.cells_written, 0),
+    case
+      when wl.observed_at is null then 'empty'
+      when wl.observed_at > now() - interval '90 minutes' then 'fresh'
+      when wl.observed_at > now() - interval '6 hours' then 'stale'
+      else 'expired'
+    end,
+    jsonb_build_object(
+      'last_observed_at', wl.observed_at,
+      'cells_requested', coalesce(w.cells_requested, 0),
+      'last_error', w.error
+    )
+  from weather_run w
+  left join public.intel_sources i on i.code = 'open_meteo'
+  cross join weather_last wl
+  union all
+  select
+    'nasa_power', coalesce(i.name, 'NASA POWER'), 'climate', i.status,
+    c.started_at,
+    (select max(r.finished_at) from public.climate_ingestion_runs r where r.provider_code = 'nasa_power' and r.status = 'ok'),
+    c.status, coalesce(c.rows_written, 0),
+    case
+      when cl.observed_at is null then 'empty'
+      when cl.observed_at > (current_date - 7)::timestamptz then 'current'
+      when cl.observed_at > (current_date - 30)::timestamptz then 'stale'
+      else 'expired'
+    end,
+    jsonb_build_object(
+      'last_observed_on', cl.observed_at,
+      'range', jsonb_build_array(c.range_start, c.range_end),
+      'last_error', c.error
+    )
+  from climate_run c
+  left join public.intel_sources i on i.code = 'nasa_power'
+  cross join climate_last cl
+  union all
+  select
+    f.provider_code, coalesce(wp.name, f.provider_code), 'forecast',
+    coalesce(i.status, 'unverified'),
+    f.started_at,
+    (select max(r.finished_at) from public.climate_ingestion_runs r where r.provider_code = f.provider_code and r.status = 'ok'),
+    f.status, coalesce(f.rows_written, 0),
+    case
+      when fl.issued_at is null then 'empty'
+      when fl.issued_at >= current_date::timestamptz then 'fresh'
+      when fl.issued_at >= (current_date - 2)::timestamptz then 'stale'
+      else 'expired'
+    end,
+    jsonb_build_object(
+      'last_issued_on', fl.issued_at,
+      'last_error', f.error
+    )
+  from forecast_run f
+  left join public.weather_providers wp on wp.code = f.provider_code
+  left join public.intel_sources i on i.code = f.provider_code
+  cross join forecast_last fl
+  union all
+  select
+    ms.code, ms.name, 'market', coalesce(i.status, 'unverified'),
+    m.started_at, succ.finished_at,
+    coalesce(m.status, 'never'), coalesce(m.rows_written, 0),
+    case
+      when ml.observed_at is null then 'empty'
+      when ml.observed_at >= (current_date - 36 * interval '1 hour')::timestamptz then 'fresh'
+      when ml.observed_at >= (current_date - 7)::timestamptz then 'stale'
+      else 'expired'
+    end,
+    jsonb_build_object(
+      'last_observed_on', ml.observed_at,
+      'rows_seen', coalesce(m.rows_seen, 0),
+      'rows_rejected', coalesce(m.rows_rejected, 0),
+      'registered_active', ms.is_active,
+      'last_error', m.error
+    )
+  from public.market_sources ms
+  left join market_run m on m.source_code = ms.code
+  left join market_success succ on succ.source_code = ms.code
+  left join market_last ml on ml.source_code = ms.code
+  left join public.intel_sources i on i.code = ms.code
+  union all
+  select
+    i.code, i.name, 'advisory', i.status,
+    a.started_at, succ.finished_at,
+    coalesce(a.status, 'never'), coalesce(a.rows_written, 0),
+    case when exists (
+      select 1 from public.agri_advisories ad
+       where ad.is_active and ad.verification_status = 'verified'
+         and (ad.valid_until is null or ad.valid_until > now())
+    ) then 'current' else 'empty' end,
+    jsonb_build_object(
+      'rows_rejected', coalesce(a.rows_rejected, 0),
+      'last_error', a.error
+    )
+  from public.intel_sources i
+  left join advisory_run a on a.source_code = i.code
+  left join advisory_success succ on succ.source_code = i.code
+  where i.code = 'punjab_advisory'
+  union all
+  select
+    'soilgrids', coalesce(i.name, 'ISRIC SoilGrids'), 'soil', i.status,
+    s.started_at,
+    (select max(r.finished_at) from public.soil_ingestion_runs r where r.source_code = 'soilgrids' and r.status = 'ok'),
+    s.status, coalesce(s.cells_written, 0),
+    case
+      when sl.fetched_at is null then 'empty'
+      when sl.fetched_at > now() - interval '180 days' then 'current'
+      else 'stale'
+    end,
+    jsonb_build_object(
+      'last_fetched_at', sl.fetched_at,
+      'cells_requested', s.cells_requested,
+      'last_error', s.error
+    )
+  from soil_run s
+  left join public.intel_sources i on i.code = 'soilgrids'
+  cross join soil_last sl;
+end;
+$$;
+
+comment on function public.ingestion_health() is
+  'Admin-only operational read: every registered market/advisory source, last attempt/success, freshness and provider error text, including sources that have never run. No credentials or raw payloads are returned.';
+
+revoke execute on function public.ingestion_health() from public, anon;
+grant execute on function public.ingestion_health() to authenticated;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261104002700_source_health_inventory.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Phase 9 · source-health inventory for every ingestion source
+--
+-- 026 made market and advisory health start from the registered inventory, but
+-- weather, climate, forecast and soil were still started from their run tables.
+-- A fresh deployment therefore omitted every source that had not run yet, which
+-- is exactly the state an operator needs to see. Forecast also selected only the
+-- latest run across all providers, so a WeatherAPI run could hide Open-Meteo (or
+-- the reverse).
+--
+-- This replacement keeps the same admin-only signature and return shape. Every
+-- branch starts from `intel_sources`; the forecast branch reads the latest run
+-- and observations independently per provider. Sources with no run return
+-- `last_status = 'never'`, zero written rows and a null `last_error`.
+
+create or replace function public.ingestion_health()
+returns table (
+  source_code text,
+  source_name text,
+  source_kind text,
+  access_status text,
+  last_attempt_at timestamptz,
+  last_success_at timestamptz,
+  last_status text,
+  rows_written integer,
+  freshness text,
+  detail jsonb
+)
+language plpgsql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  if not public.has_capability('admin') then
+    raise exception 'Ingestion health requires admin capability.' using errcode = 'insufficient_privilege';
+  end if;
+
+  return query
+  with
+  weather_run as (
+    select r.* from public.weather_ingestion_runs r
+     where r.provider_code = 'open_meteo'
+     order by r.started_at desc, r.id desc limit 1
+  ),
+  weather_last as (
+    select max(r.observed_at) as observed_at from public.weather_readings r
+     where r.provider_code = 'open_meteo' and r.kind = 'current' and r.fetch_error is null
+  ),
+  climate_run as (
+    select r.* from public.climate_ingestion_runs r
+     where r.provider_code = 'nasa_power'
+     order by r.started_at desc, r.id desc limit 1
+  ),
+  climate_last as (
+    select max(o.observed_on)::timestamptz as observed_at from public.climate_observations o
+     where o.provider_code = 'nasa_power'
+  ),
+  forecast_run as (
+    select distinct on (r.provider_code)
+      r.provider_code, r.started_at, r.finished_at, r.status, r.rows_written, r.error
+      from public.climate_ingestion_runs r
+     where r.provider_code in ('weatherapi', 'open_meteo')
+     order by r.provider_code, r.started_at desc, r.id desc
+  ),
+  forecast_success as (
+    select r.provider_code, max(r.finished_at) as finished_at
+      from public.climate_ingestion_runs r
+     where r.provider_code in ('weatherapi', 'open_meteo') and r.status = 'ok'
+     group by r.provider_code
+  ),
+  forecast_last as (
+    select f.provider_code, max(f.issued_on)::timestamptz as issued_at
+      from public.climate_forecasts f
+     where f.provider_code in ('weatherapi', 'open_meteo')
+     group by f.provider_code
+  ),
+  market_run as (
+    select distinct on (r.source_code)
+      r.source_code, r.started_at, r.finished_at, r.status,
+      r.rows_seen, r.rows_written, r.rows_rejected, r.error
+      from public.market_ingestion_runs r
+     order by r.source_code, r.started_at desc, r.id desc
+  ),
+  market_success as (
+    select r.source_code, max(r.finished_at) as finished_at
+      from public.market_ingestion_runs r
+     where r.status = 'ok'
+     group by r.source_code
+  ),
+  market_last as (
+    select o.source_code, max(o.observed_on)::timestamptz as observed_at
+      from public.market_observations o
+     group by o.source_code
+  ),
+  advisory_run as (
+    select distinct on (r.source_code)
+      r.source_code, r.started_at, r.finished_at, r.status,
+      r.rows_written, r.rows_rejected, r.error
+      from public.advisory_import_runs r
+     order by r.source_code, r.started_at desc, r.id desc
+  ),
+  advisory_success as (
+    select r.source_code, max(r.finished_at) as finished_at
+      from public.advisory_import_runs r
+     where r.status = 'ok'
+     group by r.source_code
+  ),
+  soil_run as (
+    select r.* from public.soil_ingestion_runs r
+     where r.source_code = 'soilgrids'
+     order by r.started_at desc, r.id desc limit 1
+  ),
+  soil_last as (
+    select max(o.fetched_at) as fetched_at from public.soil_observations o
+     where o.source_code = 'soilgrids'
+  )
+  select
+    i.code, coalesce(i.name, 'Open-Meteo'), 'weather', i.status,
+    w.started_at,
+    (select max(r.finished_at) from public.weather_ingestion_runs r where r.provider_code = 'open_meteo' and r.status = 'ok'),
+    coalesce(w.status, 'never'), coalesce(w.cells_written, 0),
+    case
+      when wl.observed_at is null then 'empty'
+      when wl.observed_at > now() - interval '90 minutes' then 'fresh'
+      when wl.observed_at > now() - interval '6 hours' then 'stale'
+      else 'expired'
+    end,
+    jsonb_build_object(
+      'last_observed_at', wl.observed_at,
+      'cells_requested', coalesce(w.cells_requested, 0),
+      'last_error', w.error
+    )
+  from public.intel_sources i
+  left join weather_run w on true
+  cross join weather_last wl
+  where i.code = 'open_meteo'
+  union all
+  select
+    i.code, coalesce(i.name, 'NASA POWER'), 'climate', i.status,
+    c.started_at,
+    (select max(r.finished_at) from public.climate_ingestion_runs r where r.provider_code = 'nasa_power' and r.status = 'ok'),
+    coalesce(c.status, 'never'), coalesce(c.rows_written, 0),
+    case
+      when cl.observed_at is null then 'empty'
+      when cl.observed_at > (current_date - 7)::timestamptz then 'current'
+      when cl.observed_at > (current_date - 30)::timestamptz then 'stale'
+      else 'expired'
+    end,
+    jsonb_build_object(
+      'last_observed_on', cl.observed_at,
+      'range', jsonb_build_array(c.range_start, c.range_end),
+      'last_error', c.error
+    )
+  from public.intel_sources i
+  left join climate_run c on true
+  cross join climate_last cl
+  where i.code = 'nasa_power'
+  union all
+  select
+    i.code, coalesce(i.name, f.provider_code), 'forecast', i.status,
+    f.started_at, succ.finished_at,
+    coalesce(f.status, 'never'), coalesce(f.rows_written, 0),
+    case
+      when fl.issued_at is null then 'empty'
+      when fl.issued_at >= current_date::timestamptz then 'fresh'
+      when fl.issued_at >= (current_date - 2)::timestamptz then 'stale'
+      else 'expired'
+    end,
+    jsonb_build_object(
+      'last_issued_on', fl.issued_at,
+      'last_error', f.error
+    )
+  from public.intel_sources i
+  left join forecast_run f on f.provider_code = i.code
+  left join forecast_success succ on succ.provider_code = i.code
+  left join forecast_last fl on fl.provider_code = i.code
+  where i.code in ('weatherapi', 'open_meteo')
+  union all
+  select
+    ms.code, ms.name, 'market', coalesce(i.status, 'unverified'),
+    m.started_at, succ.finished_at,
+    coalesce(m.status, 'never'), coalesce(m.rows_written, 0),
+    case
+      when ml.observed_at is null then 'empty'
+      when ml.observed_at >= (current_date - 36 * interval '1 hour')::timestamptz then 'fresh'
+      when ml.observed_at >= (current_date - 7)::timestamptz then 'stale'
+      else 'expired'
+    end,
+    jsonb_build_object(
+      'last_observed_on', ml.observed_at,
+      'rows_seen', coalesce(m.rows_seen, 0),
+      'rows_rejected', coalesce(m.rows_rejected, 0),
+      'registered_active', ms.is_active,
+      'last_error', m.error
+    )
+  from public.market_sources ms
+  left join market_run m on m.source_code = ms.code
+  left join market_success succ on succ.source_code = ms.code
+  left join market_last ml on ml.source_code = ms.code
+  left join public.intel_sources i on i.code = ms.code
+  union all
+  select
+    i.code, i.name, 'advisory', i.status,
+    a.started_at, succ.finished_at,
+    coalesce(a.status, 'never'), coalesce(a.rows_written, 0),
+    case when exists (
+      select 1 from public.agri_advisories ad
+       where ad.is_active and ad.verification_status = 'verified'
+         and (ad.valid_until is null or ad.valid_until > now())
+    ) then 'current' else 'empty' end,
+    jsonb_build_object(
+      'rows_rejected', coalesce(a.rows_rejected, 0),
+      'last_error', a.error
+    )
+  from public.intel_sources i
+  left join advisory_run a on a.source_code = i.code
+  left join advisory_success succ on succ.source_code = i.code
+  where i.code = 'punjab_advisory'
+  union all
+  select
+    i.code, coalesce(i.name, 'ISRIC SoilGrids'), 'soil', i.status,
+    s.started_at,
+    (select max(r.finished_at) from public.soil_ingestion_runs r where r.source_code = 'soilgrids' and r.status = 'ok'),
+    coalesce(s.status, 'never'), coalesce(s.cells_written, 0),
+    case
+      when sl.fetched_at is null then 'empty'
+      when sl.fetched_at > now() - interval '180 days' then 'current'
+      else 'stale'
+    end,
+    jsonb_build_object(
+      'last_fetched_at', sl.fetched_at,
+      'cells_requested', s.cells_requested,
+      'last_error', s.error
+    )
+  from public.intel_sources i
+  left join soil_run s on true
+  cross join soil_last sl
+  where i.code = 'soilgrids';
+end;
+$$;
+
+comment on function public.ingestion_health() is
+  'Admin-only operational read: every registered weather, climate, forecast, market, advisory and soil source, including sources that have never run. Reports last attempt/success, freshness, per-provider forecast runs and provider error text. No credentials or raw payloads are returned.';
+
+revoke execute on function public.ingestion_health() from public, anon;
+grant execute on function public.ingestion_health() to authenticated;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261104002800_environment_safe_ingestion_scheduler.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Phase 9 · environment-safe HTTP ingestion scheduling
+--
+-- The first scheduler stored the deployed function URL in every cron command.
+-- That made a shared migration environment-specific and risked dispatching a
+-- production schedule to staging, or the reverse. This forward-only replacement
+-- keeps the URL out of cron entirely: the dispatcher reads the project URL and
+-- project ref from this project's Vault, validates that the pair is internally
+-- consistent, and builds the function URL only after validation.
+--
+-- Vault is project-scoped. Never copy these values between staging and
+-- production. The dispatcher has no hardcoded fallback and rejects missing or
+-- mismatched configuration before making an HTTP request.
+--
+-- Existing schedules, cadence, lock semantics and service-role-only execution
+-- are preserved.
+
+-- PostgreSQL cannot rename an input parameter through CREATE OR REPLACE.
+-- Drop and recreate the same signature; the migration re-grants service_role
+-- immediately and cron commands are strings, so no SQL dependency is lost.
+drop function if exists public.dispatch_ingestion_job(text, text, jsonb, integer);
+
+create function public.dispatch_ingestion_job(
+  p_job_name text,
+  p_function_name text,
+  p_body jsonb,
+  p_lock_seconds integer default 600
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_job text;
+  v_project_url text;
+  v_project_ref text;
+  v_gateway_key text;
+  v_ingest_token text;
+  v_function_url text;
+begin
+  if p_job_name is null or p_job_name !~ '^[a-z0-9_-]{3,64}$' then
+    raise exception 'Invalid ingestion job name.' using errcode = 'check_violation';
+  end if;
+  if p_function_name is null or p_function_name !~ '^[a-z0-9][a-z0-9-]{2,63}$' then
+    raise exception 'Invalid ingestion function name.' using errcode = 'check_violation';
+  end if;
+  if p_lock_seconds is null or p_lock_seconds < 60 or p_lock_seconds > 7200 then
+    raise exception 'Lock seconds must be between 60 and 7200.' using errcode = 'check_violation';
+  end if;
+
+  insert into public.ingestion_schedule_state (
+    job_name, function_name, cadence_seconds, locked_until, last_dispatch_at,
+    last_status, last_error, dispatch_count, updated_at
+  )
+  values (
+    p_job_name, p_function_name, 60,
+    now() + make_interval(secs => p_lock_seconds), now(),
+    'dispatched', null, 1, now()
+  )
+  on conflict (job_name) do update
+    set locked_until = excluded.locked_until,
+        last_dispatch_at = now(),
+        last_status = 'dispatched',
+        last_error = null,
+        dispatch_count = public.ingestion_schedule_state.dispatch_count + 1,
+        updated_at = now()
+    where public.ingestion_schedule_state.locked_until is null
+       or public.ingestion_schedule_state.locked_until < now()
+  returning job_name into v_job;
+
+  if v_job is null then
+    return false;
+  end if;
+
+  select decrypted_secret into v_project_url
+    from vault.decrypted_secrets
+   where name = 'ingestion_project_url'
+   limit 1;
+  select decrypted_secret into v_project_ref
+    from vault.decrypted_secrets
+   where name = 'ingestion_project_ref'
+   limit 1;
+
+  if nullif(btrim(v_project_url), '') is null
+     or nullif(btrim(v_project_ref), '') is null then
+    update public.ingestion_schedule_state
+       set last_status = 'dispatch_failed',
+           last_error = 'ingestion project configuration is missing from Vault',
+           locked_until = now(),
+           updated_at = now()
+     where job_name = p_job_name;
+    raise exception 'Ingestion project configuration is missing from Vault.'
+      using errcode = 'insufficient_privilege';
+  end if;
+
+  v_project_url := rtrim(btrim(v_project_url), '/');
+  v_project_ref := btrim(v_project_ref);
+
+  if v_project_ref !~ '^[a-z0-9]{20}$' then
+    update public.ingestion_schedule_state
+       set last_status = 'dispatch_failed',
+           last_error = 'ingestion project reference is invalid',
+           locked_until = now(),
+           updated_at = now()
+     where job_name = p_job_name;
+    raise exception 'Ingestion project reference is invalid.'
+      using errcode = 'invalid_parameter_value';
+  end if;
+
+  if v_project_url <> 'https://' || v_project_ref || '.supabase.co' then
+    update public.ingestion_schedule_state
+       set last_status = 'dispatch_failed',
+           last_error = 'ingestion project URL does not match the configured project reference',
+           locked_until = now(),
+           updated_at = now()
+     where job_name = p_job_name;
+    raise exception 'Ingestion project URL does not match the configured project reference.'
+      using errcode = 'invalid_parameter_value';
+  end if;
+
+  v_function_url := v_project_url || '/functions/v1/' || p_function_name;
+
+  select decrypted_secret into v_gateway_key
+    from vault.decrypted_secrets
+   where name = 'ingest_gateway_key'
+   limit 1;
+  select decrypted_secret into v_ingest_token
+    from vault.decrypted_secrets
+   where name = 'ingest_token'
+   limit 1;
+  if v_gateway_key is null or v_ingest_token is null then
+    update public.ingestion_schedule_state
+       set last_status = 'dispatch_failed',
+           last_error = 'ingestion credentials are missing from Vault',
+           locked_until = now(),
+           updated_at = now()
+     where job_name = p_job_name;
+    raise exception 'Ingestion credentials are missing from Vault.'
+      using errcode = 'insufficient_privilege';
+  end if;
+
+  perform net.http_post(
+    url := v_function_url,
+    body := p_body,
+    headers := jsonb_build_object(
+      'Content-Type', 'application/json',
+      'Authorization', 'Bearer ' || v_gateway_key,
+      'x-ingest-key', v_ingest_token
+    ),
+    timeout_milliseconds := 60000
+  );
+
+  return true;
+exception when others then
+  update public.ingestion_schedule_state
+     set last_status = 'dispatch_failed',
+         last_error = sqlerrm,
+         locked_until = now(),
+         updated_at = now()
+   where job_name = p_job_name;
+  raise;
+end;
+$$;
+
+comment on function public.dispatch_ingestion_job(text, text, jsonb, integer) is
+  'Claims a dispatch lock and posts to a deployed ingestion function. The project URL/ref are resolved from Vault and must match; the per-function run table remains the completion authority.';
+
+revoke execute on function public.dispatch_ingestion_job(text, text, jsonb, integer) from public, anon, authenticated;
+grant execute on function public.dispatch_ingestion_job(text, text, jsonb, integer) to service_role;
+
+-- Recreate the same five schedules with function names, not URLs. Keeping the
+-- existing job names preserves the established cadence and monitoring surface.
+select cron.unschedule(jobname)
+from cron.job
+where jobname in (
+  'farmer-ingest-weather', 'farmer-ingest-forecast', 'farmer-ingest-climate',
+  'farmer-ingest-historical', 'farmer-ingest-soil'
+);
+
+select cron.schedule(
+  'farmer-ingest-weather', '*/15 * * * *',
+  $job$select public.dispatch_ingestion_job(
+    'weather',
+    'weather-ingest',
+    '{"targets":true,"limit":20}'::jsonb,
+    240
+  );$job$
+);
+select cron.schedule(
+  'farmer-ingest-forecast', '5 */3 * * *',
+  $job$select public.dispatch_ingestion_job(
+    'forecast',
+    'forecast-ingest',
+    '{"district":"layyah","days":7}'::jsonb,
+    600
+  );$job$
+);
+select cron.schedule(
+  'farmer-ingest-climate', '10 3 * * *',
+  $job$select public.dispatch_ingestion_job(
+    'climate',
+    'climate-ingest',
+    jsonb_build_object('district','layyah','start',(current_date - 7)::text,'end',(current_date - 1)::text),
+    1800
+  );$job$
+);
+select cron.schedule(
+  'farmer-ingest-historical', '40 3 * * 0',
+  $job$select public.dispatch_ingestion_job(
+    'historical',
+    'historical-forecast-ingest',
+    jsonb_build_object('district','layyah','start',(current_date - 14)::text,'end',(current_date - 1)::text),
+    3600
+  );$job$
+);
+select cron.schedule(
+  'farmer-ingest-soil', '20 4 1 * *',
+  $job$select public.dispatch_ingestion_job(
+    'soil',
+    'soil-ingest',
+    '{"all":true}'::jsonb,
+    1800
+  );$job$
+);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261104002900_scheduler_credential_isolation.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Phase 9 · scheduler credential isolation
+--
+-- Migration 028 moved the ingestion project URL into Vault and validated the
+-- URL/project-ref pair. This forward-only hardening adds the third isolation
+-- check: the Vault gateway credential must be a project JWT whose `ref` claim
+-- equals the configured project ref. A staging gateway key therefore cannot be
+-- used with a production URL/ref pair, or the reverse.
+--
+-- Only the dispatcher changes. The existing five cron jobs from migration 028
+-- keep calling the same signature, cadence and locks; no reschedule is needed.
+
+create or replace function public.dispatch_ingestion_job(
+  p_job_name text,
+  p_function_name text,
+  p_body jsonb,
+  p_lock_seconds integer default 600
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_job text;
+  v_project_url text;
+  v_project_ref text;
+  v_gateway_key text;
+  v_ingest_token text;
+  v_jwt_b64 text;
+  v_credential_ref text;
+  v_function_url text;
+begin
+  if p_job_name is null or p_job_name !~ '^[a-z0-9_-]{3,64}$' then
+    raise exception 'Invalid ingestion job name.' using errcode = 'check_violation';
+  end if;
+  if p_function_name is null or p_function_name !~ '^[a-z0-9][a-z0-9-]{2,63}$' then
+    raise exception 'Invalid ingestion function name.' using errcode = 'check_violation';
+  end if;
+  if p_lock_seconds is null or p_lock_seconds < 60 or p_lock_seconds > 7200 then
+    raise exception 'Lock seconds must be between 60 and 7200.' using errcode = 'check_violation';
+  end if;
+
+  insert into public.ingestion_schedule_state (
+    job_name, function_name, cadence_seconds, locked_until, last_dispatch_at,
+    last_status, last_error, dispatch_count, updated_at
+  )
+  values (
+    p_job_name, p_function_name, 60,
+    now() + make_interval(secs => p_lock_seconds), now(),
+    'dispatched', null, 1, now()
+  )
+  on conflict (job_name) do update
+    set locked_until = excluded.locked_until,
+        last_dispatch_at = now(),
+        last_status = 'dispatched',
+        last_error = null,
+        dispatch_count = public.ingestion_schedule_state.dispatch_count + 1,
+        updated_at = now()
+    where public.ingestion_schedule_state.locked_until is null
+       or public.ingestion_schedule_state.locked_until < now()
+  returning job_name into v_job;
+
+  if v_job is null then
+    return false;
+  end if;
+
+  select decrypted_secret into v_project_url
+    from vault.decrypted_secrets
+   where name = 'ingestion_project_url'
+   limit 1;
+  select decrypted_secret into v_project_ref
+    from vault.decrypted_secrets
+   where name = 'ingestion_project_ref'
+   limit 1;
+
+  if nullif(btrim(v_project_url), '') is null
+     or nullif(btrim(v_project_ref), '') is null then
+    update public.ingestion_schedule_state
+       set last_status = 'dispatch_failed',
+           last_error = 'ingestion project configuration is missing from Vault',
+           locked_until = now(),
+           updated_at = now()
+     where job_name = p_job_name;
+    raise exception 'Ingestion project configuration is missing from Vault.'
+      using errcode = 'insufficient_privilege';
+  end if;
+
+  v_project_url := rtrim(btrim(v_project_url), '/');
+  v_project_ref := btrim(v_project_ref);
+
+  if v_project_ref !~ '^[a-z0-9]{20}$' then
+    update public.ingestion_schedule_state
+       set last_status = 'dispatch_failed',
+           last_error = 'ingestion project reference is invalid',
+           locked_until = now(),
+           updated_at = now()
+     where job_name = p_job_name;
+    raise exception 'Ingestion project reference is invalid.'
+      using errcode = 'invalid_parameter_value';
+  end if;
+
+  if v_project_url <> ('https://' || v_project_ref || '.supabase.co') then
+    update public.ingestion_schedule_state
+       set last_status = 'dispatch_failed',
+           last_error = 'ingestion project URL does not match the configured project reference',
+           locked_until = now(),
+           updated_at = now()
+     where job_name = p_job_name;
+    raise exception 'Ingestion project URL does not match the configured project reference.'
+      using errcode = 'invalid_parameter_value';
+  end if;
+
+  v_function_url := v_project_url || '/functions/v1/' || p_function_name;
+
+  select decrypted_secret into v_gateway_key
+    from vault.decrypted_secrets
+   where name = 'ingest_gateway_key'
+   limit 1;
+  select decrypted_secret into v_ingest_token
+    from vault.decrypted_secrets
+   where name = 'ingest_token'
+   limit 1;
+  if v_gateway_key is null or v_ingest_token is null then
+    update public.ingestion_schedule_state
+       set last_status = 'dispatch_failed',
+           last_error = 'ingestion credentials are missing from Vault',
+           locked_until = now(),
+           updated_at = now()
+     where job_name = p_job_name;
+    raise exception 'Ingestion credentials are missing from Vault.'
+      using errcode = 'insufficient_privilege';
+  end if;
+
+  if v_gateway_key !~ '^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$' then
+    update public.ingestion_schedule_state
+       set last_status = 'dispatch_failed',
+           last_error = 'ingestion gateway credential is not a project JWT',
+           locked_until = now(),
+           updated_at = now()
+     where job_name = p_job_name;
+    raise exception 'Ingestion gateway credential is not a project JWT.'
+      using errcode = 'invalid_parameter_value';
+  end if;
+
+  begin
+    v_jwt_b64 := translate(split_part(v_gateway_key, '.', 2), '-_', '+/');
+    v_jwt_b64 := rpad(v_jwt_b64, ((length(v_jwt_b64) + 3) / 4) * 4, '=');
+    v_credential_ref := convert_from(decode(v_jwt_b64, 'base64'), 'UTF8')::jsonb ->> 'ref';
+  exception when others then
+    v_credential_ref := null;
+  end;
+
+  if v_credential_ref is null or v_credential_ref <> v_project_ref then
+    update public.ingestion_schedule_state
+       set last_status = 'dispatch_failed',
+           last_error = 'ingestion gateway credential belongs to a different project',
+           locked_until = now(),
+           updated_at = now()
+     where job_name = p_job_name;
+    raise exception 'Ingestion gateway credential belongs to a different project.'
+      using errcode = 'invalid_parameter_value';
+  end if;
+
+  perform net.http_post(
+    url := v_function_url,
+    body := p_body,
+    headers := jsonb_build_object(
+      'Content-Type', 'application/json',
+      'Authorization', 'Bearer ' || v_gateway_key,
+      'x-ingest-key', v_ingest_token
+    ),
+    timeout_milliseconds := 60000
+  );
+
+  return true;
+exception when others then
+  update public.ingestion_schedule_state
+     set last_status = 'dispatch_failed',
+         last_error = sqlerrm,
+         locked_until = now(),
+         updated_at = now()
+   where job_name = p_job_name;
+  raise;
+end;
+$$;
+
+comment on function public.dispatch_ingestion_job(text, text, jsonb, integer) is
+  'Claims a dispatch lock and posts to a deployed ingestion function. The project URL/ref and gateway credential project must match; the per-function run table remains the completion authority.';
+
+revoke execute on function public.dispatch_ingestion_job(text, text, jsonb, integer) from public, anon, authenticated;
+grant execute on function public.dispatch_ingestion_job(text, text, jsonb, integer) to service_role;
+
+-- The five schedules from migration 028 are intentionally left untouched.
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261104003000_ingestion_run_accounting.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Phase 9 · Accurate per-run ingestion accounting
+--
+-- The run tables previously recorded fetched/written units, but a batch upsert
+-- reports no outcome: an attempted write was indistinguishable from an insert,
+-- an update, an unchanged row or a duplicate. This migration adds a common set
+-- of record counters and service-only recording functions that classify each
+-- input row from the database's own result.
+--
+-- Existing `rows_seen`, `rows_written`, `cells_requested` and `cells_written`
+-- keep their established meanings. In particular `cells_written` remains the
+-- number of successful provider cells, not a count of depth/forecast rows.
+
+alter table public.climate_ingestion_runs
+  add column records_fetched integer not null default 0 check (records_fetched >= 0),
+  add column records_inserted integer not null default 0 check (records_inserted >= 0),
+  add column records_updated integer not null default 0 check (records_updated >= 0),
+  add column records_skipped integer not null default 0 check (records_skipped >= 0),
+  add column records_rejected integer not null default 0 check (records_rejected >= 0),
+  add column records_failed integer not null default 0 check (records_failed >= 0);
+
+alter table public.weather_ingestion_runs
+  add column records_fetched integer not null default 0 check (records_fetched >= 0),
+  add column records_inserted integer not null default 0 check (records_inserted >= 0),
+  add column records_updated integer not null default 0 check (records_updated >= 0),
+  add column records_skipped integer not null default 0 check (records_skipped >= 0),
+  add column records_rejected integer not null default 0 check (records_rejected >= 0),
+  add column records_failed integer not null default 0 check (records_failed >= 0);
+
+alter table public.soil_ingestion_runs
+  add column records_fetched integer not null default 0 check (records_fetched >= 0),
+  add column records_inserted integer not null default 0 check (records_inserted >= 0),
+  add column records_updated integer not null default 0 check (records_updated >= 0),
+  add column records_skipped integer not null default 0 check (records_skipped >= 0),
+  add column records_rejected integer not null default 0 check (records_rejected >= 0),
+  add column records_failed integer not null default 0 check (records_failed >= 0);
+
+comment on column public.climate_ingestion_runs.records_fetched is
+  'Records returned by the provider before validation, including duplicates and rejected records.';
+comment on column public.climate_ingestion_runs.records_inserted is
+  'New target rows, reported by the recording RPC from INSERT ... ON CONFLICT ... RETURNING.';
+comment on column public.climate_ingestion_runs.records_updated is
+  'Existing target rows whose data changed. Unchanged rows are not included.';
+comment on column public.climate_ingestion_runs.records_skipped is
+  'Records not written because they were duplicates, unchanged, outside the supported horizon, or had no usable measurement.';
+comment on column public.climate_ingestion_runs.records_rejected is
+  'Structurally invalid records (for example an invalid date) that were refused before persistence.';
+comment on column public.climate_ingestion_runs.records_failed is
+  'Records whose persistence call failed. They are not reported as inserted or updated.';
+
+comment on column public.weather_ingestion_runs.records_fetched is
+  'Current and daily reading records returned by the provider before validation.';
+comment on column public.weather_ingestion_runs.records_inserted is
+  'New weather rows reported by the recording RPC.';
+comment on column public.weather_ingestion_runs.records_updated is
+  'Existing weather rows whose data changed.';
+comment on column public.weather_ingestion_runs.records_skipped is
+  'Duplicates, unchanged readings, and readings outside the parseable daily series.';
+comment on column public.weather_ingestion_runs.records_rejected is
+  'Records with an invalid observation date or other structural defect refused before persistence.';
+comment on column public.weather_ingestion_runs.records_failed is
+  'Reading rows whose persistence call failed. Provider fetch failures are represented by the run status and error, not as fetched rows.';
+
+comment on column public.soil_ingestion_runs.records_fetched is
+  'Depth records returned by SoilGrids for the requested cells.';
+comment on column public.soil_ingestion_runs.records_inserted is
+  'New soil depth rows reported by the recording RPC.';
+comment on column public.soil_ingestion_runs.records_updated is
+  'Existing soil depth rows whose data changed.';
+comment on column public.soil_ingestion_runs.records_skipped is
+  'Duplicate or unchanged depth rows.';
+comment on column public.soil_ingestion_runs.records_rejected is
+  'Soil depth records with an invalid depth interval refused before persistence.';
+comment on column public.soil_ingestion_runs.records_failed is
+  'Soil depth rows whose persistence call failed. Missing provider depths are not invented as rows.';
+
+-- ---------------------------------------------------------------------------
+-- Forecasts (live and archived share climate_ingestion_runs)
+-- ---------------------------------------------------------------------------
+create or replace function public.record_climate_forecasts(p_rows jsonb)
+returns table (
+  records_inserted integer,
+  records_updated integer,
+  records_unchanged integer,
+  records_duplicate integer
+)
+language sql
+security definer
+set search_path = public, pg_temp
+as $$
+  with raw as (
+    select *
+    from jsonb_to_recordset(coalesce(p_rows, '[]'::jsonb)) as x(
+      provider_code text,
+      district_code text,
+      forecast_on date,
+      issued_on date,
+      tmax_c numeric,
+      tmin_c numeric,
+      precip_mm numeric,
+      humidity_pct numeric,
+      wind_kph numeric,
+      raw jsonb,
+      source_url text,
+      provenance jsonb,
+      is_archived boolean,
+      run_id bigint
+    )
+  ),
+  deduped as (
+    select distinct on (provider_code, district_code, forecast_on, issued_on) *
+    from raw
+    order by provider_code, district_code, forecast_on, issued_on, is_archived desc nulls last
+  ),
+  written as (
+    insert into public.climate_forecasts (
+      provider_code, district_code, forecast_on, issued_on,
+      tmax_c, tmin_c, precip_mm, humidity_pct, wind_kph,
+      raw, source_url, provenance, is_archived, run_id
+    )
+    select
+      provider_code, district_code, forecast_on, issued_on,
+      tmax_c, tmin_c, precip_mm, humidity_pct, wind_kph,
+      coalesce(raw, '{}'::jsonb), source_url, coalesce(provenance, '{}'::jsonb),
+      coalesce(is_archived, false), run_id
+    from deduped
+    on conflict (provider_code, district_code, forecast_on, issued_on) do update
+      set tmax_c = excluded.tmax_c,
+          tmin_c = excluded.tmin_c,
+          precip_mm = excluded.precip_mm,
+          humidity_pct = excluded.humidity_pct,
+          wind_kph = excluded.wind_kph,
+          raw = excluded.raw,
+          source_url = excluded.source_url,
+          provenance = excluded.provenance,
+          is_archived = excluded.is_archived,
+          run_id = excluded.run_id,
+          ingested_at = now()
+      where (
+        public.climate_forecasts.tmax_c,
+        public.climate_forecasts.tmin_c,
+        public.climate_forecasts.precip_mm,
+        public.climate_forecasts.humidity_pct,
+        public.climate_forecasts.wind_kph,
+        public.climate_forecasts.source_url,
+        public.climate_forecasts.is_archived
+      ) is distinct from (
+        excluded.tmax_c,
+        excluded.tmin_c,
+        excluded.precip_mm,
+        excluded.humidity_pct,
+        excluded.wind_kph,
+        excluded.source_url,
+        excluded.is_archived
+      )
+    returning (xmax = 0) as inserted
+  )
+  select
+    (select count(*)::integer from written where inserted),
+    (select count(*)::integer from written where not inserted),
+    ((select count(*) from deduped) - (select count(*) from written))::integer,
+    ((select count(*) from raw) - (select count(*) from deduped))::integer;
+$$;
+
+comment on function public.record_climate_forecasts(jsonb) is
+  'Records live or archived forecasts and reports inserts, changed updates, unchanged rows and within-batch duplicates from the database result. Service-only.';
+
+revoke execute on function public.record_climate_forecasts(jsonb) from public, anon, authenticated;
+grant execute on function public.record_climate_forecasts(jsonb) to service_role;
+
+-- ---------------------------------------------------------------------------
+-- District climate observations
+-- ---------------------------------------------------------------------------
+create or replace function public.record_climate_observations(p_rows jsonb)
+returns table (
+  records_inserted integer,
+  records_updated integer,
+  records_unchanged integer,
+  records_duplicate integer
+)
+language sql
+security definer
+set search_path = public, pg_temp
+as $$
+  with raw as (
+    select *
+    from jsonb_to_recordset(coalesce(p_rows, '[]'::jsonb)) as x(
+      provider_code text,
+      district_code text,
+      observed_on date,
+      tmax_c numeric,
+      tmin_c numeric,
+      precip_mm numeric,
+      humidity_pct numeric,
+      wind_kph numeric,
+      raw jsonb,
+      source_url text,
+      units jsonb,
+      provenance jsonb,
+      data_kind text,
+      run_id bigint
+    )
+  ),
+  deduped as (
+    select distinct on (provider_code, district_code, observed_on) *
+    from raw
+    order by provider_code, district_code, observed_on, data_kind
+  ),
+  written as (
+    insert into public.climate_observations (
+      provider_code, district_code, observed_on,
+      tmax_c, tmin_c, precip_mm, humidity_pct, wind_kph,
+      raw, source_url, units, provenance, data_kind, run_id
+    )
+    select
+      provider_code, district_code, observed_on,
+      tmax_c, tmin_c, precip_mm, humidity_pct, wind_kph,
+      coalesce(raw, '{}'::jsonb), source_url, coalesce(units, '{}'::jsonb),
+      coalesce(provenance, '{}'::jsonb), coalesce(data_kind, 'reanalysis'), run_id
+    from deduped
+    on conflict (provider_code, district_code, observed_on) do update
+      set tmax_c = excluded.tmax_c,
+          tmin_c = excluded.tmin_c,
+          precip_mm = excluded.precip_mm,
+          humidity_pct = excluded.humidity_pct,
+          wind_kph = excluded.wind_kph,
+          raw = excluded.raw,
+          source_url = excluded.source_url,
+          units = excluded.units,
+          provenance = excluded.provenance,
+          data_kind = excluded.data_kind,
+          run_id = excluded.run_id,
+          ingested_at = now()
+      where (
+        public.climate_observations.tmax_c,
+        public.climate_observations.tmin_c,
+        public.climate_observations.precip_mm,
+        public.climate_observations.humidity_pct,
+        public.climate_observations.wind_kph,
+        public.climate_observations.source_url,
+        public.climate_observations.units,
+        public.climate_observations.data_kind
+      ) is distinct from (
+        excluded.tmax_c,
+        excluded.tmin_c,
+        excluded.precip_mm,
+        excluded.humidity_pct,
+        excluded.wind_kph,
+        excluded.source_url,
+        excluded.units,
+        excluded.data_kind
+      )
+    returning (xmax = 0) as inserted
+  )
+  select
+    (select count(*)::integer from written where inserted),
+    (select count(*)::integer from written where not inserted),
+    ((select count(*) from deduped) - (select count(*) from written))::integer,
+    ((select count(*) from raw) - (select count(*) from deduped))::integer;
+$$;
+
+comment on function public.record_climate_observations(jsonb) is
+  'Records reanalysis observations with insert/update/unchanged/duplicate outcomes. Service-only.';
+
+revoke execute on function public.record_climate_observations(jsonb) from public, anon, authenticated;
+grant execute on function public.record_climate_observations(jsonb) to service_role;
+
+-- ---------------------------------------------------------------------------
+-- Weather readings
+-- ---------------------------------------------------------------------------
+create or replace function public.record_weather_readings(p_rows jsonb)
+returns table (
+  records_inserted integer,
+  records_updated integer,
+  records_unchanged integer,
+  records_duplicate integer
+)
+language sql
+security definer
+set search_path = public, pg_temp
+as $$
+  with raw as (
+    select *
+    from jsonb_to_recordset(coalesce(p_rows, '[]'::jsonb)) as x(
+      provider_code text,
+      lat_cell numeric,
+      lon_cell numeric,
+      observed_at timestamptz,
+      fetched_at timestamptz,
+      temp_c numeric,
+      feels_like_c numeric,
+      humidity_pct integer,
+      precip_mm numeric,
+      wind_kph numeric,
+      wind_dir text,
+      condition_text text,
+      condition_code text,
+      kind text,
+      valid_from timestamptz,
+      valid_to timestamptz,
+      raw jsonb,
+      fetch_error text
+    )
+  ),
+  deduped as (
+    select distinct on (provider_code, lat_cell, lon_cell, kind, observed_at) *
+    from raw
+    order by provider_code, lat_cell, lon_cell, kind, observed_at, fetched_at desc nulls last
+  ),
+  written as (
+    insert into public.weather_readings (
+      provider_code, lat_cell, lon_cell, observed_at, fetched_at,
+      temp_c, feels_like_c, humidity_pct, precip_mm, wind_kph, wind_dir,
+      condition_text, condition_code, kind, valid_from, valid_to, raw, fetch_error
+    )
+    select
+      provider_code, lat_cell, lon_cell, observed_at, coalesce(fetched_at, now()),
+      temp_c, feels_like_c, humidity_pct, precip_mm, wind_kph, wind_dir,
+      condition_text, condition_code, coalesce(kind, 'current'), valid_from, valid_to,
+      coalesce(raw, '{}'::jsonb), fetch_error
+    from deduped
+    on conflict (provider_code, lat_cell, lon_cell, kind, observed_at) do update
+      set fetched_at = excluded.fetched_at,
+          temp_c = excluded.temp_c,
+          feels_like_c = excluded.feels_like_c,
+          humidity_pct = excluded.humidity_pct,
+          precip_mm = excluded.precip_mm,
+          wind_kph = excluded.wind_kph,
+          wind_dir = excluded.wind_dir,
+          condition_text = excluded.condition_text,
+          condition_code = excluded.condition_code,
+          valid_from = excluded.valid_from,
+          valid_to = excluded.valid_to,
+          raw = excluded.raw,
+          fetch_error = excluded.fetch_error
+      where (
+        public.weather_readings.temp_c,
+        public.weather_readings.feels_like_c,
+        public.weather_readings.humidity_pct,
+        public.weather_readings.precip_mm,
+        public.weather_readings.wind_kph,
+        public.weather_readings.wind_dir,
+        public.weather_readings.condition_text,
+        public.weather_readings.condition_code,
+        public.weather_readings.valid_from,
+        public.weather_readings.valid_to,
+        public.weather_readings.fetch_error
+      ) is distinct from (
+        excluded.temp_c,
+        excluded.feels_like_c,
+        excluded.humidity_pct,
+        excluded.precip_mm,
+        excluded.wind_kph,
+        excluded.wind_dir,
+        excluded.condition_text,
+        excluded.condition_code,
+        excluded.valid_from,
+        excluded.valid_to,
+        excluded.fetch_error
+      )
+    returning (xmax = 0) as inserted
+  )
+  select
+    (select count(*)::integer from written where inserted),
+    (select count(*)::integer from written where not inserted),
+    ((select count(*) from deduped) - (select count(*) from written))::integer,
+    ((select count(*) from raw) - (select count(*) from deduped))::integer;
+$$;
+
+comment on function public.record_weather_readings(jsonb) is
+  'Records current/daily readings with actual insert/update/unchanged/duplicate outcomes. Service-only.';
+
+revoke execute on function public.record_weather_readings(jsonb) from public, anon, authenticated;
+grant execute on function public.record_weather_readings(jsonb) to service_role;
+
+-- ---------------------------------------------------------------------------
+-- Soil depth observations
+-- ---------------------------------------------------------------------------
+create or replace function public.record_soil_observations(p_rows jsonb)
+returns table (
+  records_inserted integer,
+  records_updated integer,
+  records_unchanged integer,
+  records_duplicate integer
+)
+language sql
+security definer
+set search_path = public, pg_temp
+as $$
+  with raw as (
+    select *
+    from jsonb_to_recordset(coalesce(p_rows, '[]'::jsonb)) as x(
+      source_code text,
+      lat_cell numeric,
+      lon_cell numeric,
+      depth_top_cm smallint,
+      depth_bottom_cm smallint,
+      clay_pct numeric,
+      sand_pct numeric,
+      silt_pct numeric,
+      ph numeric,
+      soc_g_kg numeric,
+      cec_cmol_kg numeric,
+      bulk_density_g_cm3 numeric,
+      uncertainty jsonb,
+      source_url text,
+      raw jsonb,
+      fetched_at timestamptz
+    )
+  ),
+  deduped as (
+    select distinct on (source_code, lat_cell, lon_cell, depth_top_cm, depth_bottom_cm) *
+    from raw
+    order by source_code, lat_cell, lon_cell, depth_top_cm, depth_bottom_cm, fetched_at desc nulls last
+  ),
+  written as (
+    insert into public.soil_observations (
+      source_code, lat_cell, lon_cell, depth_top_cm, depth_bottom_cm,
+      clay_pct, sand_pct, silt_pct, ph, soc_g_kg, cec_cmol_kg,
+      bulk_density_g_cm3, uncertainty, source_url, fetched_at, raw
+    )
+    select
+      coalesce(source_code, 'soilgrids'), lat_cell, lon_cell, depth_top_cm, depth_bottom_cm,
+      clay_pct, sand_pct, silt_pct, ph, soc_g_kg, cec_cmol_kg,
+      bulk_density_g_cm3, coalesce(uncertainty, '{}'::jsonb), source_url,
+      coalesce(fetched_at, now()), coalesce(raw, '{}'::jsonb)
+    from deduped
+    on conflict (source_code, lat_cell, lon_cell, depth_top_cm, depth_bottom_cm) do update
+      set clay_pct = excluded.clay_pct,
+          sand_pct = excluded.sand_pct,
+          silt_pct = excluded.silt_pct,
+          ph = excluded.ph,
+          soc_g_kg = excluded.soc_g_kg,
+          cec_cmol_kg = excluded.cec_cmol_kg,
+          bulk_density_g_cm3 = excluded.bulk_density_g_cm3,
+          uncertainty = excluded.uncertainty,
+          source_url = excluded.source_url,
+          fetched_at = excluded.fetched_at,
+          raw = excluded.raw
+      where (
+        public.soil_observations.clay_pct,
+        public.soil_observations.sand_pct,
+        public.soil_observations.silt_pct,
+        public.soil_observations.ph,
+        public.soil_observations.soc_g_kg,
+        public.soil_observations.cec_cmol_kg,
+        public.soil_observations.bulk_density_g_cm3,
+        public.soil_observations.uncertainty,
+        public.soil_observations.source_url
+      ) is distinct from (
+        excluded.clay_pct,
+        excluded.sand_pct,
+        excluded.silt_pct,
+        excluded.ph,
+        excluded.soc_g_kg,
+        excluded.cec_cmol_kg,
+        excluded.bulk_density_g_cm3,
+        excluded.uncertainty,
+        excluded.source_url
+      )
+    returning (xmax = 0) as inserted
+  )
+  select
+    (select count(*)::integer from written where inserted),
+    (select count(*)::integer from written where not inserted),
+    ((select count(*) from deduped) - (select count(*) from written))::integer,
+    ((select count(*) from raw) - (select count(*) from deduped))::integer;
+$$;
+
+comment on function public.record_soil_observations(jsonb) is
+  'Records modelled soil depths with actual insert/update/unchanged/duplicate outcomes. Service-only.';
+
+revoke execute on function public.record_soil_observations(jsonb) from public, anon, authenticated;
+grant execute on function public.record_soil_observations(jsonb) to service_role;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261104003100_ingestion_health_accounting.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Phase 9 · source-health inventory plus per-run accounting
+--
+-- 027 made every source inventory-based and kept the admin gate. Migration 030
+-- added fetched/inserted/updated/skipped/rejected/failed counters to the three
+-- run tables. This replacement exposes those counters in the existing `detail`
+-- object, so an operator can see what a run actually did without weakening the
+-- admin-only function or changing its signature.
+--
+-- Market and advisory counters are unchanged; they already have their own
+-- established meanings. No raw payload or credential is exposed.
+
+create or replace function public.ingestion_health()
+returns table (
+  source_code text,
+  source_name text,
+  source_kind text,
+  access_status text,
+  last_attempt_at timestamptz,
+  last_success_at timestamptz,
+  last_status text,
+  rows_written integer,
+  freshness text,
+  detail jsonb
+)
+language plpgsql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  if not public.has_capability('admin') then
+    raise exception 'Ingestion health requires admin capability.' using errcode = 'insufficient_privilege';
+  end if;
+
+  return query
+  with
+  weather_run as (
+    select r.* from public.weather_ingestion_runs r
+     where r.provider_code = 'open_meteo'
+     order by r.started_at desc, r.id desc limit 1
+  ),
+  weather_last as (
+    select max(r.observed_at) as observed_at from public.weather_readings r
+     where r.provider_code = 'open_meteo' and r.kind = 'current' and r.fetch_error is null
+  ),
+  climate_run as (
+    select r.* from public.climate_ingestion_runs r
+     where r.provider_code = 'nasa_power'
+     order by r.started_at desc, r.id desc limit 1
+  ),
+  climate_last as (
+    select max(o.observed_on)::timestamptz as observed_at from public.climate_observations o
+     where o.provider_code = 'nasa_power'
+  ),
+  forecast_run as (
+    select distinct on (r.provider_code)
+      r.provider_code, r.started_at, r.finished_at, r.status, r.rows_written,
+      r.records_fetched, r.records_inserted, r.records_updated, r.records_skipped,
+      r.records_rejected, r.records_failed, r.error
+      from public.climate_ingestion_runs r
+     where r.provider_code in ('weatherapi', 'open_meteo')
+     order by r.provider_code, r.started_at desc, r.id desc
+  ),
+  forecast_success as (
+    select r.provider_code, max(r.finished_at) as finished_at
+      from public.climate_ingestion_runs r
+     where r.provider_code in ('weatherapi', 'open_meteo') and r.status = 'ok'
+     group by r.provider_code
+  ),
+  forecast_last as (
+    select f.provider_code, max(f.issued_on)::timestamptz as issued_at
+      from public.climate_forecasts f
+     where f.provider_code in ('weatherapi', 'open_meteo')
+     group by f.provider_code
+  ),
+  market_run as (
+    select distinct on (r.source_code)
+      r.source_code, r.started_at, r.finished_at, r.status,
+      r.rows_seen, r.rows_written, r.rows_rejected, r.error
+      from public.market_ingestion_runs r
+     order by r.source_code, r.started_at desc, r.id desc
+  ),
+  market_success as (
+    select r.source_code, max(r.finished_at) as finished_at
+      from public.market_ingestion_runs r
+     where r.status = 'ok'
+     group by r.source_code
+  ),
+  market_last as (
+    select o.source_code, max(o.observed_on)::timestamptz as observed_at
+      from public.market_observations o
+     group by o.source_code
+  ),
+  advisory_run as (
+    select distinct on (r.source_code)
+      r.source_code, r.started_at, r.finished_at, r.status,
+      r.rows_written, r.rows_rejected, r.error
+      from public.advisory_import_runs r
+     order by r.source_code, r.started_at desc, r.id desc
+  ),
+  advisory_success as (
+    select r.source_code, max(r.finished_at) as finished_at
+      from public.advisory_import_runs r
+     where r.status = 'ok'
+     group by r.source_code
+  ),
+  soil_run as (
+    select r.* from public.soil_ingestion_runs r
+     where r.source_code = 'soilgrids'
+     order by r.started_at desc, r.id desc limit 1
+  ),
+  soil_last as (
+    select max(o.fetched_at) as fetched_at from public.soil_observations o
+     where o.source_code = 'soilgrids'
+  )
+  select
+    i.code, coalesce(i.name, 'Open-Meteo'), 'weather', i.status,
+    w.started_at,
+    (select max(r.finished_at) from public.weather_ingestion_runs r where r.provider_code = 'open_meteo' and r.status = 'ok'),
+    coalesce(w.status, 'never'), coalesce(w.cells_written, 0),
+    case
+      when wl.observed_at is null then 'empty'
+      when wl.observed_at > now() - interval '90 minutes' then 'fresh'
+      when wl.observed_at > now() - interval '6 hours' then 'stale'
+      else 'expired'
+    end,
+    jsonb_build_object(
+      'last_observed_at', wl.observed_at,
+      'cells_requested', coalesce(w.cells_requested, 0),
+      'records_fetched', coalesce(w.records_fetched, 0),
+      'records_inserted', coalesce(w.records_inserted, 0),
+      'records_updated', coalesce(w.records_updated, 0),
+      'records_skipped', coalesce(w.records_skipped, 0),
+      'records_rejected', coalesce(w.records_rejected, 0),
+      'records_failed', coalesce(w.records_failed, 0),
+      'last_error', w.error
+    )
+  from public.intel_sources i
+  left join weather_run w on true
+  cross join weather_last wl
+  where i.code = 'open_meteo'
+  union all
+  select
+    i.code, coalesce(i.name, 'NASA POWER'), 'climate', i.status,
+    c.started_at,
+    (select max(r.finished_at) from public.climate_ingestion_runs r where r.provider_code = 'nasa_power' and r.status = 'ok'),
+    coalesce(c.status, 'never'), coalesce(c.rows_written, 0),
+    case
+      when cl.observed_at is null then 'empty'
+      when cl.observed_at > (current_date - 7)::timestamptz then 'current'
+      when cl.observed_at > (current_date - 30)::timestamptz then 'stale'
+      else 'expired'
+    end,
+    jsonb_build_object(
+      'last_observed_on', cl.observed_at,
+      'range', jsonb_build_array(c.range_start, c.range_end),
+      'records_fetched', coalesce(c.records_fetched, 0),
+      'records_inserted', coalesce(c.records_inserted, 0),
+      'records_updated', coalesce(c.records_updated, 0),
+      'records_skipped', coalesce(c.records_skipped, 0),
+      'records_rejected', coalesce(c.records_rejected, 0),
+      'records_failed', coalesce(c.records_failed, 0),
+      'last_error', c.error
+    )
+  from public.intel_sources i
+  left join climate_run c on true
+  cross join climate_last cl
+  where i.code = 'nasa_power'
+  union all
+  select
+    i.code, coalesce(i.name, f.provider_code), 'forecast', i.status,
+    f.started_at, succ.finished_at,
+    coalesce(f.status, 'never'), coalesce(f.rows_written, 0),
+    case
+      when fl.issued_at is null then 'empty'
+      when fl.issued_at >= current_date::timestamptz then 'fresh'
+      when fl.issued_at >= (current_date - 2)::timestamptz then 'stale'
+      else 'expired'
+    end,
+    jsonb_build_object(
+      'last_issued_on', fl.issued_at,
+      'records_fetched', coalesce(f.records_fetched, 0),
+      'records_inserted', coalesce(f.records_inserted, 0),
+      'records_updated', coalesce(f.records_updated, 0),
+      'records_skipped', coalesce(f.records_skipped, 0),
+      'records_rejected', coalesce(f.records_rejected, 0),
+      'records_failed', coalesce(f.records_failed, 0),
+      'last_error', f.error
+    )
+  from public.intel_sources i
+  left join forecast_run f on f.provider_code = i.code
+  left join forecast_success succ on succ.provider_code = i.code
+  left join forecast_last fl on fl.provider_code = i.code
+  where i.code in ('weatherapi', 'open_meteo')
+  union all
+  select
+    ms.code, ms.name, 'market', coalesce(i.status, 'unverified'),
+    m.started_at, succ.finished_at,
+    coalesce(m.status, 'never'), coalesce(m.rows_written, 0),
+    case
+      when ml.observed_at is null then 'empty'
+      when ml.observed_at >= (current_date - 36 * interval '1 hour')::timestamptz then 'fresh'
+      when ml.observed_at >= (current_date - 7)::timestamptz then 'stale'
+      else 'expired'
+    end,
+    jsonb_build_object(
+      'last_observed_on', ml.observed_at,
+      'rows_seen', coalesce(m.rows_seen, 0),
+      'rows_rejected', coalesce(m.rows_rejected, 0),
+      'registered_active', ms.is_active,
+      'last_error', m.error
+    )
+  from public.market_sources ms
+  left join market_run m on m.source_code = ms.code
+  left join market_success succ on succ.source_code = ms.code
+  left join market_last ml on ml.source_code = ms.code
+  left join public.intel_sources i on i.code = ms.code
+  union all
+  select
+    i.code, i.name, 'advisory', i.status,
+    a.started_at, succ.finished_at,
+    coalesce(a.status, 'never'), coalesce(a.rows_written, 0),
+    case when exists (
+      select 1 from public.agri_advisories ad
+       where ad.is_active and ad.verification_status = 'verified'
+         and (ad.valid_until is null or ad.valid_until > now())
+    ) then 'current' else 'empty' end,
+    jsonb_build_object(
+      'rows_rejected', coalesce(a.rows_rejected, 0),
+      'last_error', a.error
+    )
+  from public.intel_sources i
+  left join advisory_run a on a.source_code = i.code
+  left join advisory_success succ on succ.source_code = i.code
+  where i.code = 'punjab_advisory'
+  union all
+  select
+    i.code, coalesce(i.name, 'ISRIC SoilGrids'), 'soil', i.status,
+    s.started_at,
+    (select max(r.finished_at) from public.soil_ingestion_runs r where r.source_code = 'soilgrids' and r.status = 'ok'),
+    coalesce(s.status, 'never'), coalesce(s.cells_written, 0),
+    case
+      when sl.fetched_at is null then 'empty'
+      when sl.fetched_at > now() - interval '180 days' then 'current'
+      else 'stale'
+    end,
+    jsonb_build_object(
+      'last_fetched_at', sl.fetched_at,
+      'cells_requested', s.cells_requested,
+      'records_fetched', coalesce(s.records_fetched, 0),
+      'records_inserted', coalesce(s.records_inserted, 0),
+      'records_updated', coalesce(s.records_updated, 0),
+      'records_skipped', coalesce(s.records_skipped, 0),
+      'records_rejected', coalesce(s.records_rejected, 0),
+      'records_failed', coalesce(s.records_failed, 0),
+      'last_error', s.error
+    )
+  from public.intel_sources i
+  left join soil_run s on true
+  cross join soil_last sl
+  where i.code = 'soilgrids';
+end;
+$$;
+
+comment on function public.ingestion_health() is
+  'Admin-only operational read: every registered weather, climate, forecast, market, advisory and soil source, including sources that have never run. Reports last attempt/success, freshness, per-provider forecast runs, per-run record accounting and provider error text. No credentials or raw payloads are returned.';
+
+revoke execute on function public.ingestion_health() from public, anon;
+grant execute on function public.ingestion_health() to authenticated;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261104003200_weather_partial_status.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Phase 9 · weather partial-run status
+--
+-- The weather adapter has always intended to report `partial` when some cells
+-- succeed and others fail, but `weather_ingestion_runs.status` only allowed
+-- `running`, `ok` and `failed`. A partial update therefore violated the check
+-- constraint; because the adapter ignored the update error, the run remained
+-- `running` even after a successful HTTP response. Migration 030 added the
+-- accounting columns but did not widen this status domain.
+--
+-- This is a forward-only correction of the status domain. It does not rewrite
+-- any applied migration or invent a successful run.
+
+alter table public.weather_ingestion_runs
+  drop constraint if exists weather_ingestion_runs_status_check;
+
+alter table public.weather_ingestion_runs
+  add constraint weather_ingestion_runs_status_check
+  check (status in ('running', 'ok', 'partial', 'failed'));
+
+comment on column public.weather_ingestion_runs.status is
+  'running while in progress; ok when every requested cell completed; partial when some cells succeeded and some failed or records were skipped; failed when no cell succeeded.';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261104003300_ingestion_run_leases.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Phase 9 · ingestion run leases and abandoned-run recovery
+--
+-- A run that is killed after its run row is inserted used to remain `running`
+-- forever because there was no way to distinguish an active request from a dead
+-- one. This adds a renewable lease to every run table, a heartbeat RPC, and a
+-- service-only recovery RPC. Recovery only touches a run whose lease has already
+-- expired; an active adapter renews the lease between provider operations, so it
+-- cannot be failed by a concurrent recovery.
+--
+-- The original error text and all accounting counters are preserved. Recovery
+-- appends its reason and records `recovered_at`; it never invents successful
+-- writes or changes the target data tables.
+
+alter table public.climate_ingestion_runs
+  add column heartbeat_at timestamptz not null default now(),
+  add column lease_expires_at timestamptz not null default (now() + interval '15 minutes'),
+  add column recovered_at timestamptz;
+
+alter table public.weather_ingestion_runs
+  add column heartbeat_at timestamptz not null default now(),
+  add column lease_expires_at timestamptz not null default (now() + interval '15 minutes'),
+  add column recovered_at timestamptz;
+
+alter table public.soil_ingestion_runs
+  add column heartbeat_at timestamptz not null default now(),
+  add column lease_expires_at timestamptz not null default (now() + interval '15 minutes'),
+  add column recovered_at timestamptz;
+
+create index climate_ingestion_runs_running_lease_idx
+  on public.climate_ingestion_runs (lease_expires_at)
+  where status = 'running';
+create index weather_ingestion_runs_running_lease_idx
+  on public.weather_ingestion_runs (lease_expires_at)
+  where status = 'running';
+create index soil_ingestion_runs_running_lease_idx
+  on public.soil_ingestion_runs (lease_expires_at)
+  where status = 'running';
+
+comment on column public.climate_ingestion_runs.heartbeat_at is
+  'Last successful lease renewal by the running ingestion adapter.';
+comment on column public.climate_ingestion_runs.lease_expires_at is
+  'After this time a running run may be recovered as abandoned. Active adapters renew it before provider work.';
+comment on column public.climate_ingestion_runs.recovered_at is
+  'When abandoned-run recovery changed this row to failed. Null for normal terminal rows.';
+comment on column public.weather_ingestion_runs.heartbeat_at is
+  'Last successful lease renewal by the running ingestion adapter.';
+comment on column public.weather_ingestion_runs.lease_expires_at is
+  'After this time a running run may be recovered as abandoned. Active adapters renew it before provider work.';
+comment on column public.weather_ingestion_runs.recovered_at is
+  'When abandoned-run recovery changed this row to failed. Null for normal terminal rows.';
+comment on column public.soil_ingestion_runs.heartbeat_at is
+  'Last successful lease renewal by the running ingestion adapter.';
+comment on column public.soil_ingestion_runs.lease_expires_at is
+  'After this time a running run may be recovered as abandoned. Active adapters renew it before provider work.';
+comment on column public.soil_ingestion_runs.recovered_at is
+  'When abandoned-run recovery changed this row to failed. Null for normal terminal rows.';
+
+create or replace function public.touch_ingestion_run(
+  p_kind text,
+  p_run_id bigint
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_updated integer := 0;
+begin
+  if current_user <> 'service_role' and not public.has_capability('admin') then
+    raise exception 'Renewing an ingestion run lease requires service authority.'
+      using errcode = 'insufficient_privilege';
+  end if;
+  if p_run_id is null then
+    return false;
+  end if;
+
+  if p_kind = 'climate' then
+    update public.climate_ingestion_runs
+       set heartbeat_at = now(),
+           lease_expires_at = now() + interval '15 minutes'
+     where id = p_run_id and status = 'running';
+    get diagnostics v_updated = row_count;
+  elsif p_kind = 'weather' then
+    update public.weather_ingestion_runs
+       set heartbeat_at = now(),
+           lease_expires_at = now() + interval '15 minutes'
+     where id = p_run_id and status = 'running';
+    get diagnostics v_updated = row_count;
+  elsif p_kind = 'soil' then
+    update public.soil_ingestion_runs
+       set heartbeat_at = now(),
+           lease_expires_at = now() + interval '15 minutes'
+     where id = p_run_id and status = 'running';
+    get diagnostics v_updated = row_count;
+  else
+    raise exception 'Unknown ingestion run kind.' using errcode = 'invalid_parameter_value';
+  end if;
+
+  return v_updated > 0;
+end;
+$$;
+
+comment on function public.touch_ingestion_run(text, bigint) is
+  'Renews a running ingestion run lease. Returns false when the run is no longer running. Service-only.';
+
+revoke execute on function public.touch_ingestion_run(text, bigint) from public, anon, authenticated;
+grant execute on function public.touch_ingestion_run(text, bigint) to service_role;
+
+create or replace function public.recover_abandoned_ingestion_runs(
+  p_limit integer default 50
+)
+returns table (
+  climate_recovered integer,
+  weather_recovered integer,
+  soil_recovered integer
+)
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_limit integer := least(greatest(coalesce(p_limit, 50), 1), 500);
+  v_climate integer := 0;
+  v_weather integer := 0;
+  v_soil integer := 0;
+begin
+  if current_user <> 'service_role' and not public.has_capability('admin') then
+    raise exception 'Recovering abandoned ingestion runs requires service authority.'
+      using errcode = 'insufficient_privilege';
+  end if;
+
+  with candidates as (
+    select id
+      from public.climate_ingestion_runs
+     where status = 'running'
+       and lease_expires_at < now()
+     order by lease_expires_at, id
+     limit v_limit
+     for update skip locked
+  ), recovered as (
+    update public.climate_ingestion_runs r
+       set status = 'failed',
+           finished_at = now(),
+           recovered_at = now(),
+           error = concat_ws(
+             '; ',
+             nullif(r.error, ''),
+             'Recovered as abandoned: the run lease expired without a heartbeat.'
+           )
+      from candidates c
+     where r.id = c.id
+     returning 1
+  )
+  select count(*)::integer into v_climate from recovered;
+
+  with candidates as (
+    select id
+      from public.weather_ingestion_runs
+     where status = 'running'
+       and lease_expires_at < now()
+     order by lease_expires_at, id
+     limit v_limit
+     for update skip locked
+  ), recovered as (
+    update public.weather_ingestion_runs r
+       set status = 'failed',
+           finished_at = now(),
+           recovered_at = now(),
+           error = concat_ws(
+             '; ',
+             nullif(r.error, ''),
+             'Recovered as abandoned: the run lease expired without a heartbeat.'
+           )
+      from candidates c
+     where r.id = c.id
+     returning 1
+  )
+  select count(*)::integer into v_weather from recovered;
+
+  with candidates as (
+    select id
+      from public.soil_ingestion_runs
+     where status = 'running'
+       and lease_expires_at < now()
+     order by lease_expires_at, id
+     limit v_limit
+     for update skip locked
+  ), recovered as (
+    update public.soil_ingestion_runs r
+       set status = 'failed',
+           finished_at = now(),
+           recovered_at = now(),
+           error = concat_ws(
+             '; ',
+             nullif(r.error, ''),
+             'Recovered as abandoned: the run lease expired without a heartbeat.'
+           )
+      from candidates c
+     where r.id = c.id
+     returning 1
+  )
+  select count(*)::integer into v_soil from recovered;
+
+  return query select v_climate, v_weather, v_soil;
+end;
+$$;
+
+comment on function public.recover_abandoned_ingestion_runs(integer) is
+  'Marks only running runs whose lease has expired as failed, preserving original error text and counters. Active leases are never touched. Service-only.';
+
+revoke execute on function public.recover_abandoned_ingestion_runs(integer) from public, anon, authenticated;
+grant execute on function public.recover_abandoned_ingestion_runs(integer) to service_role;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261104003400_ingestion_run_lease_role.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Phase 9 · correct service-role detection for run-lease RPCs
+--
+-- The lease functions are SECURITY DEFINER, so `current_user` is the function
+-- owner rather than the PostgREST caller. Migration 033 therefore rejected the
+-- service-role RPC calls it was meant to allow. This forward-only replacement
+-- reads the JWT role claim, matching the existing service-only functions, and
+-- keeps the admin-capability fallback.
+
+create or replace function public.touch_ingestion_run(
+  p_kind text,
+  p_run_id bigint
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_role text := coalesce(
+    nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'role',
+    ''
+  );
+  v_updated integer := 0;
+begin
+  if v_role <> 'service_role' and not public.has_capability('admin') then
+    raise exception 'Renewing an ingestion run lease requires service authority.'
+      using errcode = 'insufficient_privilege';
+  end if;
+  if p_run_id is null then
+    return false;
+  end if;
+
+  if p_kind = 'climate' then
+    update public.climate_ingestion_runs
+       set heartbeat_at = now(),
+           lease_expires_at = now() + interval '15 minutes'
+     where id = p_run_id and status = 'running';
+    get diagnostics v_updated = row_count;
+  elsif p_kind = 'weather' then
+    update public.weather_ingestion_runs
+       set heartbeat_at = now(),
+           lease_expires_at = now() + interval '15 minutes'
+     where id = p_run_id and status = 'running';
+    get diagnostics v_updated = row_count;
+  elsif p_kind = 'soil' then
+    update public.soil_ingestion_runs
+       set heartbeat_at = now(),
+           lease_expires_at = now() + interval '15 minutes'
+     where id = p_run_id and status = 'running';
+    get diagnostics v_updated = row_count;
+  else
+    raise exception 'Unknown ingestion run kind.' using errcode = 'invalid_parameter_value';
+  end if;
+
+  return v_updated > 0;
+end;
+$$;
+
+create or replace function public.recover_abandoned_ingestion_runs(
+  p_limit integer default 50
+)
+returns table (
+  climate_recovered integer,
+  weather_recovered integer,
+  soil_recovered integer
+)
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_role text := coalesce(
+    nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'role',
+    ''
+  );
+  v_limit integer := least(greatest(coalesce(p_limit, 50), 1), 500);
+  v_climate integer := 0;
+  v_weather integer := 0;
+  v_soil integer := 0;
+begin
+  if v_role <> 'service_role' and not public.has_capability('admin') then
+    raise exception 'Recovering abandoned ingestion runs requires service authority.'
+      using errcode = 'insufficient_privilege';
+  end if;
+
+  with candidates as (
+    select id
+      from public.climate_ingestion_runs
+     where status = 'running'
+       and lease_expires_at < now()
+     order by lease_expires_at, id
+     limit v_limit
+     for update skip locked
+  ), recovered as (
+    update public.climate_ingestion_runs r
+       set status = 'failed',
+           finished_at = now(),
+           recovered_at = now(),
+           error = concat_ws(
+             '; ',
+             nullif(r.error, ''),
+             'Recovered as abandoned: the run lease expired without a heartbeat.'
+           )
+      from candidates c
+     where r.id = c.id
+     returning 1
+  )
+  select count(*)::integer into v_climate from recovered;
+
+  with candidates as (
+    select id
+      from public.weather_ingestion_runs
+     where status = 'running'
+       and lease_expires_at < now()
+     order by lease_expires_at, id
+     limit v_limit
+     for update skip locked
+  ), recovered as (
+    update public.weather_ingestion_runs r
+       set status = 'failed',
+           finished_at = now(),
+           recovered_at = now(),
+           error = concat_ws(
+             '; ',
+             nullif(r.error, ''),
+             'Recovered as abandoned: the run lease expired without a heartbeat.'
+           )
+      from candidates c
+     where r.id = c.id
+     returning 1
+  )
+  select count(*)::integer into v_weather from recovered;
+
+  with candidates as (
+    select id
+      from public.soil_ingestion_runs
+     where status = 'running'
+       and lease_expires_at < now()
+     order by lease_expires_at, id
+     limit v_limit
+     for update skip locked
+  ), recovered as (
+    update public.soil_ingestion_runs r
+       set status = 'failed',
+           finished_at = now(),
+           recovered_at = now(),
+           error = concat_ws(
+             '; ',
+             nullif(r.error, ''),
+             'Recovered as abandoned: the run lease expired without a heartbeat.'
+           )
+      from candidates c
+     where r.id = c.id
+     returning 1
+  )
+  select count(*)::integer into v_soil from recovered;
+
+  return query select v_climate, v_weather, v_soil;
+end;
+$$;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261104003500_ingestion_run_context.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Phase 9 · durable ingestion run context
+--
+-- Counters and provider errors used to be written only by the terminal status
+-- update. If that update failed, the run stayed `running` with no record of what
+-- the provider had actually returned. This adds durable context columns plus
+-- service-only RPCs that persist context before finalization, merge rather than
+-- overwrite existing values, and finalize atomically.
+--
+-- `processing_errors` preserves every distinct meaningful failure. The legacy
+-- `error` text is kept for existing readers and is rebuilt from that array, so a
+-- later write cannot replace a provider error with a generic message.
+
+alter table public.climate_ingestion_runs
+  add column if not exists processing_errors jsonb not null default '[]'::jsonb;
+alter table public.weather_ingestion_runs
+  add column if not exists processing_errors jsonb not null default '[]'::jsonb;
+alter table public.soil_ingestion_runs
+  add column if not exists processing_errors jsonb not null default '[]'::jsonb;
+
+comment on column public.climate_ingestion_runs.processing_errors is
+  'Distinct provider and processing errors recorded for this run, in first-seen order. Preserved across context writes, finalization, and recovery.';
+comment on column public.weather_ingestion_runs.processing_errors is
+  'Distinct provider and processing errors recorded for this run, in first-seen order. Preserved across context writes, finalization, and recovery.';
+comment on column public.soil_ingestion_runs.processing_errors is
+  'Distinct provider and processing errors recorded for this run, in first-seen order. Preserved across context writes, finalization, and recovery.';
+
+-- ---------------------------------------------------------------------------
+-- Internal error merge helpers
+-- ---------------------------------------------------------------------------
+create or replace function public.merge_ingestion_errors(
+  p_existing_error text,
+  p_existing_errors jsonb,
+  p_error text,
+  p_errors jsonb
+)
+returns jsonb
+language sql
+immutable
+set search_path = public, pg_temp
+as $$
+  with existing_errors as (
+    select case
+      when jsonb_typeof(coalesce(p_existing_errors, '[]'::jsonb)) = 'array'
+        then coalesce(p_existing_errors, '[]'::jsonb)
+      else '[]'::jsonb
+    end as errors
+  ), inputs as (
+    -- The legacy error text is only a fallback for rows that predate the
+    -- processing_errors array. When the array exists, the text is its rendered
+    -- form; adding it again would duplicate every error.
+    select nullif(btrim(p_existing_error), '') as value, 0 as ord
+      from existing_errors e
+     where jsonb_array_length(e.errors) = 0
+    union all
+    select nullif(btrim(value), ''), ord
+      from existing_errors e,
+           jsonb_array_elements_text(e.errors) with ordinality as x(value, ord)
+    union all
+    select nullif(btrim(value), ''), 100000 + ord
+      from jsonb_array_elements_text(
+        case
+          when jsonb_typeof(coalesce(p_errors, '[]'::jsonb)) = 'array'
+            then coalesce(p_errors, '[]'::jsonb)
+          else '[]'::jsonb
+        end
+      ) with ordinality as x(value, ord)
+    union all
+    select nullif(btrim(p_error), ''), 200000
+  ), normalized as (
+    select value, ord
+      from inputs
+     where value is not null and value <> ''
+  ), unique_errors as (
+    select value, min(ord) as first_ord
+      from normalized
+     group by value
+  )
+  select coalesce(jsonb_agg(value order by first_ord), '[]'::jsonb)
+    from unique_errors;
+$$;
+
+comment on function public.merge_ingestion_errors(text, jsonb, text, jsonb) is
+  'Merges provider errors in first-seen order and removes duplicates. Internal helper.';
+
+revoke execute on function public.merge_ingestion_errors(text, jsonb, text, jsonb)
+  from public, anon, authenticated;
+
+create or replace function public.ingestion_errors_text(p_errors jsonb)
+returns text
+language sql
+immutable
+set search_path = public, pg_temp
+as $$
+  select nullif(string_agg(value, '; ' order by ord), '')
+    from jsonb_array_elements_text(
+      case
+        when jsonb_typeof(coalesce(p_errors, '[]'::jsonb)) = 'array'
+          then coalesce(p_errors, '[]'::jsonb)
+        else '[]'::jsonb
+      end
+    ) with ordinality as x(value, ord);
+$$;
+
+comment on function public.ingestion_errors_text(jsonb) is
+  'Renders the merged processing error array as the legacy error text. Internal helper.';
+
+revoke execute on function public.ingestion_errors_text(jsonb)
+  from public, anon, authenticated;
+
+-- ---------------------------------------------------------------------------
+-- Read state
+-- ---------------------------------------------------------------------------
+create or replace function public.get_ingestion_run_state(
+  p_kind text,
+  p_run_id bigint
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_role text := coalesce(
+    nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'role',
+    ''
+  );
+  v_state jsonb;
+begin
+  if v_role <> 'service_role' and not public.has_capability('admin') then
+    raise exception 'Reading an ingestion run state requires service authority.'
+      using errcode = 'insufficient_privilege';
+  end if;
+  if p_run_id is null then
+    return null;
+  end if;
+
+  if p_kind = 'climate' then
+    select jsonb_build_object(
+      'run_id', r.id,
+      'kind', 'climate',
+      'status', r.status,
+      'started_at', r.started_at,
+      'finished_at', r.finished_at,
+      'heartbeat_at', r.heartbeat_at,
+      'lease_expires_at', r.lease_expires_at,
+      'recovered_at', r.recovered_at,
+      'records_fetched', r.records_fetched,
+      'records_inserted', r.records_inserted,
+      'records_updated', r.records_updated,
+      'records_skipped', r.records_skipped,
+      'records_rejected', r.records_rejected,
+      'records_failed', r.records_failed,
+      'rows_seen', r.rows_seen,
+      'rows_written', r.rows_written,
+      'cells_written', null,
+      'error', r.error,
+      'processing_errors', coalesce(r.processing_errors, '[]'::jsonb)
+    )
+      into v_state
+      from public.climate_ingestion_runs r
+     where r.id = p_run_id;
+  elsif p_kind = 'weather' then
+    select jsonb_build_object(
+      'run_id', r.id,
+      'kind', 'weather',
+      'status', r.status,
+      'started_at', r.started_at,
+      'finished_at', r.finished_at,
+      'heartbeat_at', r.heartbeat_at,
+      'lease_expires_at', r.lease_expires_at,
+      'recovered_at', r.recovered_at,
+      'records_fetched', r.records_fetched,
+      'records_inserted', r.records_inserted,
+      'records_updated', r.records_updated,
+      'records_skipped', r.records_skipped,
+      'records_rejected', r.records_rejected,
+      'records_failed', r.records_failed,
+      'rows_seen', null,
+      'rows_written', null,
+      'cells_written', r.cells_written,
+      'error', r.error,
+      'processing_errors', coalesce(r.processing_errors, '[]'::jsonb)
+    )
+      into v_state
+      from public.weather_ingestion_runs r
+     where r.id = p_run_id;
+  elsif p_kind = 'soil' then
+    select jsonb_build_object(
+      'run_id', r.id,
+      'kind', 'soil',
+      'status', r.status,
+      'started_at', r.started_at,
+      'finished_at', r.finished_at,
+      'heartbeat_at', r.heartbeat_at,
+      'lease_expires_at', r.lease_expires_at,
+      'recovered_at', r.recovered_at,
+      'records_fetched', r.records_fetched,
+      'records_inserted', r.records_inserted,
+      'records_updated', r.records_updated,
+      'records_skipped', r.records_skipped,
+      'records_rejected', r.records_rejected,
+      'records_failed', r.records_failed,
+      'rows_seen', null,
+      'rows_written', null,
+      'cells_written', r.cells_written,
+      'error', r.error,
+      'processing_errors', coalesce(r.processing_errors, '[]'::jsonb)
+    )
+      into v_state
+      from public.soil_ingestion_runs r
+     where r.id = p_run_id;
+  else
+    raise exception 'Unknown ingestion run kind.' using errcode = 'invalid_parameter_value';
+  end if;
+
+  return v_state;
+end;
+$$;
+
+comment on function public.get_ingestion_run_state(text, bigint) is
+  'Returns the actual persisted context for one ingestion run, or null. Service-only.';
+
+revoke execute on function public.get_ingestion_run_state(text, bigint)
+  from public, anon, authenticated;
+grant execute on function public.get_ingestion_run_state(text, bigint) to service_role;
+
+-- ---------------------------------------------------------------------------
+-- Durable pre-finalization context
+-- ---------------------------------------------------------------------------
+create or replace function public.record_ingestion_run_context(
+  p_kind text,
+  p_run_id bigint,
+  p_counters jsonb default '{}'::jsonb,
+  p_error text default null,
+  p_errors jsonb default '[]'::jsonb,
+  p_cells_written integer default null
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_role text := coalesce(
+    nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'role',
+    ''
+  );
+  v_existing_error text;
+  v_existing_errors jsonb;
+  v_errors jsonb;
+  v_error text;
+  v_counters jsonb := coalesce(p_counters, '{}'::jsonb);
+  v_state jsonb;
+begin
+  if v_role <> 'service_role' and not public.has_capability('admin') then
+    raise exception 'Recording ingestion run context requires service authority.'
+      using errcode = 'insufficient_privilege';
+  end if;
+  if p_run_id is null then
+    return jsonb_build_object('ok', false, 'error', 'run id is required', 'state', null);
+  end if;
+
+  if p_kind = 'climate' then
+    select r.error, r.processing_errors
+      into v_existing_error, v_existing_errors
+      from public.climate_ingestion_runs r
+     where r.id = p_run_id and r.status = 'running'
+       for update;
+    if not found then
+      return jsonb_build_object(
+        'ok', false,
+        'error', 'run is no longer running',
+        'state', public.get_ingestion_run_state(p_kind, p_run_id)
+      );
+    end if;
+
+    v_errors := public.merge_ingestion_errors(v_existing_error, v_existing_errors, p_error, p_errors);
+    v_error := public.ingestion_errors_text(v_errors);
+
+    update public.climate_ingestion_runs
+       set records_fetched = greatest(records_fetched, coalesce((v_counters->>'fetched')::integer, 0)),
+           records_inserted = greatest(records_inserted, coalesce((v_counters->>'inserted')::integer, 0)),
+           records_updated = greatest(records_updated, coalesce((v_counters->>'updated')::integer, 0)),
+           records_skipped = greatest(records_skipped, coalesce((v_counters->>'skipped')::integer, 0)),
+           records_rejected = greatest(records_rejected, coalesce((v_counters->>'rejected')::integer, 0)),
+           records_failed = greatest(records_failed, coalesce((v_counters->>'failed')::integer, 0)),
+           rows_seen = greatest(rows_seen, coalesce((v_counters->>'fetched')::integer, 0)),
+           rows_written = greatest(
+             rows_written,
+             coalesce((v_counters->>'inserted')::integer, 0)
+               + coalesce((v_counters->>'updated')::integer, 0)
+           ),
+           error = v_error,
+           processing_errors = v_errors
+     where id = p_run_id and status = 'running';
+  elsif p_kind = 'weather' then
+    select r.error, r.processing_errors
+      into v_existing_error, v_existing_errors
+      from public.weather_ingestion_runs r
+     where r.id = p_run_id and r.status = 'running'
+       for update;
+    if not found then
+      return jsonb_build_object(
+        'ok', false,
+        'error', 'run is no longer running',
+        'state', public.get_ingestion_run_state(p_kind, p_run_id)
+      );
+    end if;
+
+    v_errors := public.merge_ingestion_errors(v_existing_error, v_existing_errors, p_error, p_errors);
+    v_error := public.ingestion_errors_text(v_errors);
+
+    update public.weather_ingestion_runs
+       set records_fetched = greatest(records_fetched, coalesce((v_counters->>'fetched')::integer, 0)),
+           records_inserted = greatest(records_inserted, coalesce((v_counters->>'inserted')::integer, 0)),
+           records_updated = greatest(records_updated, coalesce((v_counters->>'updated')::integer, 0)),
+           records_skipped = greatest(records_skipped, coalesce((v_counters->>'skipped')::integer, 0)),
+           records_rejected = greatest(records_rejected, coalesce((v_counters->>'rejected')::integer, 0)),
+           records_failed = greatest(records_failed, coalesce((v_counters->>'failed')::integer, 0)),
+           cells_written = case
+             when p_cells_written is null then cells_written
+             else greatest(cells_written, greatest(p_cells_written, 0))
+           end,
+           error = v_error,
+           processing_errors = v_errors
+     where id = p_run_id and status = 'running';
+  elsif p_kind = 'soil' then
+    select r.error, r.processing_errors
+      into v_existing_error, v_existing_errors
+      from public.soil_ingestion_runs r
+     where r.id = p_run_id and r.status = 'running'
+       for update;
+    if not found then
+      return jsonb_build_object(
+        'ok', false,
+        'error', 'run is no longer running',
+        'state', public.get_ingestion_run_state(p_kind, p_run_id)
+      );
+    end if;
+
+    v_errors := public.merge_ingestion_errors(v_existing_error, v_existing_errors, p_error, p_errors);
+    v_error := public.ingestion_errors_text(v_errors);
+
+    update public.soil_ingestion_runs
+       set records_fetched = greatest(records_fetched, coalesce((v_counters->>'fetched')::integer, 0)),
+           records_inserted = greatest(records_inserted, coalesce((v_counters->>'inserted')::integer, 0)),
+           records_updated = greatest(records_updated, coalesce((v_counters->>'updated')::integer, 0)),
+           records_skipped = greatest(records_skipped, coalesce((v_counters->>'skipped')::integer, 0)),
+           records_rejected = greatest(records_rejected, coalesce((v_counters->>'rejected')::integer, 0)),
+           records_failed = greatest(records_failed, coalesce((v_counters->>'failed')::integer, 0)),
+           cells_written = case
+             when p_cells_written is null then cells_written
+             else greatest(cells_written, greatest(p_cells_written, 0))
+           end,
+           error = v_error,
+           processing_errors = v_errors
+     where id = p_run_id and status = 'running';
+  else
+    raise exception 'Unknown ingestion run kind.' using errcode = 'invalid_parameter_value';
+  end if;
+
+  v_state := public.get_ingestion_run_state(p_kind, p_run_id);
+  return jsonb_build_object('ok', true, 'state', v_state);
+end;
+$$;
+
+comment on function public.record_ingestion_run_context(text, bigint, jsonb, text, jsonb, integer) is
+  'Persists counters and provider errors before terminal finalization. Merges counters upward and errors by value; never clears useful context. Service-only.';
+
+revoke execute on function public.record_ingestion_run_context(text, bigint, jsonb, text, jsonb, integer)
+  from public, anon, authenticated;
+grant execute on function public.record_ingestion_run_context(text, bigint, jsonb, text, jsonb, integer)
+  to service_role;
+
+-- ---------------------------------------------------------------------------
+-- Atomic terminal finalization
+-- ---------------------------------------------------------------------------
+create or replace function public.finalize_ingestion_run(
+  p_kind text,
+  p_run_id bigint,
+  p_status text,
+  p_error text default null,
+  p_errors jsonb default '[]'::jsonb,
+  p_counters jsonb default '{}'::jsonb,
+  p_cells_written integer default null
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_role text := coalesce(
+    nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'role',
+    ''
+  );
+  v_existing_error text;
+  v_existing_errors jsonb;
+  v_errors jsonb;
+  v_error text;
+  v_counters jsonb := coalesce(p_counters, '{}'::jsonb);
+  v_updated integer := 0;
+  v_state jsonb;
+begin
+  if v_role <> 'service_role' and not public.has_capability('admin') then
+    raise exception 'Finalizing an ingestion run requires service authority.'
+      using errcode = 'insufficient_privilege';
+  end if;
+  if p_status not in ('ok', 'partial', 'failed') then
+    raise exception 'Invalid terminal ingestion status.' using errcode = 'invalid_parameter_value';
+  end if;
+  if p_run_id is null then
+    return jsonb_build_object('ok', false, 'error', 'run id is required', 'state', null);
+  end if;
+
+  if p_kind = 'climate' then
+    select r.error, r.processing_errors
+      into v_existing_error, v_existing_errors
+      from public.climate_ingestion_runs r
+     where r.id = p_run_id and r.status = 'running'
+       for update;
+    if not found then
+      return jsonb_build_object(
+        'ok', false,
+        'error', 'run is no longer running',
+        'state', public.get_ingestion_run_state(p_kind, p_run_id)
+      );
+    end if;
+
+    v_errors := public.merge_ingestion_errors(v_existing_error, v_existing_errors, p_error, p_errors);
+    v_error := public.ingestion_errors_text(v_errors);
+
+    update public.climate_ingestion_runs
+       set status = p_status,
+           finished_at = now(),
+           records_fetched = greatest(records_fetched, coalesce((v_counters->>'fetched')::integer, 0)),
+           records_inserted = greatest(records_inserted, coalesce((v_counters->>'inserted')::integer, 0)),
+           records_updated = greatest(records_updated, coalesce((v_counters->>'updated')::integer, 0)),
+           records_skipped = greatest(records_skipped, coalesce((v_counters->>'skipped')::integer, 0)),
+           records_rejected = greatest(records_rejected, coalesce((v_counters->>'rejected')::integer, 0)),
+           records_failed = greatest(records_failed, coalesce((v_counters->>'failed')::integer, 0)),
+           rows_seen = greatest(rows_seen, coalesce((v_counters->>'fetched')::integer, 0)),
+           rows_written = greatest(
+             rows_written,
+             coalesce((v_counters->>'inserted')::integer, 0)
+               + coalesce((v_counters->>'updated')::integer, 0)
+           ),
+           error = v_error,
+           processing_errors = v_errors
+     where id = p_run_id and status = 'running';
+    get diagnostics v_updated = row_count;
+  elsif p_kind = 'weather' then
+    select r.error, r.processing_errors
+      into v_existing_error, v_existing_errors
+      from public.weather_ingestion_runs r
+     where r.id = p_run_id and r.status = 'running'
+       for update;
+    if not found then
+      return jsonb_build_object(
+        'ok', false,
+        'error', 'run is no longer running',
+        'state', public.get_ingestion_run_state(p_kind, p_run_id)
+      );
+    end if;
+
+    v_errors := public.merge_ingestion_errors(v_existing_error, v_existing_errors, p_error, p_errors);
+    v_error := public.ingestion_errors_text(v_errors);
+
+    update public.weather_ingestion_runs
+       set status = p_status,
+           finished_at = now(),
+           records_fetched = greatest(records_fetched, coalesce((v_counters->>'fetched')::integer, 0)),
+           records_inserted = greatest(records_inserted, coalesce((v_counters->>'inserted')::integer, 0)),
+           records_updated = greatest(records_updated, coalesce((v_counters->>'updated')::integer, 0)),
+           records_skipped = greatest(records_skipped, coalesce((v_counters->>'skipped')::integer, 0)),
+           records_rejected = greatest(records_rejected, coalesce((v_counters->>'rejected')::integer, 0)),
+           records_failed = greatest(records_failed, coalesce((v_counters->>'failed')::integer, 0)),
+           cells_written = case
+             when p_cells_written is null then cells_written
+             else greatest(cells_written, greatest(p_cells_written, 0))
+           end,
+           error = v_error,
+           processing_errors = v_errors
+     where id = p_run_id and status = 'running';
+    get diagnostics v_updated = row_count;
+  elsif p_kind = 'soil' then
+    select r.error, r.processing_errors
+      into v_existing_error, v_existing_errors
+      from public.soil_ingestion_runs r
+     where r.id = p_run_id and r.status = 'running'
+       for update;
+    if not found then
+      return jsonb_build_object(
+        'ok', false,
+        'error', 'run is no longer running',
+        'state', public.get_ingestion_run_state(p_kind, p_run_id)
+      );
+    end if;
+
+    v_errors := public.merge_ingestion_errors(v_existing_error, v_existing_errors, p_error, p_errors);
+    v_error := public.ingestion_errors_text(v_errors);
+
+    update public.soil_ingestion_runs
+       set status = p_status,
+           finished_at = now(),
+           records_fetched = greatest(records_fetched, coalesce((v_counters->>'fetched')::integer, 0)),
+           records_inserted = greatest(records_inserted, coalesce((v_counters->>'inserted')::integer, 0)),
+           records_updated = greatest(records_updated, coalesce((v_counters->>'updated')::integer, 0)),
+           records_skipped = greatest(records_skipped, coalesce((v_counters->>'skipped')::integer, 0)),
+           records_rejected = greatest(records_rejected, coalesce((v_counters->>'rejected')::integer, 0)),
+           records_failed = greatest(records_failed, coalesce((v_counters->>'failed')::integer, 0)),
+           cells_written = case
+             when p_cells_written is null then cells_written
+             else greatest(cells_written, greatest(p_cells_written, 0))
+           end,
+           error = v_error,
+           processing_errors = v_errors
+     where id = p_run_id and status = 'running';
+    get diagnostics v_updated = row_count;
+  else
+    raise exception 'Unknown ingestion run kind.' using errcode = 'invalid_parameter_value';
+  end if;
+
+  v_state := public.get_ingestion_run_state(p_kind, p_run_id);
+  if v_updated = 0 then
+    return jsonb_build_object('ok', false, 'error', 'run is no longer running', 'state', v_state);
+  end if;
+  return jsonb_build_object('ok', true, 'state', v_state);
+end;
+$$;
+
+comment on function public.finalize_ingestion_run(text, bigint, text, text, jsonb, jsonb, integer) is
+  'Atomically applies terminal status while merging counters upward and preserving every previously recorded processing error. Service-only.';
+
+revoke execute on function public.finalize_ingestion_run(text, bigint, text, text, jsonb, jsonb, integer)
+  from public, anon, authenticated;
+grant execute on function public.finalize_ingestion_run(text, bigint, text, text, jsonb, jsonb, integer)
+  to service_role;
+
+-- ---------------------------------------------------------------------------
+-- Recovery preserves context
+-- ---------------------------------------------------------------------------
+create or replace function public.recover_abandoned_ingestion_runs(
+  p_limit integer default 50
+)
+returns table (
+  climate_recovered integer,
+  weather_recovered integer,
+  soil_recovered integer
+)
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_role text := coalesce(
+    nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'role',
+    ''
+  );
+  v_limit integer := least(greatest(coalesce(p_limit, 50), 1), 500);
+  v_climate integer := 0;
+  v_weather integer := 0;
+  v_soil integer := 0;
+  v_reason constant text :=
+    'Recovered as abandoned: the run lease expired without a heartbeat.';
+begin
+  if v_role <> 'service_role' and not public.has_capability('admin') then
+    raise exception 'Recovering abandoned ingestion runs requires service authority.'
+      using errcode = 'insufficient_privilege';
+  end if;
+
+  with candidates as (
+    select id
+      from public.climate_ingestion_runs
+     where status = 'running'
+       and lease_expires_at < now()
+     order by lease_expires_at, id
+     limit v_limit
+     for update skip locked
+  ), recovered as (
+    update public.climate_ingestion_runs r
+       set status = 'failed',
+           finished_at = now(),
+           recovered_at = now(),
+           processing_errors = public.merge_ingestion_errors(
+             r.error, r.processing_errors, v_reason, '[]'::jsonb
+           ),
+           error = public.ingestion_errors_text(
+             public.merge_ingestion_errors(
+               r.error, r.processing_errors, v_reason, '[]'::jsonb
+             )
+           )
+      from candidates c
+     where r.id = c.id
+     returning 1
+  )
+  select count(*)::integer into v_climate from recovered;
+
+  with candidates as (
+    select id
+      from public.weather_ingestion_runs
+     where status = 'running'
+       and lease_expires_at < now()
+     order by lease_expires_at, id
+     limit v_limit
+     for update skip locked
+  ), recovered as (
+    update public.weather_ingestion_runs r
+       set status = 'failed',
+           finished_at = now(),
+           recovered_at = now(),
+           processing_errors = public.merge_ingestion_errors(
+             r.error, r.processing_errors, v_reason, '[]'::jsonb
+           ),
+           error = public.ingestion_errors_text(
+             public.merge_ingestion_errors(
+               r.error, r.processing_errors, v_reason, '[]'::jsonb
+             )
+           )
+      from candidates c
+     where r.id = c.id
+     returning 1
+  )
+  select count(*)::integer into v_weather from recovered;
+
+  with candidates as (
+    select id
+      from public.soil_ingestion_runs
+     where status = 'running'
+       and lease_expires_at < now()
+     order by lease_expires_at, id
+     limit v_limit
+     for update skip locked
+  ), recovered as (
+    update public.soil_ingestion_runs r
+       set status = 'failed',
+           finished_at = now(),
+           recovered_at = now(),
+           processing_errors = public.merge_ingestion_errors(
+             r.error, r.processing_errors, v_reason, '[]'::jsonb
+           ),
+           error = public.ingestion_errors_text(
+             public.merge_ingestion_errors(
+               r.error, r.processing_errors, v_reason, '[]'::jsonb
+             )
+           )
+      from candidates c
+     where r.id = c.id
+     returning 1
+  )
+  select count(*)::integer into v_soil from recovered;
+
+  return query select v_climate, v_weather, v_soil;
+end;
+$$;
+
+comment on function public.recover_abandoned_ingestion_runs(integer) is
+  'Marks only expired running runs as failed, preserving counters and all processing errors while appending the recovery reason exactly once. Active leases are never touched. Service-only.';
+
+revoke execute on function public.recover_abandoned_ingestion_runs(integer)
+  from public, anon, authenticated;
+grant execute on function public.recover_abandoned_ingestion_runs(integer) to service_role;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261105000100_knowledge_lifecycle_completion.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Phase 3 completion · agricultural knowledge lifecycle
+--
+-- The knowledge engine already had bilingual entries, a source registry,
+-- evidence dossiers, review authorities, publication guards, expiry and
+-- recommendation withdrawal. Four operational gaps remained:
+--
+--   1. There was no acquisition path: every entry had to be inserted by hand,
+--      with no run ledger, content hash, duplicate handling or item audit.
+--   2. The dossier lifecycle had no explicit `withdrawn` state. Withdrawal was
+--      only an implicit consequence of unpublishing a knowledge row.
+--   3. Retrieval accepted a district but never filtered by it, ignored the
+--      entry's stage applicability, and returned no licence metadata.
+--   4. Source licensing/permission and knowledge-specific freshness were not
+--      recorded, so an operator could not tell why a source was blocked or
+--      which published guidance had gone stale.
+--
+-- This migration adds those capabilities without changing the existing
+-- publication, review, expiry or recommendation guards. No reviewer, source
+-- permission, advisory or agricultural claim is seeded. A source whose
+-- permission is unknown stays blocked for new ingestion until a human records
+-- the licensing decision.
+
+-- ---------------------------------------------------------------------------
+-- Source licensing, permission and freshness
+-- ---------------------------------------------------------------------------
+alter table public.agri_knowledge_sources
+  add column if not exists license_name text,
+  add column if not exists license_url text
+    check (license_url is null or license_url ~ '^https://[^[:space:]]+$'),
+  add column if not exists permission_status text not null default 'unknown'
+    check (permission_status in ('granted', 'needs_permission', 'unknown', 'not_required')),
+  add column if not exists freshness_days integer
+    check (freshness_days is null or freshness_days between 1 and 3650),
+  add column if not exists last_checked_at timestamptz;
+
+comment on column public.agri_knowledge_sources.permission_status is
+  'Recorded human decision about whether this publisher permits reuse. New ingestion requires granted or not_required; unknown and needs_permission stay blocked.';
+comment on column public.agri_knowledge_sources.freshness_days is
+  'Optional source-specific review interval. Null means no automatic staleness claim; it does not mean the source is current.';
+
+update public.agri_knowledge_sources
+   set license_name = 'Farmer App internal editorial content',
+       permission_status = 'not_required',
+       last_checked_at = now()
+ where code = 'app_editorial'
+   and (license_name is null or permission_status = 'unknown');
+
+update public.agri_knowledge_sources
+   set license_name = coalesce(
+         license_name,
+         'Government of Punjab website content; reuse permission not recorded'
+       ),
+       permission_status = case
+         when permission_status = 'unknown' then 'unknown'
+         else permission_status
+       end,
+       last_checked_at = coalesce(last_checked_at, now())
+ where code = 'punjab_agri';
+
+-- ---------------------------------------------------------------------------
+-- Explicit withdrawal in the evidence lifecycle
+-- ---------------------------------------------------------------------------
+alter table public.agri_evidence_items
+  add column if not exists withdrawn_at timestamptz,
+  add column if not exists withdrawal_reason text,
+  add column if not exists license_name text,
+  add column if not exists license_url text
+    check (license_url is null or license_url ~ '^https://[^[:space:]]+$');
+
+alter table public.agri_evidence_items
+  drop constraint if exists agri_evidence_items_status_check;
+alter table public.agri_evidence_items
+  add constraint agri_evidence_items_status_check
+  check (status in (
+    'draft', 'submitted', 'under_review', 'correction_requested',
+    'approved', 'rejected', 'published', 'withdrawn', 'expired', 'superseded'
+  ));
+
+alter table public.agri_evidence_reviews
+  drop constraint if exists agri_evidence_reviews_action_check;
+alter table public.agri_evidence_reviews
+  add constraint agri_evidence_reviews_action_check
+  check (action in (
+    'create', 'submit', 'start_review', 'source_check',
+    'applicability_check', 'approve', 'reject', 'request_correction',
+    'resubmit', 'publish', 'withdraw', 'expire', 'supersede'
+  ));
+
+alter table public.agri_knowledge_entries
+  add column if not exists withdrawn_at timestamptz,
+  add column if not exists withdrawal_reason text;
+
+comment on column public.agri_evidence_items.withdrawn_at is
+  'When a content manager withdrew this dossier. Withdrawal is distinct from expiry: it is a human decision, not a validity clock.';
+comment on column public.agri_knowledge_entries.withdrawn_at is
+  'When the published entry was withdrawn. Retrieval excludes withdrawn rows even if a stale publication flag remains.';
+
+-- A re-published entry is no longer withdrawn. Clearing the marker here keeps
+-- `is_published` and the withdrawal fields from contradicting each other.
+create or replace function public.agri_knowledge_clear_withdrawal_on_publish()
+returns trigger
+language plpgsql
+set search_path = public, pg_temp
+as $$
+begin
+  if new.is_published and not old.is_published then
+    new.withdrawn_at := null;
+    new.withdrawal_reason := null;
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists agri_knowledge_clear_withdrawal on public.agri_knowledge_entries;
+create trigger agri_knowledge_clear_withdrawal
+  before update of is_published on public.agri_knowledge_entries
+  for each row
+  when (old.is_published is distinct from new.is_published)
+  execute function public.agri_knowledge_clear_withdrawal_on_publish();
+
+-- Publishing a version makes older versions of the same slug non-current. The
+-- existing withdrawal trigger then removes recommendations built from the old
+-- version; the history remains auditable.
+create or replace function public.agri_knowledge_single_published_version()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  if new.is_published then
+    update public.agri_knowledge_entries e
+       set is_published = false
+     where e.slug = new.slug
+       and e.id <> new.id
+       and e.is_published;
+  end if;
+  return null;
+end;
+$$;
+
+drop trigger if exists agri_knowledge_single_version on public.agri_knowledge_entries;
+create trigger agri_knowledge_single_version
+  after update of is_published on public.agri_knowledge_entries
+  for each row
+  when (new.is_published and old.is_published is distinct from new.is_published)
+  execute function public.agri_knowledge_single_published_version();
+
+revoke execute on function public.agri_knowledge_clear_withdrawal_on_publish()
+  from public, anon, authenticated;
+revoke execute on function public.agri_knowledge_single_published_version()
+  from public, anon, authenticated;
+
+-- ---------------------------------------------------------------------------
+-- Knowledge acquisition ledger
+-- ---------------------------------------------------------------------------
+create table public.agri_knowledge_ingestion_runs (
+  id               uuid primary key default gen_random_uuid(),
+  idempotency_key  text not null unique
+    check (length(btrim(idempotency_key)) between 8 and 200),
+  request_hash     text not null,
+  source_code      text not null references public.agri_knowledge_sources (code),
+  -- These are the submitted values, not yet trusted content. Validation happens
+  -- inside the ingestion transaction so a bad document still leaves a failed
+  -- run record instead of being rejected before it can be audited.
+  document_url     text,
+  document_title   text,
+  publisher        text,
+  published_on     date,
+  accessed_at      timestamptz not null default now(),
+  language         text not null default 'bilingual'
+    check (language in ('en', 'ur', 'bilingual')),
+  license_name     text,
+  license_url      text,
+  status           text not null default 'running'
+    check (status in ('running', 'ok', 'partial', 'failed')),
+  items_fetched    integer not null default 0 check (items_fetched >= 0),
+  items_accepted   integer not null default 0 check (items_accepted >= 0),
+  items_duplicate  integer not null default 0 check (items_duplicate >= 0),
+  items_rejected   integer not null default 0 check (items_rejected >= 0),
+  items_failed     integer not null default 0 check (items_failed >= 0),
+  detail           jsonb not null default '{}'::jsonb,
+  error            text,
+  requested_by     uuid references public.parties (id) on delete set null,
+  started_at       timestamptz not null default now(),
+  finished_at      timestamptz
+);
+
+comment on table public.agri_knowledge_ingestion_runs is
+  'One audited acquisition attempt per source document. The idempotency key makes a retry a replay, not a second import; the request hash rejects a key reused for different content.';
+
+create index agri_knowledge_ingestion_runs_source_idx
+  on public.agri_knowledge_ingestion_runs (source_code, started_at desc);
+create index agri_knowledge_ingestion_runs_status_idx
+  on public.agri_knowledge_ingestion_runs (status, started_at desc);
+
+alter table public.agri_knowledge_ingestion_runs enable row level security;
+revoke all on public.agri_knowledge_ingestion_runs from public, anon, authenticated;
+grant select on public.agri_knowledge_ingestion_runs to service_role;
+
+create table public.agri_knowledge_ingestion_items (
+  id                 uuid primary key default gen_random_uuid(),
+  run_id             uuid not null references public.agri_knowledge_ingestion_runs (id) on delete cascade,
+  source_code        text not null,
+  external_key       text,
+  content_hash       text not null,
+  slug               text not null,
+  entry_version      integer not null check (entry_version > 0),
+  title_en           text not null,
+  title_ur           text not null,
+  crop_code          text references public.crop_catalog (code),
+  topic              text not null,
+  problem_type       text not null,
+  stages             text[] not null default '{}'::text[],
+  districts          text[] not null default '{}'::text[],
+  status             text not null default 'accepted' check (status = 'accepted'),
+  knowledge_entry_id uuid references public.agri_knowledge_entries (id) on delete set null,
+  evidence_item_id   uuid references public.agri_evidence_items (id) on delete set null,
+  created_at         timestamptz not null default now(),
+  unique (source_code, content_hash),
+  unique (run_id, external_key)
+);
+
+comment on table public.agri_knowledge_ingestion_items is
+  'Accepted items only. Rejections and duplicates are recorded in the parent run detail; the unique content hash prevents re-importing the same source text.';
+
+create index agri_knowledge_ingestion_items_run_idx
+  on public.agri_knowledge_ingestion_items (run_id, created_at);
+
+alter table public.agri_knowledge_ingestion_items enable row level security;
+revoke all on public.agri_knowledge_ingestion_items from public, anon, authenticated;
+grant select on public.agri_knowledge_ingestion_items to service_role;
+
+-- Parse a bounded JSON string array without inventing values.
+create or replace function public.agri_json_text_array(p_value jsonb)
+returns text[]
+language sql
+immutable
+set search_path = public, pg_temp
+as $$
+  select coalesce(array_agg(distinct btrim(v)), '{}'::text[])
+    from jsonb_array_elements_text(
+      case
+        when jsonb_typeof(coalesce(p_value, '[]'::jsonb)) = 'array'
+          then coalesce(p_value, '[]'::jsonb)
+        else '[]'::jsonb
+      end
+    ) as x(v)
+   where btrim(v) <> '';
+$$;
+
+revoke execute on function public.agri_json_text_array(jsonb) from public, anon, authenticated;
+
+-- A human records the publisher's permission and licence. This never grants
+-- permission by itself and cannot be inferred from an institution's reputation.
+create or replace function public.agri_set_source_terms(
+  p_code              text,
+  p_permission_status text,
+  p_license_name      text default null,
+  p_license_url       text default null,
+  p_freshness_days    integer default null,
+  p_note              text default null
+)
+returns public.agri_knowledge_sources
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_actor uuid := public.current_party_id();
+  v_before public.agri_knowledge_sources;
+  v_after public.agri_knowledge_sources;
+begin
+  if not public.has_capability('admin') then
+    raise exception 'Recording source terms requires the admin capability.' using errcode = 'insufficient_privilege';
+  end if;
+  if p_permission_status not in ('granted', 'needs_permission', 'unknown', 'not_required') then
+    raise exception 'Unknown source permission status.' using errcode = 'check_violation';
+  end if;
+  if p_license_url is not null and p_license_url !~ '^https://[^[:space:]]+$' then
+    raise exception 'A licence URL must be a direct HTTPS reference.' using errcode = 'check_violation';
+  end if;
+  if p_freshness_days is not null and (p_freshness_days < 1 or p_freshness_days > 3650) then
+    raise exception 'Freshness days must be between 1 and 3650.' using errcode = 'check_violation';
+  end if;
+
+  select * into v_before from public.agri_knowledge_sources where code = p_code for update;
+  if not found then
+    raise exception 'Source % not found.', p_code using errcode = 'no_data_found';
+  end if;
+
+  if p_permission_status in ('granted', 'not_required')
+     and coalesce(nullif(btrim(p_license_name), ''), v_before.license_name) is null then
+    raise exception 'Granting or recording permission requires a licence name.' using errcode = 'check_violation';
+  end if;
+
+  update public.agri_knowledge_sources
+     set permission_status = p_permission_status,
+         license_name = coalesce(nullif(btrim(p_license_name), ''), license_name),
+         license_url = coalesce(nullif(btrim(p_license_url), ''), license_url),
+         freshness_days = coalesce(p_freshness_days, freshness_days),
+         last_checked_at = now()
+   where code = p_code
+  returning * into v_after;
+
+  perform public.write_audit(
+    'agri.source_terms_recorded', 'agri_knowledge_sources', null, p_code,
+    v_before.permission_status, v_after.permission_status,
+    jsonb_build_object(
+      'license_name', v_after.license_name,
+      'license_url', v_after.license_url,
+      'freshness_days', v_after.freshness_days,
+      'note', nullif(btrim(p_note), '')
+    ),
+    v_actor, 'admin'
+  );
+  return v_after;
+end;
+$$;
+
+comment on function public.agri_set_source_terms(text, text, text, text, integer, text) is
+  'Admin-only record of a publisher permission and licence decision. It does not grant permission and no permission is seeded.';
+
+revoke execute on function public.agri_set_source_terms(text, text, text, text, integer, text)
+  from public, anon;
+grant execute on function public.agri_set_source_terms(text, text, text, text, integer, text)
+  to authenticated;
+
+-- ---------------------------------------------------------------------------
+-- Knowledge document ingestion
+-- ---------------------------------------------------------------------------
+create or replace function public.agri_ingest_knowledge_document(
+  p_source_code     text,
+  p_idempotency_key text,
+  p_document        jsonb,
+  p_items           jsonb
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_actor          uuid := public.current_party_id();
+  v_source         public.agri_knowledge_sources;
+  v_run            public.agri_knowledge_ingestion_runs;
+  v_existing       public.agri_knowledge_ingestion_runs;
+  v_run_json       jsonb;
+  v_request_hash   text;
+  v_items          jsonb := coalesce(p_items, '[]'::jsonb);
+  v_document       jsonb := coalesce(p_document, '{}'::jsonb);
+
+  v_url            text;
+  v_document_title text;
+  v_publisher      text;
+  v_published_on   date;
+  v_accessed_at    timestamptz;
+  v_language       text;
+  v_license_name   text;
+  v_license_url    text;
+  v_valid_until    timestamptz;
+  v_document_ref   text;
+  v_document_districts text[];
+  v_document_stages    text[];
+
+  v_item           jsonb;
+  v_hash           text;
+  v_external       text;
+  v_slug           text;
+  v_entry_version  integer;
+  v_title_en       text;
+  v_title_ur       text;
+  v_body_en        text;
+  v_body_ur        text;
+  v_crop           text;
+  v_problem        text;
+  v_topic          text;
+  v_evidence_topic text;
+  v_stages         text[];
+  v_districts      text[];
+  v_regions        text[];
+  v_symptoms       text[];
+  v_classification text;
+  v_source_type    text;
+  v_provenance     text;
+  v_reason         text;
+  v_entry_id       uuid;
+  v_evidence_id    uuid;
+
+  v_fetched        integer := 0;
+  v_accepted       integer := 0;
+  v_duplicate      integer := 0;
+  v_rejected       integer := 0;
+  v_status         text;
+  v_duplicates     jsonb := '[]'::jsonb;
+  v_rejections     jsonb := '[]'::jsonb;
+  v_stage          text;
+  v_item_stages    text[];
+begin
+  -- The RPC is executable by service_role only. A signed-in caller must hold a
+  -- content-manager or admin capability; a service-role call has no party and
+  -- is the trusted backend acquisition path. The run ledger records that
+  -- distinction, so an ingestion is never mistaken for a human review act.
+  if v_actor is not null
+     and not public.agri_has_authority_role('content_manager')
+     and not public.has_capability('admin') then
+    raise exception 'Knowledge ingestion requires content-manager or admin authority.' using errcode = 'insufficient_privilege';
+  end if;
+  if p_idempotency_key is null or length(btrim(p_idempotency_key)) not between 8 and 200 then
+    raise exception 'An idempotency key between 8 and 200 characters is required.' using errcode = 'check_violation';
+  end if;
+  if jsonb_typeof(v_items) <> 'array' then
+    raise exception 'p_items must be a JSON array.' using errcode = 'check_violation';
+  end if;
+  if jsonb_typeof(v_document) <> 'object' then
+    raise exception 'p_document must be a JSON object.' using errcode = 'check_violation';
+  end if;
+
+  select * into v_source from public.agri_knowledge_sources where code = p_source_code;
+  if not found or not v_source.is_active then
+    raise exception 'An active source registry entry is required.' using errcode = 'no_data_found';
+  end if;
+
+  v_url := nullif(btrim(v_document->>'url'), '');
+  v_document_title := nullif(btrim(v_document->>'title'), '');
+  v_publisher := coalesce(
+    nullif(btrim(v_document->>'publisher'), ''),
+    nullif(btrim(v_source.publisher), ''),
+    v_source.name
+  );
+  v_document_ref := nullif(btrim(v_document->>'document_ref'), '');
+  v_license_name := coalesce(
+    nullif(btrim(v_document->>'license_name'), ''),
+    nullif(btrim(v_source.license_name), '')
+  );
+  v_license_url := coalesce(
+    nullif(btrim(v_document->>'license_url'), ''),
+    nullif(btrim(v_source.license_url), '')
+  );
+  v_language := coalesce(nullif(btrim(v_document->>'language'), ''), 'bilingual');
+  v_document_districts := public.agri_json_text_array(v_document->'districts');
+  v_document_stages := public.agri_json_text_array(v_document->'stages');
+
+  v_request_hash := md5(
+    p_source_code || '|' || btrim(p_idempotency_key) || '|' ||
+    v_document::text || '|' || v_items::text
+  );
+
+  insert into public.agri_knowledge_ingestion_runs (
+    idempotency_key, request_hash, source_code, document_url, document_title,
+    publisher, published_on, accessed_at, language, license_name, license_url,
+    requested_by, status
+  ) values (
+    btrim(p_idempotency_key), v_request_hash, p_source_code,
+    v_url, v_document_title, v_publisher, null,
+    now(),
+    'bilingual', v_license_name,
+    v_license_url, v_actor, 'running'
+  )
+  on conflict (idempotency_key) do nothing
+  returning * into v_run;
+
+  if v_run.id is null then
+    select * into v_existing
+      from public.agri_knowledge_ingestion_runs
+     where idempotency_key = btrim(p_idempotency_key);
+    if v_existing.request_hash <> v_request_hash then
+      return jsonb_build_object(
+        'ok', false,
+        'error', 'This idempotency key was already used with a different payload.',
+        'run_id', v_existing.id
+      );
+    end if;
+    return jsonb_build_object(
+      'ok', v_existing.status in ('ok', 'partial'),
+      'replay', true,
+      'status', v_existing.status,
+      'run_id', v_existing.id,
+      'counts', jsonb_build_object(
+        'fetched', v_existing.items_fetched,
+        'accepted', v_existing.items_accepted,
+        'duplicate', v_existing.items_duplicate,
+        'rejected', v_existing.items_rejected,
+        'failed', v_existing.items_failed
+      ),
+      'detail', v_existing.detail,
+      'error', v_existing.error
+    );
+  end if;
+
+  begin
+    if v_source.permission_status not in ('granted', 'not_required') then
+      raise exception 'Source % has no recorded reuse permission (%).', p_source_code, v_source.permission_status
+        using errcode = 'insufficient_privilege';
+    end if;
+    if v_url is null or v_url !~ '^https://[^[:space:]]+$' then
+      raise exception 'A direct HTTPS document URL is required.' using errcode = 'check_violation';
+    end if;
+    if v_document_title is null or length(v_document_title) > 400 then
+      raise exception 'A document title of 1-400 characters is required.' using errcode = 'check_violation';
+    end if;
+    v_published_on := (v_document->>'published_on')::date;
+    if v_published_on is null then
+      raise exception 'A publication date is required.' using errcode = 'check_violation';
+    end if;
+    if v_published_on > current_date then
+      raise exception 'A future publication date cannot be ingested as current evidence.' using errcode = 'check_violation';
+    end if;
+    v_accessed_at := coalesce((v_document->>'accessed_at')::timestamptz, now());
+    v_valid_until := (v_document->>'valid_until')::timestamptz;
+    if v_valid_until is null or v_valid_until <= now() then
+      raise exception 'A future validity end is required for the evidence review window.' using errcode = 'check_violation';
+    end if;
+    if v_license_name is null then
+      raise exception 'Licence metadata is required before ingesting a document.' using errcode = 'check_violation';
+    end if;
+    if v_license_url is not null and v_license_url !~ '^https://[^[:space:]]+$' then
+      raise exception 'A licence URL must be a direct HTTPS reference.' using errcode = 'check_violation';
+    end if;
+    if jsonb_array_length(v_items) = 0 or jsonb_array_length(v_items) > 100 then
+      raise exception 'Between 1 and 100 items are required per document.' using errcode = 'check_violation';
+    end if;
+
+    update public.agri_knowledge_ingestion_runs
+       set document_url = v_url,
+           document_title = v_document_title,
+           publisher = v_publisher,
+           published_on = v_published_on,
+           accessed_at = v_accessed_at,
+           license_name = v_license_name,
+           license_url = v_license_url
+     where id = v_run.id;
+
+    for v_item in select value from jsonb_array_elements(v_items) loop
+      v_fetched := v_fetched + 1;
+      v_reason := null;
+      v_title_en := nullif(btrim(v_item->>'title_en'), '');
+      v_title_ur := nullif(btrim(v_item->>'title_ur'), '');
+      v_body_en := nullif(btrim(v_item->>'body_en'), '');
+      v_body_ur := nullif(btrim(v_item->>'body_ur'), '');
+      v_external := nullif(btrim(v_item->>'external_key'), '');
+      v_hash := md5(
+        p_source_code || '|' || coalesce(v_title_en, '') || '|' || coalesce(v_body_en, '') ||
+        '|' || coalesce(v_title_ur, '') || '|' || coalesce(v_body_ur, '')
+      );
+      v_slug := nullif(btrim(v_item->>'slug'), '');
+      v_crop := nullif(btrim(v_item->>'crop_code'), '');
+      v_problem := nullif(btrim(v_item->>'problem_type'), '');
+      v_topic := nullif(btrim(v_item->>'topic'), '');
+      v_stages := public.agri_json_text_array(v_item->'stages');
+      if cardinality(v_stages) = 0 then v_stages := v_document_stages; end if;
+      v_districts := public.agri_json_text_array(v_item->'districts');
+      if cardinality(v_districts) = 0 then v_districts := v_document_districts; end if;
+      v_regions := public.agri_json_text_array(v_item->'regions');
+      v_symptoms := public.agri_json_text_array(v_item->'symptoms');
+      v_classification := nullif(btrim(v_item->>'classification'), '');
+
+      if v_title_en is null or v_title_ur is null or v_body_en is null or v_body_ur is null then
+        v_reason := 'Bilingual title and body are required.';
+      elsif length(v_title_en) > 300 or length(v_title_ur) > 300
+         or length(v_body_en) > 12000 or length(v_body_ur) > 12000 then
+        v_reason := 'Title or body exceeds the accepted length.';
+      elsif v_slug is not null and v_slug !~ '^[a-z0-9][a-z0-9-]{2,119}$' then
+        v_reason := 'Slug must be lowercase letters, digits and hyphens.';
+      elsif cardinality(v_districts) > 30 or cardinality(v_stages) > 20
+         or cardinality(v_regions) > 20 or cardinality(v_symptoms) > 20 then
+        v_reason := 'Applicability arrays exceed the accepted length.';
+      elsif v_problem is not null and v_problem not in (
+        'pest', 'disease', 'weed', 'disorder', 'agronomy', 'safety', 'nutrition', 'water', 'other'
+      ) then
+        v_reason := 'Unknown problem type.';
+      elsif v_topic is not null and length(v_topic) > 60 then
+        v_reason := 'Topic exceeds 60 characters.';
+      else
+        for v_stage in select unnest(v_stages) loop
+          if not exists (
+            select 1 from unnest(enum_range(null::public.crop_stage)) e
+             where e::text = v_stage
+          ) then
+            v_reason := 'Unknown crop stage: ' || v_stage;
+            exit;
+          end if;
+        end loop;
+      end if;
+
+      if v_reason is null and v_crop is not null
+         and not exists (select 1 from public.crop_catalog c where c.code = v_crop) then
+        v_reason := 'Unknown crop code: ' || v_crop;
+      end if;
+
+      if v_reason is null and v_external is not null and exists (
+        select 1 from public.agri_knowledge_ingestion_items i
+         where i.run_id = v_run.id and i.external_key = v_external
+      ) then
+        v_reason := 'Duplicate external key in this run.';
+      end if;
+
+      if v_reason is null and exists (
+        select 1 from public.agri_knowledge_ingestion_items i
+         where i.source_code = p_source_code and i.content_hash = v_hash
+      ) then
+        v_duplicate := v_duplicate + 1;
+        v_duplicates := v_duplicates || jsonb_build_array(jsonb_build_object(
+          'external_key', v_external,
+          'content_hash', v_hash,
+          'reason', 'identical content already ingested from this source'
+        ));
+        continue;
+      end if;
+
+      if v_reason is not null then
+        v_rejected := v_rejected + 1;
+        v_rejections := v_rejections || jsonb_build_array(jsonb_build_object(
+          'external_key', v_external,
+          'reason', v_reason
+        ));
+        continue;
+      end if;
+
+      if v_problem is null then
+        v_problem := 'other';
+      end if;
+      if v_topic is null then
+        v_topic := case v_problem
+          when 'pest' then 'pest'
+          when 'disease' then 'disease'
+          when 'weed' then 'weed'
+          when 'water' then 'irrigation'
+          else 'agronomy'
+        end;
+      end if;
+      v_evidence_topic := case v_problem
+        when 'pest' then 'pest'
+        when 'disease' then 'disease'
+        when 'weed' then 'weed'
+        when 'water' then 'water'
+        when 'agronomy' then 'sowing'
+        when 'disorder' then 'other'
+        when 'nutrition' then 'other'
+        when 'safety' then 'other'
+        else 'other'
+      end;
+
+      if v_classification is null then
+        v_classification := case v_source.source_type
+          when 'official_extension' then 'official_government'
+          when 'regulator' then 'official_government'
+          when 'qualified_expert' then 'qualified_expert'
+          when 'community' then 'unverified_submission'
+          else 'supplementary_editorial'
+        end;
+      end if;
+      if v_classification not in (
+        'official_government', 'peer_reviewed_research', 'qualified_expert',
+        'supplementary_editorial', 'unverified_submission'
+      ) then
+        v_rejected := v_rejected + 1;
+        v_rejections := v_rejections || jsonb_build_array(jsonb_build_object(
+          'external_key', v_external,
+          'reason', 'Unknown evidence classification.'
+        ));
+        continue;
+      end if;
+
+      v_source_type := case v_source.source_type
+        when 'official_extension' then 'official_extension'
+        when 'regulator' then 'regulator'
+        when 'university' then 'university'
+        when 'supplementary' then 'supplementary_editorial'
+        when 'editorial' then 'supplementary_editorial'
+        when 'community' then 'community'
+        else 'unknown'
+      end;
+
+      if v_slug is null then
+        v_slug := 'kb-' || replace(lower(p_source_code), '_', '-') || '-' || left(v_hash, 12);
+      end if;
+      select coalesce(max(version), 0) + 1 into v_entry_version
+        from public.agri_knowledge_entries where slug = v_slug;
+
+      v_provenance := left(
+        v_source.name || ' — ' || v_document_title || ' (accessed ' || v_accessed_at::date || ')',
+        900
+      );
+
+      insert into public.agri_knowledge_entries (
+        slug, version, title_en, title_ur, body_en, body_ur, body_local,
+        crop_code, applies_to_stages, topic, provenance, is_published,
+        problem_type, symptoms, regions, source_code, source_url,
+        source_published_on, source_accessed_on, evidence_tier
+      ) values (
+        v_slug, v_entry_version, v_title_en, v_title_ur, v_body_en, v_body_ur, '{}'::jsonb,
+        v_crop, v_stages::public.crop_stage[], v_topic, v_provenance, false,
+        v_problem, v_symptoms, v_regions, p_source_code, v_url,
+        v_published_on, v_accessed_at::date, 'supplementary'
+      )
+      returning id into v_entry_id;
+
+      insert into public.agri_evidence_items (
+        evidence_key, target_kind, target_ref, version,
+        source_organization, source_type, source_code, source_url, document_ref,
+        document_title, published_on, accessed_at, language,
+        crop_code, topic, districts, stages, classification,
+        status, valid_from, valid_until, created_by, license_name, license_url
+      ) values (
+        'knowledge_entry:' || v_entry_id::text || ':v1', 'knowledge_entry',
+        v_entry_id::text, 1,
+        v_publisher, v_source_type, p_source_code, v_url, v_document_ref,
+        v_document_title, v_published_on, v_accessed_at, 'bilingual',
+        v_crop, v_evidence_topic, v_districts, v_stages, v_classification,
+        'draft', now(), v_valid_until, v_actor, v_license_name, v_license_url
+      )
+      returning id into v_evidence_id;
+
+      update public.agri_knowledge_entries
+         set evidence_item_id = v_evidence_id
+       where id = v_entry_id;
+
+      perform public.agri_log_evidence_event(
+        v_evidence_id, 'create', null, 'draft',
+        'Draft created by knowledge ingestion run ' || v_run.id::text,
+        jsonb_build_object(
+          'run_id', v_run.id,
+          'content_hash', v_hash,
+          'source_code', p_source_code,
+          'channel', case when v_actor is null then 'service_role_ingestion' else 'authenticated_ingestion' end
+        ),
+        'submitter'
+      );
+
+      insert into public.agri_knowledge_ingestion_items (
+        run_id, source_code, external_key, content_hash, slug, entry_version,
+        title_en, title_ur, crop_code, topic, problem_type, stages, districts,
+        status, knowledge_entry_id, evidence_item_id
+      ) values (
+        v_run.id, p_source_code, v_external, v_hash, v_slug, v_entry_version,
+        v_title_en, v_title_ur, v_crop, v_topic, v_problem, v_stages, v_districts,
+        'accepted', v_entry_id, v_evidence_id
+      );
+
+      v_accepted := v_accepted + 1;
+    end loop;
+
+    v_status := case
+      when v_accepted = 0 then 'failed'
+      when v_rejected > 0 then 'partial'
+      else 'ok'
+    end;
+
+    update public.agri_knowledge_ingestion_runs
+       set status = v_status,
+           items_fetched = v_fetched,
+           items_accepted = v_accepted,
+           items_duplicate = v_duplicate,
+           items_rejected = v_rejected,
+           items_failed = 0,
+           detail = jsonb_build_object(
+             'duplicates', v_duplicates,
+             'rejections', v_rejections
+           ),
+           error = case when v_accepted = 0 then 'No item passed validation.' else null end,
+           finished_at = now()
+     where id = v_run.id;
+
+    select to_jsonb(r) into v_run_json
+      from public.agri_knowledge_ingestion_runs r where r.id = v_run.id;
+
+    return jsonb_build_object(
+      'ok', v_status in ('ok', 'partial'),
+      'replay', false,
+      'status', v_status,
+      'run_id', v_run.id,
+      'counts', jsonb_build_object(
+        'fetched', v_fetched,
+        'accepted', v_accepted,
+        'duplicate', v_duplicate,
+        'rejected', v_rejected,
+        'failed', 0
+      ),
+      'duplicates', v_duplicates,
+      'rejections', v_rejections,
+      'run', v_run_json
+    );
+  exception when others then
+    update public.agri_knowledge_ingestion_runs
+       set status = 'failed',
+           items_fetched = v_fetched,
+           items_accepted = 0,
+           items_duplicate = v_duplicate,
+           items_rejected = v_rejected,
+           error = SQLERRM,
+           detail = jsonb_build_object(
+             'duplicates', v_duplicates,
+             'rejections', v_rejections
+           ),
+           finished_at = now()
+     where id = v_run.id;
+
+    return jsonb_build_object(
+      'ok', false,
+      'replay', false,
+      'status', 'failed',
+      'run_id', v_run.id,
+      'error', SQLERRM,
+      'counts', jsonb_build_object(
+        'fetched', v_fetched,
+        'accepted', 0,
+        'duplicate', v_duplicate,
+        'rejected', v_rejected,
+        'failed', 0
+      )
+    );
+  end;
+end;
+$$;
+
+comment on function public.agri_ingest_knowledge_document(text, text, jsonb, jsonb) is
+  'Service-only, idempotent acquisition of one source document. Validates source permission, licence, date, bilingual content, crop and stage applicability; creates unpublished knowledge and a draft evidence dossier; records duplicates and rejections in the run ledger. It never publishes or approves anything.';
+
+revoke execute on function public.agri_ingest_knowledge_document(text, text, jsonb, jsonb)
+  from public, anon, authenticated;
+grant execute on function public.agri_ingest_knowledge_document(text, text, jsonb, jsonb)
+  to service_role;
+
+-- ---------------------------------------------------------------------------
+-- Explicit withdrawal
+-- ---------------------------------------------------------------------------
+create or replace function public.agri_withdraw_evidence(
+  p_evidence_id uuid,
+  p_reason      text
+)
+returns public.agri_evidence_items
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_actor uuid := public.current_party_id();
+  v_item public.agri_evidence_items;
+  v_from text;
+begin
+  if coalesce(btrim(p_reason), '') = '' then
+    raise exception 'A withdrawal reason is required.' using errcode = 'check_violation';
+  end if;
+  select * into v_item from public.agri_evidence_items where id = p_evidence_id for update;
+  if not found then
+    raise exception 'Evidence dossier not found.' using errcode = 'no_data_found';
+  end if;
+  if not public.agri_has_authority('content_manager', v_item.crop_code, v_item.districts) then
+    raise exception 'You need content-manager authority for this evidence.' using errcode = 'insufficient_privilege';
+  end if;
+  if v_item.status not in ('approved', 'published') then
+    raise exception 'Only approved or published evidence can be withdrawn.' using errcode = 'check_violation';
+  end if;
+  v_from := v_item.status;
+
+  if v_item.status = 'published' then
+    if v_item.target_kind = 'knowledge_entry' then
+      update public.agri_knowledge_entries
+         set is_published = false,
+             withdrawn_at = now(),
+             withdrawal_reason = btrim(p_reason)
+       where id = v_item.target_ref::uuid;
+    elsif v_item.target_kind = 'official_advisory' then
+      update public.agri_advisories
+         set is_active = false
+       where id = v_item.target_ref::uuid;
+    else
+      update public.forecast_risk_rules
+         set is_active = false,
+             deactivated_at = now(),
+             deactivated_by = v_actor,
+             deactivation_note = btrim(p_reason)
+       where code = v_item.target_ref;
+    end if;
+  end if;
+
+  update public.agri_evidence_items
+     set status = 'withdrawn',
+         withdrawn_at = now(),
+         withdrawal_reason = btrim(p_reason)
+   where id = p_evidence_id
+  returning * into v_item;
+
+  perform public.agri_log_evidence_event(
+    p_evidence_id, 'withdraw', v_from, 'withdrawn', btrim(p_reason), '{}'::jsonb, 'content_manager'
+  );
+  perform public.write_audit(
+    'agri.evidence_withdrawn', 'agri_evidence_items', p_evidence_id, v_item.target_ref,
+    v_from, 'withdrawn', jsonb_build_object('reason', btrim(p_reason)), v_actor, 'content_manager'
+  );
+  return v_item;
+end;
+$$;
+
+comment on function public.agri_withdraw_evidence(uuid, text) is
+  'Content-manager withdrawal of approved or published evidence. It unpublishes the linked target, records the reason in the append-only ledger and audit log, and lets the existing trigger withdraw recommendations built from the affected knowledge version.';
+
+revoke execute on function public.agri_withdraw_evidence(uuid, text) from public, anon;
+grant execute on function public.agri_withdraw_evidence(uuid, text) to authenticated;
+
+-- ---------------------------------------------------------------------------
+-- Operational monitoring
+-- ---------------------------------------------------------------------------
+create or replace function public.agri_knowledge_health()
+returns jsonb
+language plpgsql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  -- A service-role operations probe has no party; the function is not granted
+  -- to anon/authenticated without a role, so null is the trusted service path.
+  if public.current_party_id() is not null
+     and not (public.has_capability('admin') or public.agri_has_review_access()) then
+    raise exception 'Knowledge health requires admin or review authority.' using errcode = 'insufficient_privilege';
+  end if;
+
+  return jsonb_build_object(
+    'generated_at', now(),
+    'sources', (
+      select jsonb_build_object(
+        'total', count(*),
+        'active', count(*) filter (where is_active),
+        'permission_ready', count(*) filter (where permission_status in ('granted', 'not_required')),
+        'permission_blocked', count(*) filter (where permission_status in ('unknown', 'needs_permission')),
+        'licensed', count(*) filter (where license_name is not null)
+      ) from public.agri_knowledge_sources
+    ),
+    'knowledge', (
+      select jsonb_build_object(
+        'total', count(*),
+        'published', count(*) filter (where is_published),
+        'withdrawn', count(*) filter (where withdrawn_at is not null),
+        'verified', count(*) filter (where is_published and evidence_tier = 'verified'),
+        'supplementary', count(*) filter (where is_published and evidence_tier = 'supplementary'),
+        'without_evidence', count(*) filter (where evidence_item_id is null)
+      ) from public.agri_knowledge_entries
+    ),
+    'evidence', (
+      select jsonb_build_object(
+        'draft', count(*) filter (where status = 'draft'),
+        'submitted', count(*) filter (where status = 'submitted'),
+        'under_review', count(*) filter (where status = 'under_review'),
+        'correction_requested', count(*) filter (where status = 'correction_requested'),
+        'approved', count(*) filter (where status = 'approved'),
+        'published', count(*) filter (where status = 'published'),
+        'withdrawn', count(*) filter (where status = 'withdrawn'),
+        'expired', count(*) filter (where status = 'expired'),
+        'rejected', count(*) filter (where status = 'rejected'),
+        'superseded', count(*) filter (where status = 'superseded')
+      ) from public.agri_evidence_items
+    ),
+    'stale_or_expiring_published', (
+      select count(*)
+        from public.agri_knowledge_entries e
+        join public.agri_evidence_items ev on ev.id = e.evidence_item_id
+        left join public.agri_knowledge_sources s on s.code = coalesce(ev.source_code, e.source_code)
+       where e.is_published
+         and e.withdrawn_at is null
+         and ev.status = 'published'
+         and (
+           (s.freshness_days is not null
+             and ev.accessed_at < now() - make_interval(days => s.freshness_days))
+           or (ev.valid_until is not null and ev.valid_until <= now() + interval '30 days')
+         )
+    ),
+    'expiring_30d', (
+      select count(*) from public.agri_evidence_items
+       where status = 'published'
+         and valid_until is not null
+         and valid_until > now()
+         and valid_until <= now() + interval '30 days'
+    ),
+    'ingestion', (
+      select jsonb_build_object(
+        'runs_30d', count(*),
+        'failed_30d', count(*) filter (where status = 'failed'),
+        'partial_30d', count(*) filter (where status = 'partial'),
+        'last_run_at', max(started_at),
+        'items_accepted_30d', coalesce(sum(items_accepted), 0),
+        'items_duplicate_30d', coalesce(sum(items_duplicate), 0),
+        'items_rejected_30d', coalesce(sum(items_rejected), 0)
+      ) from public.agri_knowledge_ingestion_runs
+       where started_at > now() - interval '30 days'
+    ),
+    'authorities', (
+      select jsonb_build_object(
+        'evidence_reviewers', count(*) filter (where authority = 'evidence_reviewer'),
+        'content_managers', count(*) filter (where authority = 'content_manager')
+      ) from public.agri_review_authorities where revoked_at is null
+    )
+  );
+end;
+$$;
+
+comment on function public.agri_knowledge_health() is
+  'Admin/reviewer operational read: source permission readiness, lifecycle counts, stale or expiring published guidance, ingestion outcomes and active review authorities. It returns no farmer data.';
+
+revoke execute on function public.agri_knowledge_health() from public, anon;
+grant execute on function public.agri_knowledge_health() to authenticated, service_role;
+
+-- ---------------------------------------------------------------------------
+-- Retrieval: crop, stage, district and licence aware
+-- ---------------------------------------------------------------------------
+drop function if exists public.ai_knowledge_search(text, text, text, integer);
+
+create or replace function public.ai_knowledge_search(
+  p_query    text,
+  p_crop     text default null,
+  p_district text default null,
+  p_limit    integer default 4,
+  p_stage    text default null
+)
+returns table (
+  id                  uuid,
+  slug                text,
+  version             integer,
+  title_en            text,
+  title_ur            text,
+  body_en             text,
+  body_ur             text,
+  topic               text,
+  problem_type        text,
+  symptoms            text[],
+  regions             text[],
+  crop_code           text,
+  provenance          text,
+  evidence_tier       text,
+  source_code         text,
+  source_name         text,
+  source_url          text,
+  source_published_on date,
+  source_updated_on   date,
+  source_accessed_on  date,
+  stages              text[],
+  districts           text[],
+  source_publisher    text,
+  source_license      text,
+  stale               boolean,
+  score               double precision,
+  used_embedding      boolean
+)
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+  with content as (
+    select regexp_replace(
+      lower(left(coalesce(nullif(btrim(p_query), ''), ''), 500)),
+      '\m(how|what|when|where|why|who|which|do|does|did|i|we|you|they|he|she|it|the|a|an|and|or|in|on|of|to|for|from|at|by|with|about|as|is|are|was|were|be|been|being|can|could|should|would|will|shall|may|might|must|please|tell|me|my|our|your|their|his|her|its|this|that|these|those|there|if|after|before|more|most|much|many|any|all|not|no|so|than|then|also|just|very|but|into|over|under|use|using|has|have|had)\M',
+      ' ', 'gi'
+    ) as terms
+  ), q as (
+    select
+      websearch_to_tsquery('simple', coalesce(nullif(btrim(content.terms), ''), 'crop')) as strict,
+      websearch_to_tsquery(
+        'simple',
+        coalesce(
+          nullif(regexp_replace(btrim(content.terms), '[[:space:]]+', ' OR ', 'g'), ''),
+          'crop'
+        )
+      ) as broad
+      from content
+  ), documents as (
+    select e.*,
+           ev.status as evidence_status,
+           ev.stages as evidence_stages,
+           ev.districts as evidence_districts,
+           ev.accessed_at as evidence_accessed_at,
+           ev.valid_until as evidence_valid_until,
+           ev.source_organization as evidence_publisher,
+           coalesce(ev.license_name, s.license_name) as source_license,
+           s.freshness_days,
+           coalesce(ev.source_organization, s.publisher, s.name) as source_publisher,
+           to_tsvector(
+             'simple',
+             coalesce(e.title_en, '') || ' ' || coalesce(e.title_ur, '') || ' ' ||
+             coalesce(e.body_en, '') || ' ' || coalesce(e.body_ur, '') || ' ' ||
+             coalesce(e.topic, '') || ' ' || coalesce(e.problem_type, '') || ' ' ||
+             coalesce(array_to_string(e.symptoms, ' '), '') || ' ' || coalesce(e.slug, '')
+           ) as document
+      from public.agri_knowledge_entries e
+      left join public.agri_evidence_items ev on ev.id = e.evidence_item_id
+      left join public.agri_knowledge_sources s on s.code = coalesce(ev.source_code, e.source_code)
+     where e.is_published
+       and e.withdrawn_at is null
+       and (e.evidence_item_id is null or ev.status = 'published')
+       and (ev.valid_until is null or ev.valid_until > now())
+  )
+  select
+    e.id, e.slug, e.version, e.title_en, e.title_ur, e.body_en, e.body_ur,
+    e.topic, e.problem_type, e.symptoms, e.regions, e.crop_code, e.provenance,
+    e.evidence_tier, e.source_code, s.name, e.source_url,
+    e.source_published_on, e.source_updated_on, e.source_accessed_on,
+    coalesce(e.applies_to_stages::text[], '{}'::text[]),
+    coalesce(e.evidence_districts, '{}'::text[]),
+    e.source_publisher,
+    e.source_license,
+    coalesce(
+      (e.freshness_days is not null
+        and e.evidence_accessed_at < now() - make_interval(days => e.freshness_days))
+      or (e.evidence_valid_until is not null and e.evidence_valid_until <= now()),
+      false
+    ),
+    least(
+      1.0,
+      ts_rank(e.document, q.strict) * 8
+      + ts_rank(e.document, q.broad) * 3
+      + case e.evidence_tier when 'verified' then 0.12 when 'supplementary' then 0.05 else 0 end
+    )::double precision as score,
+    false as used_embedding
+  from documents e
+  cross join q
+  left join public.agri_knowledge_sources s on s.code = e.source_code
+  where
+    (
+      e.document @@ q.strict
+      or e.document @@ q.broad
+      or (
+        btrim(coalesce(p_query, '')) <> ''
+        and (
+          e.title_en ilike '%' || left(btrim(p_query), 80) || '%'
+          or e.title_ur ilike '%' || left(btrim(p_query), 80) || '%'
+          or e.slug ilike '%' || left(btrim(p_query), 80) || '%'
+        )
+      )
+    )
+    and (
+      p_district is null
+      or cardinality(coalesce(e.evidence_districts, '{}'::text[])) = 0
+      or p_district = any (coalesce(e.evidence_districts, '{}'::text[]))
+    )
+    and (
+      p_stage is null
+      or cardinality(coalesce(e.applies_to_stages, '{}'::public.crop_stage[])) = 0
+      or p_stage::public.crop_stage = any (e.applies_to_stages)
+    )
+  order by
+    (p_crop is not null and e.crop_code = p_crop) desc,
+    (
+      p_stage is not null
+      and cardinality(coalesce(e.applies_to_stages, '{}'::public.crop_stage[])) > 0
+      and p_stage::public.crop_stage = any (e.applies_to_stages)
+    ) desc,
+    (
+      p_district is not null
+      and cardinality(coalesce(e.evidence_districts, '{}'::text[])) > 0
+      and p_district = any (coalesce(e.evidence_districts, '{}'::text[]))
+    ) desc,
+    case e.evidence_tier when 'verified' then 3 when 'supplementary' then 2 else 1 end desc,
+    score desc,
+    e.version desc
+  limit greatest(1, least(coalesce(p_limit, 4), 8));
+$$;
+
+comment on function public.ai_knowledge_search(text, text, text, integer, text) is
+  'Published, non-withdrawn, source-labelled knowledge only. Crop match ranks first, then stage applicability, explicit district applicability, evidence tier and text score. Excludes rows whose evidence is not published and returns licence/publisher freshness metadata.';
+
+revoke execute on function public.ai_knowledge_search(text, text, text, integer, text)
+  from public, anon, authenticated;
+grant execute on function public.ai_knowledge_search(text, text, text, integer, text)
+  to service_role;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 20261105000200_ai_gateway_controls.sql
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Phase 5: server-side controls for the AI gateway.
+--
+-- The Edge Function is the only component that calls the model vendor. This
+-- migration adds the two things an isolated function cannot do by itself:
+--
+--   · a per-party request gate, so a retry storm or a compromised client cannot
+--     spend the owner's model quota without limit;
+--   · an append-only operational record of route, outcome, provider/model,
+--     latency and evidence counts.
+--
+-- Privacy boundary:
+--   · No question, image, prompt, farmer profile, crop, district or citation
+--     text is stored here. The event references the party id only so the same
+--     party can submit feedback for its own answer.
+--   · Clients have no table grants. The functions are security definer and derive
+--     the party from current_party_id(); a body field cannot claim an identity.
+--
+-- Deliberate limits:
+--   · 20 requests per minute and 300 per day per party. These are server limits,
+--     not a client timer, and they are stored so every isolate shares them.
+--   · A client request id is optional. When supplied, the unique partial index
+--     makes a replayed submission return the existing event instead of charging
+--     the rate limit twice.
+
+create table public.ai_request_events (
+  id                uuid primary key default gen_random_uuid(),
+  party_id          uuid not null references public.parties (id) on delete cascade,
+  client_request_id text,
+  route             text not null check (route in ('ask', 'diagnose')),
+  outcome           text not null default 'started'
+                    check (outcome in ('started', 'ok', 'fallback', 'failed', 'rate_limited')),
+  provider          text check (provider in ('openai', 'gemini')),
+  model             text,
+  latency_ms        integer check (latency_ms between 0 and 300000),
+  evidence_count    integer not null default 0 check (evidence_count between 0 and 20),
+  citation_count    integer not null default 0 check (citation_count between 0 and 40),
+  error_code        text,
+  created_at        timestamptz not null default now(),
+  finished_at       timestamptz,
+  constraint ai_request_events_client_id_len
+    check (client_request_id is null or char_length(client_request_id) between 1 and 80),
+  constraint ai_request_events_model_len
+    check (model is null or char_length(model) <= 120),
+  constraint ai_request_events_error_len
+    check (error_code is null or char_length(error_code) <= 80)
+);
+
+create unique index ai_request_events_party_request_uidx
+  on public.ai_request_events (party_id, client_request_id)
+  where client_request_id is not null;
+
+create index ai_request_events_party_created_idx
+  on public.ai_request_events (party_id, created_at desc);
+
+alter table public.ai_request_events enable row level security;
+revoke all on public.ai_request_events from public, anon, authenticated;
+
+create table public.ai_rate_windows (
+  party_id      uuid not null references public.parties (id) on delete cascade,
+  window_kind   text not null check (window_kind in ('minute', 'day')),
+  window_start  timestamptz not null,
+  request_count integer not null default 0 check (request_count >= 0),
+  primary key (party_id, window_kind, window_start)
+);
+
+alter table public.ai_rate_windows enable row level security;
+revoke all on public.ai_rate_windows from public, anon, authenticated;
+
+create table public.ai_answer_feedback (
+  id         uuid primary key default gen_random_uuid(),
+  event_id   uuid not null references public.ai_request_events (id) on delete cascade,
+  party_id   uuid not null references public.parties (id) on delete cascade,
+  helpful    boolean not null,
+  reason     text check (reason in ('incorrect', 'unsafe', 'unclear', 'other')),
+  created_at timestamptz not null default now(),
+  unique (event_id, party_id)
+);
+
+alter table public.ai_answer_feedback enable row level security;
+revoke all on public.ai_answer_feedback from public, anon, authenticated;
+
+comment on table public.ai_request_events is
+  'Operational AI gateway events: route, outcome, provider/model, latency and evidence counts. No question, prompt, image, profile or citation text is stored.';
+comment on table public.ai_rate_windows is
+  'Shared per-party AI request counters. The Edge Function cannot keep these in memory because isolates do not share state.';
+comment on table public.ai_answer_feedback is
+  'A bounded feedback signal for an AI answer. The event belongs to the caller; no free text is accepted.';
+
+-- ---------------------------------------------------------------------------
+-- Claim: authenticate, deduplicate, and count in one transaction.
+-- ---------------------------------------------------------------------------
+
+create or replace function public.ai_claim_request(
+  p_route      text,
+  p_request_id text default null
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_party       uuid := public.current_party_id();
+  v_route       text := lower(btrim(coalesce(p_route, '')));
+  v_request_id  text := nullif(btrim(coalesce(p_request_id, '')), '');
+  v_event       public.ai_request_events;
+  v_minute_start timestamptz := date_trunc('minute', now());
+  v_day_start    timestamptz := date_trunc('day', now());
+  v_minute_count integer;
+  v_day_count    integer;
+  v_retry        integer;
+begin
+  if v_party is null then
+    raise exception 'An authenticated party is required.' using errcode = 'insufficient_privilege';
+  end if;
+  if v_route not in ('ask', 'diagnose') then
+    raise exception 'Unknown AI route.' using errcode = 'check_violation';
+  end if;
+  if v_request_id is not null and char_length(v_request_id) > 80 then
+    raise exception 'Request id is too long.' using errcode = 'check_violation';
+  end if;
+
+  if v_request_id is not null then
+    insert into public.ai_request_events (party_id, client_request_id, route)
+    values (v_party, v_request_id, v_route)
+    on conflict (party_id, client_request_id) where client_request_id is not null
+    do nothing
+    returning * into v_event;
+
+    if v_event.id is null then
+      select *
+        into v_event
+        from public.ai_request_events
+       where party_id = v_party and client_request_id = v_request_id
+       limit 1;
+      return jsonb_build_object(
+        'allowed', false,
+        'duplicate', true,
+        'retry_after_seconds', null,
+        'event_id', v_event.id
+      );
+    end if;
+  else
+    insert into public.ai_request_events (party_id, route)
+    values (v_party, v_route)
+    returning * into v_event;
+  end if;
+
+  -- Keep two days of counters; the gate only reads the current minute and day.
+  delete from public.ai_rate_windows
+   where window_start < now() - interval '2 days';
+
+  insert into public.ai_rate_windows (party_id, window_kind, window_start, request_count)
+  values (v_party, 'minute', v_minute_start, 1)
+  on conflict (party_id, window_kind, window_start)
+  do update set request_count = public.ai_rate_windows.request_count + 1
+  returning request_count into v_minute_count;
+
+  insert into public.ai_rate_windows (party_id, window_kind, window_start, request_count)
+  values (v_party, 'day', v_day_start, 1)
+  on conflict (party_id, window_kind, window_start)
+  do update set request_count = public.ai_rate_windows.request_count + 1
+  returning request_count into v_day_count;
+
+  if v_minute_count > 20 or v_day_count > 300 then
+    update public.ai_request_events
+       set outcome = 'rate_limited',
+           error_code = 'rate_limit',
+           finished_at = now()
+     where id = v_event.id;
+
+    v_retry := case
+      when v_minute_count > 20 then
+        greatest(1, ceil(extract(epoch from (v_minute_start + interval '1 minute' - now())))::integer)
+      else
+        greatest(1, ceil(extract(epoch from (v_day_start + interval '1 day' - now())))::integer)
+    end;
+
+    return jsonb_build_object(
+      'allowed', false,
+      'duplicate', false,
+      'retry_after_seconds', v_retry,
+      'event_id', v_event.id
+    );
+  end if;
+
+  return jsonb_build_object(
+    'allowed', true,
+    'duplicate', false,
+    'retry_after_seconds', null,
+    'event_id', v_event.id
+  );
+end;
+$$;
+
+comment on function public.ai_claim_request(text, text) is
+  'Claims one AI request for the caller, deduplicating an optional client request id and enforcing the shared minute/day limits.';
+
+-- ---------------------------------------------------------------------------
+-- Finish: record operational metadata against the caller's own claim.
+-- ---------------------------------------------------------------------------
+
+create or replace function public.ai_finish_request(
+  p_event_id       uuid,
+  p_outcome        text,
+  p_provider       text default null,
+  p_model          text default null,
+  p_latency_ms     integer default null,
+  p_evidence_count integer default 0,
+  p_citation_count integer default 0,
+  p_error_code     text default null
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_party   uuid := public.current_party_id();
+  v_outcome text := lower(btrim(coalesce(p_outcome, '')));
+  v_provider text := nullif(lower(btrim(coalesce(p_provider, ''))), '');
+  v_model   text := nullif(btrim(coalesce(p_model, '')), '');
+  v_error   text := nullif(btrim(coalesce(p_error_code, '')), '');
+begin
+  if v_party is null then
+    raise exception 'An authenticated party is required.' using errcode = 'insufficient_privilege';
+  end if;
+  if p_event_id is null then
+    raise exception 'An event id is required.' using errcode = 'check_violation';
+  end if;
+  if v_outcome not in ('ok', 'fallback', 'failed') then
+    raise exception 'Unknown AI outcome.' using errcode = 'check_violation';
+  end if;
+  if v_provider is not null and v_provider not in ('openai', 'gemini') then
+    raise exception 'Unknown AI provider.' using errcode = 'check_violation';
+  end if;
+  if v_model is not null and char_length(v_model) > 120 then
+    raise exception 'Model name is too long.' using errcode = 'check_violation';
+  end if;
+
+  update public.ai_request_events
+     set outcome = v_outcome,
+         provider = v_provider,
+         model = v_model,
+         latency_ms = greatest(0, least(coalesce(p_latency_ms, 0), 300000)),
+         evidence_count = greatest(0, least(coalesce(p_evidence_count, 0), 20)),
+         citation_count = greatest(0, least(coalesce(p_citation_count, 0), 40)),
+         error_code = left(v_error, 80),
+         finished_at = now()
+   where id = p_event_id
+     and party_id = v_party
+     and outcome = 'started';
+
+  return found;
+end;
+$$;
+
+comment on function public.ai_finish_request(uuid, text, text, text, integer, integer, integer, text) is
+  'Completes the caller''s own AI event. It cannot update another party''s event or overturn a rate-limited claim.';
+
+-- ---------------------------------------------------------------------------
+-- Feedback: a bounded signal, never free text.
+-- ---------------------------------------------------------------------------
+
+create or replace function public.ai_feedback(
+  p_request_id text,
+  p_helpful    boolean,
+  p_reason     text default null
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_party      uuid := public.current_party_id();
+  v_request_id text := nullif(btrim(coalesce(p_request_id, '')), '');
+  v_reason     text := nullif(lower(btrim(coalesce(p_reason, ''))), '');
+  v_event_id   uuid;
+begin
+  if v_party is null then
+    raise exception 'An authenticated party is required.' using errcode = 'insufficient_privilege';
+  end if;
+  if v_request_id is null or char_length(v_request_id) > 80 then
+    raise exception 'A valid request id is required.' using errcode = 'check_violation';
+  end if;
+  if p_helpful is null then
+    raise exception 'Feedback must be helpful or not helpful.' using errcode = 'check_violation';
+  end if;
+  if v_reason is not null and v_reason not in ('incorrect', 'unsafe', 'unclear', 'other') then
+    raise exception 'Unknown feedback reason.' using errcode = 'check_violation';
+  end if;
+
+  select id
+    into v_event_id
+    from public.ai_request_events
+   where party_id = v_party
+     and client_request_id = v_request_id
+     and outcome in ('ok', 'fallback')
+   order by created_at desc
+   limit 1;
+
+  if v_event_id is null then
+    raise exception 'No answered request matches that request id.' using errcode = 'no_data_found';
+  end if;
+
+  insert into public.ai_answer_feedback (event_id, party_id, helpful, reason)
+  values (v_event_id, v_party, p_helpful, v_reason)
+  on conflict (event_id, party_id)
+  do update set helpful = excluded.helpful,
+                reason = excluded.reason,
+                created_at = now();
+
+  return true;
+end;
+$$;
+
+comment on function public.ai_feedback(text, boolean, text) is
+  'Records one bounded feedback signal for the caller''s own answered request.';
+
+-- ---------------------------------------------------------------------------
+-- Grants
+-- ---------------------------------------------------------------------------
+
+revoke execute on function public.ai_claim_request(text, text) from public, anon;
+revoke execute on function public.ai_finish_request(uuid, text, text, text, integer, integer, integer, text) from public, anon;
+revoke execute on function public.ai_feedback(text, boolean, text) from public, anon;
+
+grant execute on function public.ai_claim_request(text, text) to authenticated;
+grant execute on function public.ai_finish_request(uuid, text, text, text, integer, integer, integer, text) to authenticated;
+grant execute on function public.ai_feedback(text, boolean, text) to authenticated;
 
 commit;

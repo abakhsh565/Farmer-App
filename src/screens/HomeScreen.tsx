@@ -61,11 +61,13 @@ export function HomeScreen({
   onOpenProfile,
   onOpenLocationSearch,
   onOpenCommunity,
+  onOpenWeather,
 }: {
   onScan: () => void;
   onOpenProfile: () => void;
   onOpenLocationSearch: () => void;
   onOpenCommunity: () => void;
+  onOpenWeather: () => void;
 }) {
   const { t, locale, tIn } = useLocale();
   const credit = useCredit();
@@ -397,14 +399,24 @@ export function HomeScreen({
         ) : null}
 
         {reading !== null && reading.data.tempC !== null ? (
-          <div className="mt-3 flex items-center gap-3">
+          /*
+            The card's number is the door to the sky. It used to be a plain block,
+            which left the fuller weather screen with no way in from the only
+            surface that carries weather. Listen and Refresh sit outside this
+            control, so each press still does exactly one thing.
+          */
+          <button
+            type="button"
+            onClick={onOpenWeather}
+            className="mt-3 flex w-full items-center gap-3 text-start motion-safe:transition-transform motion-safe:active:scale-95"
+          >
             <Cloud className="size-9 shrink-0 text-white" aria-hidden />
             {/* lining-nums matters: Cormorant defaults to old-style figures, and a
                 temperature set in text figures reads as a broken number. */}
-            <p className="font-serif text-display lining-nums tabular-nums">
+            <span className="font-serif text-display lining-nums tabular-nums">
               {Math.round(reading.data.tempC)}°
-            </p>
-            <p className="text-label leading-relaxed text-white/70">
+            </span>
+            <span className="block text-label leading-relaxed text-white/70">
               {reading.data.conditionKey
                 ? t(reading.data.conditionKey)
                 : (reading.data.conditionText ?? '')}
@@ -415,8 +427,13 @@ export function HomeScreen({
               {reading.data.windKph !== null
                 ? t('weather.windValue', { speed: Math.round(reading.data.windKph) })
                 : ''}
-            </p>
-          </div>
+            </span>
+            <ChevronRight
+              className="ms-auto size-4 shrink-0 self-start text-white/60 rtl:rotate-180"
+              aria-hidden
+            />
+            <span className="sr-only">{t('weather.open')}</span>
+          </button>
         ) : null}
 
         {weatherUsable ? (
@@ -513,7 +530,7 @@ export function HomeScreen({
         one question asked two ways. The block this replaced was a second, louder
         answer to the same question, with the same destination.
       */}
-      <CropCard onScan={onScan} />
+      <CropCard onScan={onScan} onOpenWeather={onOpenWeather} />
 
       {/*
         The credit card is account data, so before there is an account it is not

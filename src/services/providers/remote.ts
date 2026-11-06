@@ -604,10 +604,9 @@ export class RemoteAiProvider implements AiProvider {
   /**
    * The farmer's own token, when there is one.
    *
-   * The gateway accepts guests, so this is not authorisation — it is how a
-   * signed-in question is attributed to the party that asked it. A body field
-   * claiming an identity would be trusted by nobody, which is why the identity
-   * travels in the header the server can verify.
+   * The gateway requires a signed-in party for both answer routes, so this is
+   * the authorisation boundary as well as the attribution: the identity travels
+   * in the header the server verifies, never in a body field.
    */
   private async authHeaders(): Promise<Record<string, string>> {
     const token = await currentAccessToken();
@@ -620,6 +619,19 @@ export class RemoteAiProvider implements AiProvider {
 
   async diagnose(imageRef: string, context: AiContext): Promise<AiScanResult> {
     return this.post<AiScanResult>('/diagnose', { imageRef, context });
+  }
+
+  /**
+   * Feedback is keyed by the opaque request id returned with an answer. It is
+   * separate from the answer path so a feedback failure can never hide or change
+   * the advice the farmer received.
+   */
+  async feedback(
+    requestId: string,
+    helpful: boolean,
+    reason?: 'incorrect' | 'unsafe' | 'unclear' | 'other',
+  ): Promise<void> {
+    await this.post<{ ok: true }>('/feedback', { requestId, helpful, ...(reason ? { reason } : {}) });
   }
 }
 

@@ -263,6 +263,13 @@ insert into public.party_capabilities (party_id, capability) values ('$ADMIN', '
 on conflict (party_id, capability) do update set revoked_at = null;" >/dev/null
 
 echo
+echo "-- source reuse permission is an admin decision, not an inference --"
+case_out "a farmer records source terms" refuse authenticated "$AUTH_FARMER" \
+  "select code from public.agri_set_source_terms('uaf','granted','CC BY 4.0')"
+case_out "an admin grants a licence with no name" refuse authenticated "$AUTH_ADMIN" \
+  "select code from public.agri_set_source_terms('uaf','granted',null)"
+
+echo
 echo "-- the expert is made an expert through the real gate, not by hand --"
 # A verified contact is the PRD's first precondition, and a confirmed
 # qualification is the second. Both are done here the way the product does them.
@@ -493,6 +500,86 @@ case_out "an expert activates a threshold" refuse authenticated "$AUTH_EXPERT" \
   "select code from public.activate_forecast_risk_rule('spray-wind-too-strong', 'Looks fine to me')"
 case_out "an admin activates it without a reason" refuse authenticated "$AUTH_ADMIN" \
   "select code from public.activate_forecast_risk_rule('spray-wind-too-strong', '')"
+# A reason is not evidence: the rule still has no reviewed dossier at this point.
+case_out "an admin activates it without reviewed evidence" refuse authenticated "$AUTH_ADMIN" \
+  "select code from public.activate_forecast_risk_rule('spray-wind-too-strong', 'The threshold looks operationally sensible')"
+# The seed cites supplementary editorial text, which is why the case above must
+# refuse. In this throwaway database only, the fixture is promoted through the
+# same guards production uses: a published evidence dossier for the entry and
+# one for the rule, each clearly labelled as harness data. This is not staging
+# evidence, and the reviewer fields point at the harness admin solely because the
+# table requires an identified reviewer. It is fixture setup, not an approval.
+psql_root -v ON_ERROR_STOP=1 <<SQL
+with entry as (
+  select id from public.agri_knowledge_entries where slug = 'spray-wind'
+), dossier as (
+  insert into public.agri_evidence_items (
+    evidence_key, target_kind, target_ref, version,
+    source_organization, source_type, source_code, source_url,
+    document_title, published_on, topic, classification, status,
+    source_check_status, applicability_status, agronomic_status,
+    submitted_by, submitted_at, reviewer_id, reviewed_at, review_note,
+    valid_from, valid_until, published_at, created_by
+  )
+  select
+    'harness-spray-wind-entry', 'knowledge_entry', entry.id::text, 1,
+    'Punjab Agriculture Department', 'official_extension', 'punjab_agri',
+    'https://agripunjab.gov.pk/',
+    'Harness fixture: spray-wind entry', current_date, 'other',
+    'official_government', 'published', 'authentic', 'applicable', 'approved',
+    (select id from public.parties where auth_user_id = '$AUTH_ADMIN'), now(),
+    (select id from public.parties where auth_user_id = '$AUTH_ADMIN'), now(),
+    'Throwaway-database harness fixture, not a real review.',
+    now() - interval '1 day', now() + interval '1 year', now(),
+    (select id from public.parties where auth_user_id = '$AUTH_ADMIN')
+  from entry
+  returning id
+)
+update public.agri_knowledge_entries e
+   set evidence_item_id = d.id,
+       evidence_tier = 'verified',
+       source_code = 'punjab_agri',
+       source_url = 'https://agripunjab.gov.pk/',
+       source_accessed_on = current_date
+  from dossier d
+ where e.slug = 'spray-wind';
+
+insert into public.agri_evidence_items (
+  evidence_key, target_kind, target_ref, version,
+  source_organization, source_type, source_code, source_url,
+  document_title, published_on, topic, classification, status,
+  source_check_status, applicability_status, agronomic_status,
+  submitted_by, submitted_at, reviewer_id, reviewed_at, review_note,
+  valid_from, valid_until, published_at, created_by
+)
+values (
+  'harness-spray-wind-rule', 'forecast_rule', 'spray-wind-too-strong', 1,
+  'Punjab Agriculture Department', 'official_extension', 'punjab_agri',
+  'https://agripunjab.gov.pk/',
+  'Harness fixture: spray-wind rule', current_date, 'weather_damage',
+  'official_government', 'published', 'authentic', 'applicable', 'approved',
+  (select id from public.parties where auth_user_id = '$AUTH_ADMIN'), now(),
+  (select id from public.parties where auth_user_id = '$AUTH_ADMIN'), now(),
+  'Throwaway-database harness fixture, not a real review.',
+  now() - interval '1 day', now() + interval '1 year', now(),
+  (select id from public.parties where auth_user_id = '$AUTH_ADMIN')
+);
+
+update public.forecast_risk_rules r
+   set evidence_item_id = (
+     select id from public.agri_evidence_items
+      where evidence_key = 'harness-spray-wind-rule')
+ where r.code = 'spray-wind-too-strong';
+SQL
+
+expect_eq "the fixture promotion is in place" \
+  "$(psql_value "select evidence_tier || '/' || (source_url is not null)::text || '/' || (evidence_item_id is not null)::text from public.agri_knowledge_entries where slug = 'spray-wind'")" "verified/true/true"
+
+EVIDENCE_ID="$(psql_value "select id from public.agri_evidence_items where evidence_key = 'harness-spray-wind-entry'")"
+case_out "a farmer publishes evidence" refuse authenticated "$AUTH_FARMER" \
+  "select status from public.agri_publish_evidence('$EVIDENCE_ID', null)"
+case_out "a farmer withdraws published evidence" refuse authenticated "$AUTH_FARMER" \
+  "select status from public.agri_withdraw_evidence('$EVIDENCE_ID', 'I disagree')"
 case_out "an admin activates it with a reason" allow authenticated "$AUTH_ADMIN" \
   "select is_active::text from public.activate_forecast_risk_rule('spray-wind-too-strong', 'Extension guidance: do not spray above 20 km/h; signed off by the division agronomist')"
 

@@ -235,6 +235,8 @@ export type AiAnswer = {
    * Optional so an older gateway remains a valid response.
    */
   generation?: 'model' | 'retrieval';
+  /** Opaque id for feedback and retry deduplication; never a farmer id. */
+  requestId?: string;
   /**
    * Internal provenance. Optional so an older gateway remains a valid response;
    * the screens do not render this object.
@@ -257,6 +259,8 @@ export type AiScanResult = {
   };
   citations: AiCitation[];
   escalate: boolean;
+  /** Opaque id for feedback and retry deduplication; never a farmer id. */
+  requestId?: string;
 };
 
 export interface AiProvider {

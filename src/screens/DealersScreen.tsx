@@ -5,7 +5,6 @@ import {
   Search,
   ShieldCheck,
   SlidersHorizontal,
-  Sprout,
   TriangleAlert,
 } from 'lucide-react';
 import { useState } from 'react';
@@ -15,16 +14,13 @@ import { EmptyState, ErrorState, LoadingState } from '@/components/States';
 import { Button } from '@/components/ui/button';
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from '@/components/ui/sheet';
 import {
-  AREAS,
   MAX_RADIUS_KM,
   PROFILE_AREA,
   RADIUS_OPTIONS,
   areaNameKey,
-  areaPoint,
   closingHour,
   dealerNameKey,
   tagLabel,
-  type AreaId,
   type DealerTag,
 } from '@/data/dealers';
 import { useLocale } from '@/i18n/LocaleProvider';
@@ -33,7 +29,7 @@ import type { MessageKey } from '@/i18n/catalog';
 import { formatDay, formatHour, formatMoney, formatNumber, formatRelativeTime } from '@/i18n/format';
 import { initialsOf } from '@/lib/initials';
 import { useSession } from '@/session/SessionProvider';
-import { useDealerProducts, useDealerSearch } from '@/services/hooks';
+import { useDealerProducts, useDealerSearch, useProductSearch } from '@/services/hooks';
 import type { DealerProduct, DealerSummary } from '@/services/types';
 import { useVisits } from '@/visits/VisitProvider';
 
@@ -79,9 +75,9 @@ export function DealersScreen({
 }) {
   const { t, locale } = useLocale();
   const [filter, setFilter] = useState<FilterId>('all');
-  /** null means the profile location; anything else is a search that stays temporary. */
-  const [areaId, setAreaId] = useState<AreaId | null>(null);
   const [profileId, setProfileId] = useState<string | null>(null);
+  /** Two answers in one shop: the shelf (products) and the shops (dealers). */
+  const [shopSection, setShopSection] = useState<'products' | 'dealers'>('dealers');
 
   /*
    * Where the search is about lives above the screen, in the location store, and
@@ -92,7 +88,7 @@ export function DealersScreen({
    */
   const location = useLocation();
 
-  const searchedArea = areaId ?? PROFILE_AREA;
+  const searchedArea = PROFILE_AREA;
   /*
    * The origin a search passes.
    *
@@ -122,25 +118,17 @@ export function DealersScreen({
     tags: filter === 'all' || filter === 'open' ? undefined : [filter],
   });
 
-  /**
-   * Choosing a place to look is temporary by construction — it writes to the
-   * session's search area and nothing else. Keeping it on the account is a
-   * separate act with its own control, below.
+  /*
+   * The product half of the shop. No keyword: this tab is the shelf itself —
+   * every listing the shops near the farmer have actually sent, with that
+   * shop's own price and stock. A keyword belongs on the search page, one tap
+   * away, which answers about shops and stock together.
    */
-  const applyArea = (next: AreaId | null) => {
-    setAreaId(next);
-    if (next === null) {
-      location.clearTemporary();
-      return;
-    }
-    const point = areaPoint(next);
-    location.setTemporary({
-      label: t(areaNameKey(next)),
-      lat: point.lat,
-      lon: point.lon,
-      source: 'search',
-    });
-  };
+  const products = useProductSearch({
+    radiusKm: location.radiusKm,
+    origin: searchOrigin,
+    query: '',
+  });
 
   /**
    * The explicit save.
@@ -175,7 +163,6 @@ export function DealersScreen({
          * owns, and the two labels would contradict each other.
          */
         location.clearTemporary();
-        setAreaId(null);
         toast.success(t('location.savedToast'));
       } catch (failure) {
         toast.error(
@@ -198,6 +185,12 @@ export function DealersScreen({
     return key ? t(key) : entry.name;
   };
 
+  /** The same naming rule for a row that only carries a dealer id. */
+  const dealerLabel = (id: string, fallback: string) => {
+    const key = dealerNameKey(id);
+    return key ? t(key) : fallback;
+  };
+
   return (
     <div className="flex flex-col px-4 pt-4 pb-4">
       <header className="flex items-center justify-between gap-3">
@@ -211,9 +204,7 @@ export function DealersScreen({
           */}
           <SearchSettingsSheet
             radius={location.radiusKm}
-            areaId={areaId}
             onChangeRadius={location.setRadiusKm}
-            onChangeArea={applyArea}
             onOpenLocationSearch={onOpenLocationSearch}
           />
         </div>
@@ -270,6 +261,38 @@ export function DealersScreen({
         </div>
       </section>
 
+      {/*
+        The shop's two halves, directly under the place they are measured from.
+        The shelf is what a farmer came to price; the list is where they walk to.
+        Both keep the same radius and area, so switching cannot quietly change
+        the ground either one covers.
+      */}
+      <div
+        role="tablist"
+        aria-label={t('shop.tabsAria')}
+        className="mt-3 grid grid-cols-2 gap-1 rounded-full bg-muted p-1"
+      >
+        {(['products', 'dealers'] as const).map((id) => {
+          const active = shopSection === id;
+          return (
+            <button
+              key={id}
+              type="button"
+              role="tab"
+              aria-selected={active}
+              onClick={() => setShopSection(id)}
+              className={`h-10 rounded-full text-body-sm font-medium leading-none ${
+                active ? 'bg-primary text-primary-foreground' : 'text-muted-foreground'
+              }`}
+            >
+              {id === 'products' ? t('shop.tabProducts') : t('shop.tabDealers')}
+            </button>
+          );
+        })}
+      </div>
+
+      {shopSection === 'dealers' ? (
+        <>
       {/*
         Opens the search page rather than filtering this list in place. Filtering
         here could only ever match a shop's *name*, so a farmer who searched
@@ -441,6 +464,110 @@ export function DealersScreen({
           </ul>
         </>
       ) : null}
+        </>
+      ) : null}
+
+      {shopSection === 'products' ? (
+        <>
+          {products.status === 'loading' ? <LoadingState label={t('rates.loading')} /> : null}
+
+          {products.status === 'error' ? (
+            <ErrorState
+              title={t('shop.tabProducts')}
+              body={products.error ?? t('otp.network')}
+              onRetry={products.retry}
+              retryLabel={t('common.tryAgain')}
+            />
+          ) : null}
+
+          {products.status === 'ready' ? (
+            <>
+              <SectionLabel className="mt-3.5">
+                {t('shop.products.count', {
+                  count: products.data.length,
+                  km: location.radiusKm,
+                })}
+              </SectionLabel>
+
+              {products.data.length === 0 ? (
+                <EmptyState
+                  title={t('shop.products.emptyTitle')}
+                  body={t('shop.products.emptyBody', { km: location.radiusKm })}
+                />
+              ) : null}
+
+              <ul className="mt-2 space-y-2.5">
+                {products.data.map((hit) => {
+                  const name = dealerLabel(hit.dealerId, hit.dealerName);
+                  return (
+                    <li
+                      key={`${hit.dealerId}-${hit.product.id}`}
+                      className="flex items-start justify-between gap-3 rounded-lg border border-border bg-card p-3"
+                    >
+                      <span className="min-w-0">
+                        <span className="block truncate text-body font-medium">
+                          {hit.product.name}
+                        </span>
+                        <span className="mt-0.5 block truncate text-caption text-muted-foreground">
+                          {hit.product.brand ? `${hit.product.brand} · ` : ''}
+                          {hit.product.packSize ?? ''}
+                        </span>
+                        <span
+                          className={`mt-1 block text-caption ${
+                            hit.product.inStock === false
+                              ? 'text-amber-700 dark:text-amber-100'
+                              : 'text-muted-foreground'
+                          }`}
+                        >
+                          {hit.product.inStock === true && hit.product.availableQty !== null
+                            ? t('dealer.products.inStock', { qty: hit.product.availableQty })
+                            : hit.product.inStock === false
+                              ? t('dealer.products.outOfStock')
+                              : t('dealer.products.unknownQty')}
+                        </span>
+                        <span className="mt-0.5 block truncate text-caption text-muted-foreground">
+                          {t('search.product.shop', {
+                            shop: name,
+                            km: t('common.km', {
+                              km: formatNumber(hit.distanceKm, locale),
+                            }),
+                          })}
+                        </span>
+                      </span>
+
+                      <span className="flex shrink-0 flex-col items-end gap-1.5">
+                        {hit.product.unitPrice !== null ? (
+                          <span className="text-label tabular-nums">
+                            {formatMoney(hit.product.unitPrice, locale, t)}
+                          </span>
+                        ) : (
+                          <span className="text-caption text-muted-foreground">
+                            {t('scan.product.askPrice')}
+                          </span>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => onOpenChat(hit.dealerId)}
+                          aria-label={t('dealers.chatAria', { name })}
+                          className="grid size-9 shrink-0 place-items-center rounded-full bg-muted"
+                        >
+                          <MessageCircle className="size-4" aria-hidden />
+                        </button>
+                      </span>
+                    </li>
+                  );
+                })}
+              </ul>
+
+              {products.sourced?.sourceLabel ? (
+                <p className="mt-2 text-caption text-muted-foreground">
+                  {products.sourced.sourceLabel}
+                </p>
+              ) : null}
+            </>
+          ) : null}
+        </>
+      ) : null}
 
       <Sheet open={dealer !== undefined} onOpenChange={(next) => (next ? null : setProfileId(null))}>
         <SheetContent
@@ -467,26 +594,30 @@ export function DealersScreen({
   );
 }
 
-/* ── search settings: radius and the temporary area ──────────────────────── */
+/* ── search settings: the place, and how far to look ─────────────────────── */
 
 function SearchSettingsSheet({
   radius,
-  areaId,
   onChangeRadius,
-  onChangeArea,
   onOpenLocationSearch,
 }: {
   radius: number;
-  areaId: AreaId | null;
   onChangeRadius: (next: number) => void;
-  onChangeArea: (next: AreaId | null) => void;
   onOpenLocationSearch: () => void;
 }) {
   const { t } = useLocale();
-  /* Read from the location store rather than a constant: "my profile location"
-     has to name the place the account actually holds, or it names a place the
-     farmer never chose. */
   const location = useLocation();
+
+  /*
+   * Two facts, in the order a farmer thinks about them: where the app is reading
+   * from, then the circle drawn around it.
+   *
+   * The four hard-coded towns that used to be listed here looked like a choice
+   * but were not one: they could only ever be the same four places, while the
+   * search page can find any village in the country. So the row states the place
+   * and "Change" opens the page that can actually change it — one destination,
+   * not a second list that competes with it.
+   */
   return (
     <Sheet>
       <SheetTrigger asChild>
@@ -502,37 +633,26 @@ function SearchSettingsSheet({
         <SheetHeader>
           <SheetTitle>{t('dealer.search.settings')}</SheetTitle>
         </SheetHeader>
-        <div className="flex flex-col gap-4 p-4 pt-0">
-          {/*
-            Where the farmer is, first — it is the filter that changes every
-            other number in this sheet, and the one they came here to set.
-            Tapping it opens a page to type the name of the place; the place
-            they tap there is saved straight away and this sheet is gone by the
-            time they are back, because the whole screen returns with the list.
-          */}
+
+        <div className="flex flex-col gap-5 p-4 pt-0">
           <section>
-            <SectionLabel>{t('location.current')}</SectionLabel>
-            {/*
-              The label names the action and the row shows the current value —
-              a button whose only name was the place already set would read as a
-              statement rather than as something that opens a search.
-            */}
-            <button
-              type="button"
-              aria-label={t('location.title')}
-              onClick={onOpenLocationSearch}
-              className="mt-2 flex h-11 w-full items-center gap-2.5 rounded-md bg-muted px-3.5 text-start text-body"
-            >
-              <Search className="size-4 shrink-0 text-muted-foreground" aria-hidden />
-              <span className="truncate">{location.placeLabel || t('location.none')}</span>
-            </button>
-            <p className="mt-2 text-caption text-muted-foreground">
-              {t('location.searchBarHint')}
-            </p>
+            <p className="text-label text-muted-foreground">{t('location.current')}</p>
+            <div className="mt-1 flex items-start justify-between gap-3">
+              <p className="min-w-0 flex-1 truncate text-body font-medium">
+                {location.placeLabel || t('location.none')}
+              </p>
+              <button
+                type="button"
+                onClick={onOpenLocationSearch}
+                className="shrink-0 rounded-full py-0.5 text-label font-medium text-brand motion-safe:transition-transform motion-safe:active:scale-95"
+              >
+                {t('location.changePlace')}
+              </button>
+            </div>
           </section>
 
           <section>
-            <SectionLabel>{t('dealer.search.radius')}</SectionLabel>
+            <p className="text-label text-muted-foreground">{t('dealer.search.currentRadius')}</p>
             <ul className="mt-2 flex flex-wrap gap-2">
               {RADIUS_OPTIONS.map((km) => {
                 const active = km === radius;
@@ -543,7 +663,9 @@ function SearchSettingsSheet({
                       aria-pressed={active}
                       onClick={() => onChangeRadius(km)}
                       className={`rounded-full px-3.5 py-2 text-body-sm font-medium leading-none ${
-                        active ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground'
+                        active
+                          ? 'bg-primary text-primary-foreground'
+                          : 'bg-muted text-muted-foreground'
                       }`}
                     >
                       {t('dealer.search.radiusValue', { km })}
@@ -552,53 +674,6 @@ function SearchSettingsSheet({
                 );
               })}
             </ul>
-            <p className="mt-2 text-caption text-muted-foreground">
-              {t('dealer.search.max', { km: MAX_RADIUS_KM })}
-            </p>
-          </section>
-
-          <section>
-            <SectionLabel>{t('dealer.search.area')}</SectionLabel>
-            <ul className="mt-2 space-y-1.5">
-              <li>
-                <button
-                  type="button"
-                  aria-pressed={areaId === null}
-                  onClick={() => onChangeArea(null)}
-                  className={`flex w-full items-center gap-2 rounded-md px-3 py-2.5 text-start text-body ${
-                    areaId === null ? 'bg-brand-soft text-brand' : 'bg-muted text-muted-foreground'
-                  }`}
-                >
-                  <Sprout className="size-4 shrink-0" aria-hidden />
-                  {t('dealer.search.profile')}
-                  {location.saved ? ` · ${location.saved.label}` : ` · ${t('location.none')}`}
-                </button>
-              </li>
-              {AREAS.map((entry) => {
-                const active = areaId === entry.id;
-                return (
-                  <li key={entry.id}>
-                    <button
-                      type="button"
-                      aria-pressed={active}
-                      onClick={() => onChangeArea(entry.id)}
-                      className={`w-full rounded-md px-3 py-2.5 text-start text-body ${
-                        active ? 'bg-brand-soft text-brand' : 'bg-muted text-muted-foreground'
-                      }`}
-                    >
-                      {t(entry.nameKey)}
-                    </button>
-                  </li>
-                );
-              })}
-            </ul>
-            {areaId ? (
-              <p className="mt-2 text-body-sm text-muted-foreground">
-                {t('dealer.search.temp', {
-                  place: location.saved?.label ?? t('location.none'),
-                })}
-              </p>
-            ) : null}
           </section>
         </div>
       </SheetContent>

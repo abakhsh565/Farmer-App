@@ -24,7 +24,10 @@
     "provision:demo": "node --disable-warning=ExperimentalWarning scripts/provision-demo-farmers.ts",
     "import:advisories": "node scripts/import-advisories.mjs",
     "import:market": "node scripts/import-market.mjs",
-    "verify:isolation": "bash scripts/verify-isolation.sh"
+    "verify:isolation": "bash scripts/verify-isolation.sh",
+    "verify:ai-controls": "bash scripts/verify-ai-controls.sh",
+    "verify:recovery": "bash scripts/verify-recovery.sh",
+    "verify:performance": "bash scripts/verify-performance.sh"
   },
   "dependencies": {
     "@capacitor/android": "^8.5.2",
@@ -40,7 +43,6 @@
     "class-variance-authority": "^0.7.1",
     "cn": "^0.4.0",
     "lucide-react": "^1.48.0",
-    "maplibre-gl": "^6.12.0",
     "onnxruntime-web": "^1.30.0",
     "posthog-js": "^1.435.8",
     "radix-ui": "^1.6.7",

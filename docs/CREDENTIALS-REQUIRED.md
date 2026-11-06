@@ -87,7 +87,7 @@ cannot execute DDL — which is why the schema is still unapplied.
 dashboard's function editor.
 
 ```
-supabase functions deploy ai otp weather-ingest market-ingest climate-ingest advisory-ingest forecast-ingest
+supabase functions deploy ai otp weather-ingest market-ingest climate-ingest advisory-ingest forecast-ingest soil-ingest
 ```
 
 Each one states in its own header what it will not do without a source — a
@@ -97,10 +97,13 @@ empty table.
 **3. Set the function secrets.** `OPENAI_API_KEY` (rotated — see below) or
 `GEMINI_API_KEY`, `OTP_HASH_SECRET` (any long random string), and
 `OTP_DELIVERY_URL` + `OTP_DELIVERY_TOKEN` once an SMS provider exists. For live
-mandi rates, `AMIS_FEED_URL` (+ `AMIS_FEED_TOKEN`) or `MARKET_FEED_URL`. For the
-district forecast, `WEATHERAPI_KEY` — used by `forecast-ingest` to fill
-`climate_forecasts`; with it unset, that function records a failed run naming the
-missing secret rather than returning an empty forecast.
+mandi rates, `AMIS_FEED_URL` (+ `AMIS_FEED_TOKEN`) or `MARKET_FEED_URL`.
+
+The district forecast now defaults to **keyless Open-Meteo ECMWF IFS** in
+`forecast-ingest`, because that is the provider/model the Layyah calibration was
+trained on. No `WEATHERAPI_KEY` is needed for that path. WeatherAPI remains an
+explicit alternative (`provider=weatherapi`) and still starts a recorded failed
+run if its key is missing.
 
 The AI gateway supports **both** OpenAI and Gemini. `AI_PROVIDER` chooses one
 (`openai` or `gemini`); with it unset, whichever key is present wins, OpenAI
@@ -123,7 +126,8 @@ function secret — never in chat, never in `.env.local`.
 | Service | Why needed | Exact credential / access | Where it will be used | Required for |
 | --- | --- | --- | --- | --- |
 | **Supabase: apply the schema** (see §0) | The project is configured and verified, but has no tables — the 30 migrations have nowhere to land without a DDL-capable credential | One of: the database password, an `sbp_…` personal access token, or a paste of `supabase/apply-all.sql` into the SQL Editor | Nothing client-side — the remote providers already read the schema that this creates | **Blocks the backend.** Real auth, real persistence, real market and dealer data |
-| **WeatherAPI.com** | Live weather instead of a fixture, and the **district forecast** (NASA POWER has no forecast product — its temporal services are near-real-time only) | API key (free tier is enough to start); set as the `WEATHERAPI_KEY` secret on the `forecast-ingest` function | `weather_readings` ingestion adapter, run on a schedule; read by UI and AI through the same normalised service. `forecast-ingest` writes the 3-day horizon to `climate_forecasts`, keyed by issue date so a revised forecast never overwrites what was believed yesterday | Weather in UI and in AI advice; the forecast_risk rows in the intel feed. **Licence caveat:** the site advertises commercial use on the free plan while its general T&C says otherwise, so `intel_sources` keeps this at `needs_permission` until that is confirmed in writing |
+| **Open-Meteo ECMWF IFS** (default) | The district forecast and the provider/model used by the trained Layyah bias correction | **No key.** `forecast-ingest` defaults to `provider=open_meteo`; no secret is configured | `forecast-ingest` writes a 7-day horizon to `climate_forecasts`; the active model applies only to `open_meteo` + `layyah` | Weather/forecast risks and the calibrated model. **Licence caveat:** the free tier is non-commercial; commercial deployment needs the paid plan or another licensed source. `intel_sources` records the limitation |
+| **WeatherAPI.com** (optional) | Alternative district forecast if a commercial WeatherAPI licence is confirmed | `WEATHERAPI_KEY` and an explicit `provider=weatherapi` request; the free horizon is 3 days | `forecast-ingest` alternative path. It is not selected silently, because the trained ECMWF model must not be applied to a different vendor's raw value | Optional forecast path only. The prior licence ambiguity remains recorded in `intel_sources` |
 | **AMIS Punjab market data** | Real mandi rates. The PRD forbids inventing an AMIS key, so this needs the real thing | Feed endpoint and/or registered credentials, or your written approval of a named alternative source | `market_observations` ingestion adapter → the internal `market_rates()` API | Market rates |
 | **SMS / OTP provider** | The sign-in *machine* is built and the `otp` function is written: codes are generated from a CSPRNG, stored as HMACs (never plaintext), and limited to 5 sends an hour and 3 attempts a code. What is missing is the sender | Name, e.g. Twilio or a Pakistani aggregator: account SID, auth token, sender/mask ID, and a template approved for Urdu. Set as `OTP_DELIVERY_URL` + `OTP_DELIVERY_TOKEN` on the `otp` function, plus a generated `OTP_HASH_SECRET` | The `otp` Edge Function. **With no provider configured it reports `deliveredVia: "none (not delivered)"` and a `deliveryError`, rather than claiming a code was sent** | Real authentication, and the "verified identity" precondition for expert verification |
 | **Firebase Cloud Messaging** | Push delivery. The PRD's notification requirement is not satisfied by an in-app list | `google-services.json` for Android, plus a service account JSON for server-side sends | `notification_events` dispatch Edge Function; `google-services.json` into `android/app/` | Real notifications |

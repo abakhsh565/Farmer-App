@@ -1,0 +1,113 @@
+{
+  "artifact_file": "forecast-bias-layyah.json",
+  "model_code": "ecmwf_ifs_forecast_bias_layyah",
+  "version": 1,
+  "district": "layyah",
+  "coordinates": {
+    "lat": 30.9648,
+    "lon": 70.9399
+  },
+  "algorithm": "ridge_linear_bias_correction",
+  "feature_names": [
+    "intercept",
+    "raw",
+    "lead_day",
+    "month_sin",
+    "month_cos"
+  ],
+  "training_start": "2025-01-04",
+  "training_end": "2026-10-24",
+  "started_at": "2026-11-04T19:44:53.200Z",
+  "finished_at": "2026-11-04T19:44:53.200Z",
+  "trained_at": "2026-11-04T19:44:53.200Z",
+  "samples": {
+    "forecast_rows": 658,
+    "complete_rows": 648,
+    "unavailable_runs": 1,
+    "train_rows": 455,
+    "test_rows": 193
+  },
+  "sources": [
+    "https://single-runs-api.open-meteo.com/v1/forecast",
+    "https://power.larc.nasa.gov/api/temporal/daily/point",
+    "https://open-meteo.com/en/docs/single-runs-api",
+    "https://power.larc.nasa.gov/docs/services/api/temporal/daily/"
+  ],
+  "provenance": {
+    "forecast_provider": "open_meteo",
+    "forecast_model": "ecmwf_ifs",
+    "forecast_run": "00 UTC archived run",
+    "reference_provider": "nasa_power",
+    "reference_product": "MERRA-2 daily reanalysis, 0.5 degree",
+    "license": "Open-Meteo CC BY 4.0 (free tier non-commercial); NASA POWER open data with attribution",
+    "limitation": "Reanalysis reference and global forecast grid; not a field or station measurement. Do not present holdout metrics as field accuracy."
+  },
+  "models": {
+    "tmax": {
+      "target": "forecast_tmax_c",
+      "coefficients": [
+        6.877793263917056,
+        0.8721785949652248,
+        -0.08844602860594315,
+        0.6844755964720441,
+        -0.7257473847938721
+      ],
+      "train_rows": 455,
+      "test_rows": 193,
+      "metrics": {
+        "test_rows": 193,
+        "train_rows": 455,
+        "raw_mae": 3.598,
+        "calibrated_mae": 1.772,
+        "improvement_pct": 50.75,
+        "raw_rmse": 3.973,
+        "calibrated_rmse": 2.171,
+        "raw_bias": -3.593,
+        "calibrated_bias": -1.373,
+        "train_raw_mae": 2.994,
+        "train_calibrated_mae": 1.475,
+        "test_start": "2026-04-11",
+        "test_end": "2026-10-24",
+        "train_start": "2025-01-04",
+        "train_end": "2026-04-04",
+        "reference": "NASA POWER daily reanalysis (0.5 degree)",
+        "forecast": "ECMWF IFS archived 00 UTC run via Open-Meteo Single Runs API",
+        "caveat": "Model-to-model comparison; not a station-observation validation."
+      },
+      "confidence": 0.95
+    },
+    "tmin": {
+      "target": "forecast_tmin_c",
+      "coefficients": [
+        3.672275915341093,
+        0.8662820463208103,
+        0.016503879529202875,
+        0.03530063705993436,
+        -2.089702943462793
+      ],
+      "train_rows": 455,
+      "test_rows": 193,
+      "metrics": {
+        "test_rows": 193,
+        "train_rows": 455,
+        "raw_mae": 2.011,
+        "calibrated_mae": 1.209,
+        "improvement_pct": 39.88,
+        "raw_rmse": 2.533,
+        "calibrated_rmse": 1.61,
+        "raw_bias": -1.835,
+        "calibrated_bias": -0.423,
+        "train_raw_mae": 1.426,
+        "train_calibrated_mae": 1.054,
+        "test_start": "2026-04-11",
+        "test_end": "2026-10-24",
+        "train_start": "2025-01-04",
+        "train_end": "2026-04-04",
+        "reference": "NASA POWER daily reanalysis (0.5 degree)",
+        "forecast": "ECMWF IFS archived 00 UTC run via Open-Meteo Single Runs API",
+        "caveat": "Model-to-model comparison; not a station-observation validation."
+      },
+      "confidence": 0.95
+    }
+  }
+}
