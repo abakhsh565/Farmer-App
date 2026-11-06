@@ -1,4 +1,4 @@
-import { fireEvent, screen } from '@testing-library/react';
+import { fireEvent, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 
 /**
@@ -21,6 +21,13 @@ export async function startSignIn(contact: string): Promise<void> {
   });
   await userEvent.click(screen.getByRole('button', { name: 'Continue' }));
   await screen.findByRole('group', { name: 'OTP verification' });
+  /*
+   * The sheet moves focus to the first digit shortly after the step opens. If a
+   * slow runner starts typing before that lands, the focus move swallows the
+   * digits already typed and the code submitted is not the one the test wrote.
+   * Wait for the real focus before handing over to the test.
+   */
+  await waitFor(() => expect(codeInputs()[0]).toHaveFocus(), READY);
 }
 
 export function codeInputs(): HTMLElement[] {
@@ -29,6 +36,9 @@ export function codeInputs(): HTMLElement[] {
 
 export async function enterCode(code = developmentCode()): Promise<void> {
   const inputs = codeInputs();
+  /* A retry happens on the same step, when the one-time autofocus has already
+     run; start at the first digit so the retry replaces the whole code. */
+  inputs[0]?.focus();
   for (let index = 0; index < inputs.length; index += 1) {
     await userEvent.type(inputs[index] as HTMLElement, code[index] ?? '');
   }
