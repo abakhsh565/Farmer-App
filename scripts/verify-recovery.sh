@@ -107,10 +107,21 @@ snapshot() { # database
 }
 
 echo "=========== 1. a clean disposable Supabase Postgres ==========="
-docker rm -f "$CONTAINER" >/dev/null 2>&1
-docker run -d --name "$CONTAINER" -e POSTGRES_PASSWORD=postgres "$IMAGE" >/dev/null || {
-  echo "could not start $IMAGE — is Docker running?"; exit 1
-}
+# Public registries rate-limit shared CI egress. Retry the pull/start boundedly;
+# a persistent failure is still a failure, not a skipped recovery drill.
+started=0
+for attempt in 1 2 3 4 5 6; do
+  docker rm -f "$CONTAINER" >/dev/null 2>&1
+  if docker run -d --name "$CONTAINER" -e POSTGRES_PASSWORD=postgres "$IMAGE" >/dev/null 2>/tmp/farmer-recovery-docker.log; then
+    started=1
+    break
+  fi
+  echo "container start attempt $attempt failed: $(tail -1 /tmp/farmer-recovery-docker.log)"
+  sleep $((attempt * 10))
+done
+if [ "$started" -ne 1 ]; then
+  echo "could not start $IMAGE after retries — is Docker running?"; exit 1
+fi
 
 ready=0
 for _ in $(seq 1 150); do

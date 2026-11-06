@@ -13,8 +13,12 @@ export function developmentCode(): string {
   return match[1];
 }
 
+const READY = { timeout: 5000 } as const;
+
 export async function startSignIn(contact: string): Promise<void> {
-  fireEvent.change(screen.getByLabelText('Number or email'), { target: { value: contact } });
+  fireEvent.change(await screen.findByLabelText('Number or email', {}, READY), {
+    target: { value: contact },
+  });
   await userEvent.click(screen.getByRole('button', { name: 'Continue' }));
   await screen.findByRole('group', { name: 'OTP verification' });
 }
@@ -42,9 +46,15 @@ export async function completeAccount(
   name = 'Bilal Ahmed',
   password = 'secret123',
 ): Promise<void> {
-  fireEvent.change(await screen.findByLabelText('Your name'), { target: { value: name } });
-  fireEvent.change(screen.getByLabelText('Create a password'), { target: { value: password } });
-  await userEvent.click(screen.getByRole('button', { name: 'Create account' }));
+  // The account step appears only after the OTP round-trip. CI can take longer
+  // than the default 1s to render it even when the action is correct.
+  fireEvent.change(await screen.findByLabelText('Your name', {}, READY), {
+    target: { value: name },
+  });
+  fireEvent.change(await screen.findByLabelText('Create a password', {}, READY), {
+    target: { value: password },
+  });
+  await userEvent.click(await screen.findByRole('button', { name: 'Create account' }, READY));
 }
 
 export async function completeSignIn(contact: string): Promise<void> {
