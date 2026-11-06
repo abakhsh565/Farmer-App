@@ -11,8 +11,8 @@ remain unverified. Everything that can be verified from this environment passes.
 ## What passes today
 
 All commands were run from the repository root on 2026-11-06. The CI workflow now
-includes independent recovery and performance jobs; its first run against this
-change set is recorded in the final delivery note.
+includes independent recovery and performance jobs; the final run against this
+change set is green on every job (see CI evidence below).
 
 | Check | Command | Result |
 | --- | --- | --- |
@@ -37,6 +37,27 @@ deduplication are per party, evidence gates refuse supplementary citations,
 risk generation and feed geography work, and no client can read the control
 tables. They do **not** prove a hosted project accepts the migrations or that
 its PostgREST/Edge runtime exposes them correctly.
+
+## CI evidence
+
+The workflow ran on branch `work/phase2c-stabilization` at commit `13abc32`:
+
+| Run | Commit | `verify` | `recovery` | `performance` | `ingestion-lifecycle` | `live-contracts` |
+| --- | --- | --- | --- | --- | --- | --- |
+| [42285592745](https://github.com/abakhsh565/Farmer-App/actions/runs/42285592745) | `13abc32` | pass | pass | pass | pass | pass |
+
+The two earlier runs on this branch exposed problems that the final run covers:
+run [42282874422](https://github.com/abakhsh565/Farmer-App/actions/runs/42282874422)
+had one isolation-test failure and a Docker image pull rate limit in `recovery`;
+run [42284118164](https://github.com/abakhsh565/Farmer-App/actions/runs/42284118164)
+had the recovery and performance jobs green but four credential-flow tests
+failing in `verify`. The pull now retries with backoff, and the test helper waits
+for the OTP field to take focus before typing; the four tests pass locally and in
+the final CI run.
+
+These CI jobs use disposable Postgres and no staging credentials. A green
+`recovery` job is the 20-case drill below, not a hosted restore; a green
+`performance` job is the 21-case local load baseline, not a hosted load test.
 
 ## Backup and recovery evidence
 
@@ -103,7 +124,7 @@ regression baseline for the database paths.
 
 | Area | Status | Evidence / gap |
 | --- | --- | --- |
-| Regression | **Local pass** | 607 tests; CI run pending for this commit |
+| Regression | **Local + CI pass** | 607 tests; run 42285592745 `verify` success |
 | Security — database | **Local pass** | 90/90 RLS, AI control tables revoked, isolation harness green |
 | Security — HTTP/JWT | **Blocked** | New migrations and Edge routes are not on staging; no signed-in HTTP test |
 | Data quality | **Partial** | Phase 9 staging counts exist; lifecycle/evidence additions are not applied there |
