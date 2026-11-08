@@ -287,20 +287,32 @@ export function OnboardingFlow({ onDone }: { onDone: () => void }) {
       ) : null}
 
       {step !== 'splash' ? (
-        <div className="flex flex-1 flex-col px-6 pb-8 pt-6">
+        <div className="relative flex flex-1 flex-col px-6 pb-8 pt-[4.75rem]">
           {/*
-            Pinned above the step, not part of it. Choosing a language applies
-            immediately, so the crop names and the location copy that follow are
-            already in the farmer's own language rather than catching up later.
+            Pinned to the physical top-right of every step, not the reading
+            end. `dir="ltr"` is deliberate: without it the header's `right`
+            becomes the left side as soon as the page flips to Urdu, and the
+            language switch jumps across the screen. The same override keeps
+            the options in one fixed order — English, then اردو — so the
+            control looks identical in both languages.
+
+            Choosing a language applies immediately, so the crop names and the
+            location copy that follow are already in the farmer's own language
+            rather than catching up later.
           */}
-          <LanguageBar
-            label={copy('language')}
-            picked={picked}
-            onPick={(next) => {
-              setPicked(next);
-              setLocale(next);
-            }}
-          />
+          <header
+            dir="ltr"
+            className="absolute inset-x-0 top-0 z-20 flex justify-end px-6 pt-6"
+          >
+            <LanguageBar
+              label={copy('language')}
+              picked={picked}
+              onPick={(next) => {
+                setPicked(next);
+                setLocale(next);
+              }}
+            />
+          </header>
 
           <div className="flex flex-1 flex-col">
             {step === 'slides' ? (
@@ -443,35 +455,33 @@ function LanguageBar({
   onPick: (locale: Locale) => void;
 }) {
   return (
-    <div className="flex shrink-0 justify-end pb-4">
-      <div
-        role="group"
-        aria-label={label}
-        className="flex items-center gap-1 rounded-full border border-border bg-card p-1"
-      >
-        {ONBOARDING_LANGUAGES.map((code) => {
-          const meta = LOCALE_REGISTRY[code];
-          const active = code === picked;
-          return (
-            <button
-              key={code}
-              type="button"
-              onClick={() => onPick(code)}
-              aria-pressed={active}
-              // Typed in its own script, so `dir` belongs to the option rather
-              // than to the page: the Urdu name reads right-to-left even while
-              // the surrounding control is laid out left-to-right.
-              dir={meta.dir}
-              className={[
-                'rounded-full px-3 py-1 text-xs font-medium transition-colors',
-                active ? 'bg-primary text-primary-foreground' : 'text-muted-foreground',
-              ].join(' ')}
-            >
-              {meta.nativeName}
-            </button>
-          );
-        })}
-      </div>
+    <div
+      role="group"
+      aria-label={label}
+      className="flex shrink-0 items-center gap-1 rounded-full border border-border bg-card p-1 shadow-sm"
+    >
+      {ONBOARDING_LANGUAGES.map((code) => {
+        const meta = LOCALE_REGISTRY[code];
+        const active = code === picked;
+        return (
+          <button
+            key={code}
+            type="button"
+            onClick={() => onPick(code)}
+            aria-pressed={active}
+            // Typed in its own script, so `dir` belongs to the option rather
+            // than to the page: the Urdu name reads right-to-left even while
+            // the surrounding control is laid out left-to-right.
+            dir={meta.dir}
+            className={[
+              'rounded-full px-3 py-1 text-xs font-medium transition-colors',
+              active ? 'bg-primary text-primary-foreground' : 'text-muted-foreground',
+            ].join(' ')}
+          >
+            {meta.nativeName}
+          </button>
+        );
+      })}
     </div>
   );
 }

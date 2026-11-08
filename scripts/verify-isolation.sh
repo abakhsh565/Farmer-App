@@ -156,6 +156,30 @@ create table if not exists storage.buckets (
   file_size_limit bigint
 );
 
+-- The storage API installs these objects in a hosted project. Migration 0029
+-- attaches the report-media policies to storage.objects, so the throwaway
+-- database must provide the same surface before applying the bundle.
+create table if not exists storage.objects (
+  id         uuid primary key default gen_random_uuid(),
+  bucket_id  text,
+  name       text,
+  owner      uuid,
+  created_at timestamptz not null default now()
+);
+
+create or replace function storage.foldername(name text)
+returns text[]
+language sql
+immutable
+as $$
+  select (string_to_array(name, '/'))[1:greatest(array_length(string_to_array(name, '/'), 1) - 1, 0)];
+$$;
+
+grant usage on schema storage to anon, authenticated;
+grant select on storage.buckets to anon, authenticated;
+grant select, insert, update, delete on storage.objects to anon, authenticated;
+alter table storage.objects enable row level security;
+
 grant usage on schema public, auth to anon, authenticated;
 grant usage on schema extensions to anon, authenticated, public;
 SQL

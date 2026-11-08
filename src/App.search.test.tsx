@@ -27,8 +27,8 @@ beforeEach(() => {
 
 /** Reaches the search page the way a farmer does: through the dealer list. */
 async function openSearch() {
-  await userEvent.click(screen.getByRole('button', { name: 'Dealers' }));
-  await screen.findByRole('region', { name: 'Your location' }, READY);
+  await userEvent.click(screen.getByRole('button', { name: 'Shop' }));
+  await screen.findByRole('region', { name: 'Current location' }, READY);
   await userEvent.click(screen.getByRole('button', { name: 'Search dealers or products' }));
   await screen.findByRole('heading', { name: 'Search' }, READY);
 }
@@ -45,15 +45,15 @@ describe('the search page', () => {
     // The field is where the farmer's attention is, and the page says what it
     // takes rather than leaving an empty box.
     expect(searchbox()).toHaveFocus();
-    expect(screen.getByText('Type a shop, or a product like urea or Roundup.')).toBeInTheDocument();
+    expect(screen.getByText('Write a dealer, shop or product name.')).toBeInTheDocument();
 
     /*
      * Both kinds, before a keyword exists — and both real: the suggestions come
      * from the dealer service, so they cannot name a shop that has stopped trading
      * or a product nobody nearby carries.
      */
-    expect(screen.getByText('Suggested dealers')).toBeInTheDocument();
-    expect(screen.getByText('Suggested products')).toBeInTheDocument();
+    expect(screen.getByText('Dealers near you')).toBeInTheDocument();
+    expect(screen.getByText('Products sold nearby')).toBeInTheDocument();
     expect((await screen.findAllByText('Ali Traders', {}, READY)).length).toBeGreaterThan(0);
     expect((await screen.findAllByText('Roundup', {}, READY)).length).toBeGreaterThan(0);
   });
@@ -103,7 +103,7 @@ describe('the search page', () => {
     // answers it rather than making the farmer find the other tab.
     expect(searchbox()).toHaveValue('Urea');
     expect(productsTab()).toHaveAttribute('aria-pressed', 'true');
-    expect(await screen.findByText('Green Agro Store · 3 km', {}, READY)).toBeInTheDocument();
+    expect(await screen.findByText('at Green Agro Store · 3 km', {}, READY)).toBeInTheDocument();
   });
 
   it('goes back to suggesting when the keyword is edited after confirming', async () => {
@@ -124,6 +124,6 @@ describe('the search page', () => {
 
     // Both halves are offering matches again — under the typed-keyword heading
     // rather than the before-you-type one.
-    expect(screen.getAllByText('Suggested for you')).toHaveLength(2);
+    expect(screen.getAllByText('Suggestions')).toHaveLength(2);
   });
 });

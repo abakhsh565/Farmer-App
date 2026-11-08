@@ -25,8 +25,15 @@
  * which one is active, which is exactly what a health endpoint should say.
  */
 
+// The Edge runtime supplies the real global. The app's TypeScript project does
+// not include Deno's ambient library, so declare the narrow surface this module
+// uses; the declaration is erased at runtime.
+declare const Deno: { env: { get(name: string): string | undefined } };
+
 const OPENAI_DEFAULT_MODEL = 'gpt-4o-mini';
-const GEMINI_DEFAULT_MODEL = 'gemini-2.0-flash';
+// Gemini retired 2.0-flash. Keep the default on the supported current model;
+// short answers also opt into the lower-latency thinking level explicitly.
+const GEMINI_DEFAULT_MODEL = 'gemini-3.8-flash';
 
 export type ProviderName = 'openai' | 'gemini';
 
@@ -40,13 +47,41 @@ export type ModelReply = {
   text: string;
   model: string;
   provider: ProviderName;
+  /** How many provider calls it took, including the successful one. */
+  attempts: number;
 } | {
   ok: false;
-  reason: 'not_configured' | 'unreachable' | 'refused' | 'empty';
+  reason:
+    | 'not_configured'
+    | 'unreachable'
+    | 'rate_limited'
+    | 'refused'
+    | 'empty'
+    | 'malformed';
   detail: string;
+  provider: ProviderName | null;
+  model: string | null;
+  /** HTTP status when the provider answered; absent for network/timeouts. */
+  status?: number;
+  /** Provider-requested wait, when a 429 carried Retry-After. */
+  retryAfterMs?: number;
+  attempts: number;
 };
 
+type CallFailure = {
+  ok: false;
+  reason: 'not_configured' | 'unreachable' | 'rate_limited' | 'refused' | 'empty' | 'malformed';
+  detail: string;
+  status?: number;
+  retryAfterMs?: number;
+};
+
+type CallReply = { ok: true; text: string } | CallFailure;
+
 function env(...names: string[]): string | null {
+  // `typeof` keeps the module importable in a Node test runner, while the
+  // direct `Deno.env.get(name)` call is what the server-secret checker verifies.
+  if (typeof Deno === 'undefined') return null;
   for (const name of names) {
     const value = Deno.env.get(name);
     if (value && value.trim().length > 0) return value.trim();
@@ -129,6 +164,19 @@ export function providerStatus(): {
   };
 }
 
+function retryAfterMs(value: string | null): number | undefined {
+  if (!value) return undefined;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.round(seconds * 1000);
+  const date = Date.parse(value);
+  if (Number.isFinite(date)) return Math.max(0, date - Date.now());
+  return undefined;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 /* -------------------------------------------------------------------------- */
 /* OpenAI                                                                     */
 /* -------------------------------------------------------------------------- */
@@ -136,7 +184,7 @@ export function providerStatus(): {
 async function callOpenAi(
   messages: ChatMessage[],
   opts: { json?: boolean; temperature?: number; maxTokens?: number; signal: AbortSignal },
-): Promise<ModelReply> {
+): Promise<CallReply> {
   const key = openAiKey();
   const gateway = openAiGateway();
   if (!key && !gateway) {
@@ -163,13 +211,23 @@ async function callOpenAi(
   });
 
   if (!response.ok) {
-    const body = await response.text();
-    return { ok: false, reason: 'unreachable', detail: `OpenAI answered ${response.status}: ${body.slice(0, 200)}` };
+    return {
+      ok: false,
+      reason: response.status === 429 ? 'rate_limited' : 'unreachable',
+      detail: `OpenAI answered ${response.status}.`,
+      status: response.status,
+      retryAfterMs: retryAfterMs(response.headers.get('retry-after')),
+    };
   }
 
-  const payload = (await response.json()) as {
+  let payload: {
     choices?: Array<{ message?: { content?: string }; finish_reason?: string }>;
   };
+  try {
+    payload = (await response.json()) as typeof payload;
+  } catch {
+    return { ok: false, reason: 'malformed', detail: 'OpenAI returned a malformed response.' };
+  }
   const choice = payload.choices?.[0];
   const text = choice?.message?.content?.trim() ?? '';
 
@@ -178,7 +236,7 @@ async function callOpenAi(
   }
   if (text.length === 0) return { ok: false, reason: 'empty', detail: 'The model returned an empty answer.' };
 
-  return { ok: true, text, model, provider: 'openai' };
+  return { ok: true, text };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -193,8 +251,14 @@ async function callOpenAi(
  */
 async function callGemini(
   messages: ChatMessage[],
-  opts: { json?: boolean; temperature?: number; maxTokens?: number; signal: AbortSignal },
-): Promise<ModelReply> {
+  opts: {
+    json?: boolean;
+    temperature?: number;
+    maxTokens?: number;
+    thinkingLevel?: 'low' | 'medium' | 'high';
+    signal: AbortSignal;
+  },
+): Promise<CallReply> {
   const key = geminiKey();
   if (!key) return { ok: false, reason: 'not_configured', detail: 'GEMINI_API_KEY is not set.' };
   const model = modelName();
@@ -222,6 +286,13 @@ async function callGemini(
         generationConfig: {
           temperature: opts.temperature ?? 0.2,
           maxOutputTokens: opts.maxTokens ?? 700,
+          /* Gemini 3.8 defaults to medium thinking. A short, grounded answer
+             does not need that deliberation, and the default is what pushed
+             the request past the gateway's 25s budget. Diagnosis leaves this
+             unset so its deeper reasoning is unchanged. */
+          ...(opts.thinkingLevel
+            ? { thinkingConfig: { thinkingLevel: opts.thinkingLevel } }
+            : {}),
           ...(opts.json ? { responseMimeType: 'application/json' } : {}),
         },
       }),
@@ -230,17 +301,27 @@ async function callGemini(
   );
 
   if (!response.ok) {
-    const body = await response.text();
-    return { ok: false, reason: 'unreachable', detail: `Gemini answered ${response.status}: ${body.slice(0, 200)}` };
+    return {
+      ok: false,
+      reason: response.status === 429 ? 'rate_limited' : 'unreachable',
+      detail: `Gemini answered ${response.status}.`,
+      status: response.status,
+      retryAfterMs: retryAfterMs(response.headers.get('retry-after')),
+    };
   }
 
-  const payload = (await response.json()) as {
+  let payload: {
     candidates?: Array<{
       content?: { parts?: Array<{ text?: string }> };
       finishReason?: string;
     }>;
     promptFeedback?: { blockReason?: string };
   };
+  try {
+    payload = (await response.json()) as typeof payload;
+  } catch {
+    return { ok: false, reason: 'malformed', detail: 'Gemini returned a malformed response.' };
+  }
 
   if (payload.promptFeedback?.blockReason) {
     return { ok: false, reason: 'refused', detail: `Gemini blocked the prompt (${payload.promptFeedback.blockReason}).` };
@@ -255,7 +336,7 @@ async function callGemini(
   }
   if (text.length === 0) return { ok: false, reason: 'empty', detail: 'The model returned an empty answer.' };
 
-  return { ok: true, text, model, provider: 'gemini' };
+  return { ok: true, text };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -269,7 +350,19 @@ async function callGemini(
  */
 export async function complete(
   messages: ChatMessage[],
-  opts: { json?: boolean; temperature?: number; maxTokens?: number; timeoutMs?: number } = {},
+  opts: {
+    json?: boolean;
+    temperature?: number;
+    maxTokens?: number;
+    /** Total budget across attempts. */
+    timeoutMs?: number;
+    /** Per-attempt cap; the remainder of the total budget is still respected. */
+    attemptTimeoutMs?: number;
+    maxAttempts?: number;
+    /** Base for exponential backoff; jitter is added per attempt. */
+    retryBaseMs?: number;
+    thinkingLevel?: 'low' | 'medium' | 'high';
+  } = {},
 ): Promise<ModelReply> {
   const provider = activeProvider();
   if (!provider) {
@@ -277,25 +370,72 @@ export async function complete(
       ok: false,
       reason: 'not_configured',
       detail: 'No model provider is configured. Set OPENAI_API_KEY, GEMINI_API_KEY or OPENAI_BASE_URL as a function secret.',
+      provider: null,
+      model: null,
+      attempts: 0,
     };
   }
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? 25_000);
+  const model = modelName();
+  const call = provider === 'gemini' ? callGemini : callOpenAi;
+  const maxAttempts = Math.max(1, Math.min(opts.maxAttempts ?? 3, 4));
+  const deadline = Date.now() + Math.max(1_000, opts.timeoutMs ?? 25_000);
+  let last: CallFailure | null = null;
+  let attempts = 0;
 
-  try {
-    const call = provider === 'gemini' ? callGemini : callOpenAi;
-    return await call(messages, { ...opts, signal: controller.signal });
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : 'unknown error';
-    return {
-      ok: false,
-      reason: 'unreachable',
-      detail: detail.includes('abort') ? 'The model did not answer in time.' : detail,
-    };
-  } finally {
-    clearTimeout(timer);
+  while (attempts < maxAttempts) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+
+    attempts += 1;
+    const controller = new AbortController();
+    const attemptMs = Math.min(opts.attemptTimeoutMs ?? 12_000, remaining);
+    const timer = setTimeout(() => controller.abort(), attemptMs);
+
+    try {
+      const reply = await call(messages, { ...opts, signal: controller.signal });
+      if (reply.ok) return { ok: true, text: reply.text, model, provider, attempts };
+      last = reply;
+      if (!retryable(reply) || attempts >= maxAttempts) break;
+    } catch (error) {
+      const name = error instanceof Error ? error.name : '';
+      const message = error instanceof Error ? error.message : 'unknown error';
+      last = {
+        ok: false,
+        reason: 'unreachable',
+        detail: name === 'AbortError' || /abort/i.test(message)
+          ? 'The model did not answer in time.'
+          : 'The model could not be reached.',
+      };
+      if (attempts >= maxAttempts) break;
+    } finally {
+      clearTimeout(timer);
+    }
+
+    const left = deadline - Date.now();
+    if (left <= 0) break;
+    const backoff = Math.min(opts.retryBaseMs ?? 250, 2_000) * 2 ** (attempts - 1);
+    const wait = last.retryAfterMs !== undefined
+      ? Math.min(last.retryAfterMs, left)
+      : Math.min(backoff + Math.floor(Math.random() * 100), left);
+    if (wait <= 0) continue;
+    await sleep(wait);
   }
+
+  const failure = last ?? {
+    ok: false as const,
+    reason: 'unreachable' as const,
+    detail: 'The model did not answer in time.',
+  };
+  return { ...failure, provider, model, attempts };
+}
+
+function retryable(failure: CallFailure): boolean {
+  if (failure.reason === 'rate_limited' || failure.reason === 'malformed' || failure.reason === 'empty') {
+    return true;
+  }
+  if (failure.reason !== 'unreachable') return false;
+  return failure.status === undefined || failure.status === 429 || failure.status >= 500;
 }
 
 /** Parses a JSON reply, tolerating a fenced block. Returns null when unusable. */

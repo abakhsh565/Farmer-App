@@ -1,9 +1,11 @@
-import { render, screen } from '@testing-library/react';
+import { act, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { App } from '@/App';
 import { SESSION_STORAGE_KEY } from '@/session/SessionProvider';
 import { markOnboardingComplete } from '@/onboarding/OnboardingFlow';
+import { createServices } from '@/services/registry';
+import type { AiAnswer, AiProvider } from '@/services/types';
 
 /** Long enough for a service read to land on a loaded machine. */
 const READY = { timeout: 4000 };
@@ -64,11 +66,11 @@ beforeEach(() => {
 });
 
 describe('App', () => {
-  it('opens on Home and switches to Dealers', async () => {
+  it('opens on Home and switches to Shop', async () => {
     render(<App />);
 
     // With no account yet the greeting names the guest, not a fixture farmer.
-    expect(screen.getByText('Assalam o Alaikum, Guest')).toBeInTheDocument();
+    expect(screen.getByText('Welcome back, Guest')).toBeInTheDocument();
     // Home no longer carries a mandi rates strip: every tile it could draw came
     // from the labelled non-authoritative `research_feed`, so the section showed
     // prices the app was at the same time telling the farmer not to trust. The
@@ -77,9 +79,9 @@ describe('App', () => {
     expect(screen.queryByText('Mandi rates')).toBeNull();
     expect(screen.queryByText('Rs. per 40 kg')).toBeNull();
 
-    await userEvent.click(screen.getByRole('button', { name: 'Dealers' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Shop' }));
 
-    expect(screen.getByRole('heading', { name: 'Dealers' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Shop' })).toBeInTheDocument();
     expect(screen.getByText('5 dealers within 10 km')).toBeInTheDocument();
   });
 
@@ -88,7 +90,7 @@ describe('App', () => {
    * invisible to a unit test and obvious to a user, so the five tabs are asserted
    * by name — including that "Me" is not among them.
    */
-  it('offers Home, Dealers, Scan, Chat and Community in the bottom bar', () => {
+  it('offers Home, Shop, Scan, Chat and Community in the bottom bar', () => {
     render(<App />);
 
     const nav = screen.getByRole('navigation', { name: 'Main' });
@@ -96,7 +98,7 @@ describe('App', () => {
       (button) => button.textContent?.trim() || button.getAttribute('aria-label'),
     );
 
-    expect(labels).toEqual(['Home', 'Dealers', 'Scan a crop', 'Chat', 'Community']);
+    expect(labels).toEqual(['Home', 'Shop', 'Scan a crop', 'Chat', 'Community']);
     expect(screen.queryByRole('button', { name: 'Me' })).not.toBeInTheDocument();
   });
 
@@ -128,10 +130,11 @@ describe('App', () => {
    * design draws a message button on each one, and a button that opens nothing is
    * worse than no button.
    */
-  it('opens a dealer conversation from the home screen', async () => {
+  it('opens a dealer conversation from the shop list', async () => {
     render(<App />);
 
-    /* The home list is a service read, so the row arrives a tick after the paint. */
+    /* The dealer row is a service read, so it arrives a tick after the paint. */
+    await userEvent.click(screen.getByRole('button', { name: 'Shop' }));
     await userEvent.click(
       await screen.findByRole('button', { name: 'Chat with Ali Traders' }, READY),
     );
@@ -144,12 +147,12 @@ describe('App', () => {
     ).toBeInTheDocument();
   });
 
-  it('sends the home dealer section to the Dealers screen', async () => {
+  it('sends the home community section to Community', async () => {
     render(<App />);
 
     await userEvent.click(screen.getByRole('button', { name: 'See all' }));
 
-    expect(screen.getByRole('heading', { name: 'Dealers' })).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: 'Write a post' }, READY)).toBeInTheDocument();
   });
 
   it('gives the weather card its spray advice in the app’s own language', async () => {
@@ -172,7 +175,7 @@ describe('App', () => {
   it('shows the dealers the service returns, with their distance and what they carry', async () => {
     render(<App />);
 
-    await userEvent.click(screen.getByRole('button', { name: 'Dealers' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Shop' }));
 
     expect(await screen.findByText('Ali Traders', {}, READY)).toBeInTheDocument();
     expect(screen.getByText('Wazirabad Agri Center')).toBeInTheDocument();
@@ -203,7 +206,7 @@ describe('profile', () => {
     // No account: the profile says so instead of showing a name and a number
     // that belong to nobody — or, after logging out, to the previous farmer.
     expect(screen.getByText('Guest farmer')).toBeInTheDocument();
-    expect(screen.getByText('Not signed in')).toBeInTheDocument();
+    expect(screen.getByText('Tap to sign in')).toBeInTheDocument();
     /*
      * The farm at a glance, read from the farmer's own stores. On a clean install
      * the farmer has told this app nothing, so the strip says so: no crops, none
@@ -211,15 +214,16 @@ describe('profile', () => {
      * rendered as this farmer's land, on a phone where nothing had ever asked
      * them for an acreage and nothing could correct it.
      */
-    expect(screen.getByText('No crops yet')).toBeInTheDocument();
-    expect(screen.getByText('0 crops')).toBeInTheDocument();
+    expect(screen.queryByText('No crops yet')).not.toBeInTheDocument();
+    expect(screen.queryByText(/\d+ crops?/)).not.toBeInTheDocument();
+    expect(screen.getAllByRole('button', { name: 'My Crops' })).toHaveLength(2);
     expect(screen.queryByText('8 acres')).not.toBeInTheDocument();
     expect(screen.getByText('My Dealers')).toBeInTheDocument();
     expect(screen.getByText('Farm Details')).toBeInTheDocument();
     expect(screen.getByText('Help & Support')).toBeInTheDocument();
     /* A guest sees the way in, not the way out: signing out and deleting the
        account are authenticated-only controls. */
-    expect(screen.getByText('Create an account')).toBeInTheDocument();
+    expect(screen.queryByText('Create an account')).not.toBeInTheDocument();
     expect(screen.queryByText('Log Out')).not.toBeInTheDocument();
     expect(screen.queryByText('Delete account')).not.toBeInTheDocument();
     // The tab bar is hidden while a pushed screen is open.
@@ -230,13 +234,14 @@ describe('profile', () => {
     expect(screen.getByRole('navigation', { name: 'Main' })).toBeInTheDocument();
   });
 
-  it('sends My Dealers to the Dealers tab', async () => {
+  it('sends My Dealers to the Shop tab', async () => {
+    withSignedInFarmer();
     render(<App />);
 
     await openProfile();
     await userEvent.click(screen.getByRole('button', { name: /My Dealers/ }));
 
-    expect(screen.getByRole('heading', { name: 'Dealers' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Shop' })).toBeInTheDocument();
   });
 
   it('switches language from the profile and mirrors the direction', async () => {
@@ -252,8 +257,8 @@ describe('profile', () => {
     await userEvent.keyboard('{Escape}');
     await userEvent.click(screen.getByRole('button', { name: 'واپس' }));
 
-    expect(screen.getByText(/السلام علیکم/)).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'ڈیلر' })).toBeInTheDocument();
+    expect(screen.getByText(/دوبارہ خوش آمدید/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'دکان' })).toBeInTheDocument();
   });
 
   /**
@@ -304,11 +309,11 @@ describe('chat', () => {
     expect(screen.queryByRole('button', { name: /unread messages/ })).toBeNull();
   });
 
-  it('opens a dealer thread from the Dealers screen', async () => {
+  it('opens a dealer thread from the Shop screen', async () => {
     withChatHistory();
     render(<App />);
 
-    await userEvent.click(screen.getByRole('button', { name: 'Dealers' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Shop' }));
     await userEvent.click(screen.getByRole('button', { name: 'Chat with Ali Traders' }));
 
     expect(screen.getByText('Assalam o Alaikum. Do you have Roundup in stock?')).toBeInTheDocument();
@@ -374,7 +379,7 @@ describe('scan', () => {
     expect(screen.getByPlaceholderText('Ask a follow-up question')).toBeInTheDocument();
 
     // The same product on the same shop's page, at the same price.
-    await userEvent.click(screen.getByRole('button', { name: 'Dealers' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Shop' }));
     // The row body, not the chat button beside it — both name the shop.
     await userEvent.click(await screen.findByRole('button', { name: /^Ali Traders/ }, READY));
     expect(await screen.findByText('Roundup', {}, READY)).toBeInTheDocument();
@@ -386,6 +391,173 @@ describe('scan', () => {
    * assistant that answers off-topic questions "just this once" is not the
    * assistant the rules describe.
    */
+  it('sends a follow-up through the server assistant with the selected crop', async () => {
+    const ask = vi.fn(async () => ({
+      gate: 'agriculture' as const,
+      confidence: 88,
+      text: 'Scout the field first, then treat only if you find the pest.',
+      citations: [],
+      escalate: false,
+      caveats: [],
+      metadata: {
+        scoring_version: 2,
+        farmer_context_available: true,
+        context_categories: ['crops' as const],
+        knowledge_sources: ['cotton-pink-bollworm'],
+      },
+    }));
+    const fakeAi: AiProvider = {
+      name: 'Test assistant',
+      ask,
+      diagnose: async () => {
+        throw new Error('diagnosis is not used by this test');
+      },
+    };
+    const services = createServices();
+    services.ai = fakeAi;
+    render(<App services={services} />);
+
+    await userEvent.click(screen.getByRole('button', { name: 'Scan a crop' }));
+    await userEvent.click(screen.getByRole('button', { name: /Take a photo/ }));
+    await userEvent.click(screen.getByRole('button', { name: 'Next' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Next' }));
+
+    const box = await screen.findByPlaceholderText('Ask a follow-up question', {}, READY);
+    await userEvent.type(box, 'How do I treat bollworm?');
+    await userEvent.click(screen.getByRole('button', { name: 'Send question' }));
+
+    expect(
+      await screen.findByText('Scout the field first, then treat only if you find the pest.') ,
+    ).toBeInTheDocument();
+    expect(ask).toHaveBeenCalledWith('How do I treat bollworm?', {
+      cropCode: 'cotton',
+      language: 'en',
+    });
+  });
+
+  it('shows source trust and labels a retrieval-only answer without claiming it came from the model', async () => {
+    const answer: AiAnswer = {
+      gate: 'agriculture',
+      confidence: 86,
+      text: 'Count 5 larvae per 100 bolls before deciding to spray.',
+      citations: [
+        {
+          kind: 'knowledge',
+          label: 'Pink bollworm economic threshold',
+          version: 1,
+          slug: 'cotton-pink-bollworm-etl',
+          source: 'Punjab Agriculture Department',
+          sourceUrl: 'https://agripunjab.gov.pk/pw_economic',
+          evidenceTier: 'verified',
+          accessedOn: '2026-11-03',
+        },
+        {
+          kind: 'knowledge',
+          label: 'Pink bollworm in cotton',
+          version: 3,
+          slug: 'cotton-pink-bollworm',
+          source: 'Farmer App editorial notes',
+          evidenceTier: 'supplementary',
+          accessedOn: '2026-11-03',
+        },
+      ],
+      escalate: false,
+      caveats: ['The AI model is unavailable.'],
+      generation: 'retrieval',
+      metadata: {
+        scoring_version: null,
+        farmer_context_available: false,
+        context_categories: [],
+        knowledge_sources: ['cotton-pink-bollworm-etl'],
+      },
+    };
+    const fakeAi: AiProvider = {
+      name: 'Retrieval fallback',
+      ask: async () => answer,
+      diagnose: async () => {
+        throw new Error('diagnosis is not used by this test');
+      },
+    };
+    const services = createServices();
+    services.ai = fakeAi;
+    render(<App services={services} />);
+
+    await userEvent.click(screen.getByRole('button', { name: 'Scan a crop' }));
+    await userEvent.click(screen.getByRole('button', { name: /Take a photo/ }));
+    await userEvent.click(screen.getByRole('button', { name: 'Next' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Next' }));
+
+    const box = await screen.findByPlaceholderText('Ask a follow-up question', {}, READY);
+    await userEvent.type(box, 'How many pink bollworm should trigger a spray?');
+    await userEvent.click(screen.getByRole('button', { name: 'Send question' }));
+
+    expect(
+      await screen.findByText('Published guidance only · the AI model is unavailable'),
+    ).toBeInTheDocument();
+    expect(screen.getByText('Pink bollworm economic threshold')).toBeInTheDocument();
+    expect(screen.getByText('Source-verified')).toBeInTheDocument();
+    expect(screen.getByText('Supplementary')).toBeInTheDocument();
+    expect(screen.getByText('Punjab Agriculture Department')).toBeInTheDocument();
+    expect(screen.getByText('Farmer App editorial notes')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Open source' })).toHaveAttribute(
+      'href',
+      'https://agripunjab.gov.pk/pw_economic',
+    );
+  });
+
+  it('shows a loading state and falls back locally when the assistant is offline', async () => {
+    let rejectAsk: ((error: Error) => void) | null = null;
+    const ask = vi.fn(
+      () =>
+        new Promise<never>((_, reject) => {
+          rejectAsk = reject;
+        }),
+    );
+    const fakeAi: AiProvider = {
+      name: 'Offline assistant',
+      ask,
+      diagnose: async () => {
+        throw new Error('diagnosis is not used by this test');
+      },
+    };
+    const services = createServices();
+    services.ai = fakeAi;
+    render(<App services={services} />);
+
+    await userEvent.click(screen.getByRole('button', { name: 'Scan a crop' }));
+    await userEvent.click(screen.getByRole('button', { name: /Take a photo/ }));
+    await userEvent.click(screen.getByRole('button', { name: 'Next' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Next' }));
+
+    const box = await screen.findByPlaceholderText('Ask a follow-up question', {}, READY);
+    await userEvent.type(box, 'Who will win the cricket match tonight?');
+    await userEvent.click(screen.getByRole('button', { name: 'Send question' }));
+
+    expect(await screen.findByText('Checking the approved knowledge…')).toBeInTheDocument();
+    await act(async () => {
+      rejectAsk?.(new Error('offline'));
+    });
+
+    expect(
+      await screen.findByText('The live assistant could not be reached. This is the offline guidance.'),
+    ).toBeInTheDocument();
+    expect(screen.getByText('I can only help with farming')).toBeInTheDocument();
+  });
+
+  it('renders the assistant in Urdu with RTL direction', async () => {
+    localStorage.setItem('agri-shop.locale', 'ur');
+    render(<App />);
+
+    expect(document.documentElement.dir).toBe('rtl');
+    await userEvent.click(screen.getByRole('button', { name: 'فصل اسکین کریں' }));
+    await userEvent.click(await screen.findByRole('button', { name: /تصویر لیں/ }));
+    await userEvent.click(screen.getByRole('button', { name: 'آگے' }));
+    await userEvent.click(screen.getByRole('button', { name: 'آگے' }));
+
+    expect(await screen.findByText('فصل کا معاون', {}, READY)).toBeInTheDocument();
+    expect(screen.getByPlaceholderText('مزید سوال پوچھیں')).toBeInTheDocument();
+  });
+
   it('refuses an off-topic question and hands an uncovered one to an expert', async () => {
     render(<App />);
 
@@ -406,7 +578,7 @@ describe('scan', () => {
 
     // Asking a person is an accountable action, so it is gated like the others.
     await userEvent.click(screen.getByRole('button', { name: 'Ask a verified expert' }));
-    expect(await screen.findByText('Create your account')).toBeInTheDocument();
+    expect(await screen.findByRole('dialog')).toBeInTheDocument();
   });
 });
 
@@ -422,7 +594,8 @@ describe('ChatScreen', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Chat' }));
 
     expect(await screen.findByText('No conversations yet')).toBeInTheDocument();
-    // The nav tab and the empty state's own action both offer the Dealers screen.
-    expect(screen.getAllByRole('button', { name: 'Dealers' })).toHaveLength(2);
+    // The nav tab ("Shop") and the empty state's own action ("Dealers") both lead there.
+    expect(screen.getByRole('button', { name: 'Dealers' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Shop' })).toBeInTheDocument();
   });
 });

@@ -1,7 +1,8 @@
-import { render, screen } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { App } from '@/App';
+import { completeSignIn } from '@/testing/credential';
 import { clearPlaceCache } from '@/services/geocode';
 import { writeSavedLocation } from '@/services/location';
 import { markOnboardingComplete } from '@/onboarding/OnboardingFlow';
@@ -82,39 +83,26 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-/** The development provider prints its code on the sheet it issues. */
-const developmentCode = (): string => {
-  const hint = screen.getByText(/Development build — the code is/).textContent ?? '';
-  const match = hint.match(/(\d{3,8})/);
-  if (!match?.[1]) throw new Error('the development sheet did not show a code');
-  return match[1];
-};
-
-const signIn = async (number: string) => {
-  await userEvent.type(screen.getByLabelText('Mobile number'), number);
-  await userEvent.click(screen.getByRole('button', { name: 'Continue' }));
-  await screen.findByLabelText('Code');
-  await userEvent.type(screen.getByLabelText('Code'), developmentCode());
-  await userEvent.click(screen.getByRole('button', { name: 'Verify' }));
-};
+const signIn = completeSignIn;
 
 /** The filter on the dealer list, and the location bar inside it. */
 async function openLocationBar() {
-  await userEvent.click(screen.getByRole('button', { name: 'Dealers' }));
-  await screen.findByRole('region', { name: 'Your location' }, READY);
+  await userEvent.click(screen.getByRole('button', { name: 'Shop' }));
+  await screen.findByRole('region', { name: 'Current location' }, READY);
   await userEvent.click(screen.getByRole('button', { name: 'Search settings' }));
 
-  const bar = await screen.findByRole('button', { name: 'Set your location' }, READY);
-  expect(bar).toHaveTextContent('Not saved yet');
+  const sheet = await screen.findByRole('dialog', {}, READY);
+  const bar = within(sheet).getByRole('button', { name: 'Change' });
+  expect(within(sheet).getByText('Not set')).toBeInTheDocument();
   return bar;
 }
 
-const placeField = () => screen.getByRole('searchbox', { name: /Search your area/ });
+const placeField = () => screen.getByRole('searchbox', { name: /Search village or town/ });
 
 /** Signs in from where a farmer would: the profile's own account row. */
 async function signInFromProfile(number: string) {
   await userEvent.click(screen.getByRole('button', { name: 'Profile and settings' }));
-  await userEvent.click(await screen.findByRole('button', { name: 'Create an account' }, READY));
+  await userEvent.click(await screen.findByRole('button', { name: /Tap to sign in/ }, READY));
   await signIn(number);
   await userEvent.click(screen.getByRole('button', { name: 'Back' }));
 }
@@ -127,14 +115,14 @@ describe('finding your area by name', () => {
     await userEvent.click(bar);
 
     expect(
-      await screen.findByRole('heading', { name: 'Set your location' }, READY),
+      await screen.findByRole('heading', { name: 'Your location' }, READY),
     ).toBeInTheDocument();
     expect(placeField()).toHaveFocus();
 
     // Below the geocoder's own minimum, the page says what it needs rather than
     // spending a request to discover that two letters match half of Pakistan.
     expect(
-      screen.getByText('Type at least three letters of a village, town or district.'),
+      screen.getByText('Search by village, town or tehsil name.'),
     ).toBeInTheDocument();
   });
 
@@ -145,7 +133,7 @@ describe('finding your area by name', () => {
     await userEvent.type(placeField(), 'Kot Ladha');
 
     expect(
-      await screen.findByText('Tap a place to save it as your location.', {}, READY),
+      await screen.findByText('Tap a place to choose it, then set how far to search.', {}, READY),
     ).toBeInTheDocument();
     expect(await screen.findByText(PLACE.display_name, {}, READY)).toBeInTheDocument();
 
@@ -166,7 +154,7 @@ describe('finding your area by name', () => {
     await userEvent.type(placeField(), 'Nowhereabad');
 
     expect(
-      await screen.findByText('Nothing found for “Nowhereabad”. Try the district name.', {}, READY),
+      await screen.findByText('Nothing found for "Nowhereabad".', {}, READY),
     ).toBeInTheDocument();
   });
 
@@ -185,12 +173,12 @@ describe('finding your area by name', () => {
      */
     expect(screen.queryByText('Create your account')).not.toBeInTheDocument();
 
+    await userEvent.click(screen.getByRole('button', { name: 'Save location' }));
+    expect(await screen.findByText('Saved on this phone only.', {}, READY)).toBeInTheDocument();
+
     // The place is kept on the phone, and the app is back on the list it came from.
     const kept = JSON.parse(localStorage.getItem('agri-shop.location') ?? '{}');
     expect(kept).toMatchObject({ label: PLACE.display_name, lat: 32.4601, lon: 74.0923 });
-    expect(
-      screen.queryByRole('heading', { name: 'Set your location' }),
-    ).not.toBeInTheDocument();
     expect(await screen.findByText(PLACE.display_name, {}, READY)).toBeInTheDocument();
 
     // And there was no account to write to, so nothing was written to one.
@@ -209,7 +197,8 @@ describe('finding your area by name', () => {
      * statement about where their data is, which is a worse failure than not
      * saving at all.
      */
-    expect(await screen.findByText('Saved on this phone.', {}, READY)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Save location' }));
+    expect(await screen.findByText('Saved on this phone only.', {}, READY)).toBeInTheDocument();
   });
 
   it('writes to the account instead when there is one, and leaves nothing on the phone', async () => {
@@ -219,8 +208,9 @@ describe('finding your area by name', () => {
     await userEvent.click(await openLocationBar());
     await userEvent.type(placeField(), 'Kot Ladha');
     await userEvent.click(await screen.findByText(PLACE.display_name, {}, READY));
+    await userEvent.click(screen.getByRole('button', { name: 'Save location' }));
 
-    expect(writeSavedLocation).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(writeSavedLocation).toHaveBeenCalledTimes(1));
     expect(vi.mocked(writeSavedLocation).mock.calls[0]?.[0]).toMatchObject({
       label: PLACE.display_name,
       lat: 32.4601,

@@ -2,6 +2,7 @@ import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { App } from '@/App';
+import { completeSignIn } from '@/testing/credential';
 import { markOnboardingComplete } from '@/onboarding/OnboardingFlow';
 
 /**
@@ -56,21 +57,7 @@ const openChat = async () => {
   await screen.findByRole('heading', { name: 'Messages' }, READY);
 };
 
-/** The code the development provider issued, read off the sheet it prints it on. */
-const developmentCode = (): string => {
-  const hint = screen.getByText(/Development build — the code is/).textContent ?? '';
-  const match = hint.match(/(\d{3,8})/);
-  if (!match?.[1]) throw new Error('the development sheet did not show a code');
-  return match[1];
-};
-
-const signIn = async (number: string) => {
-  await userEvent.type(screen.getByLabelText('Mobile number'), number);
-  await userEvent.click(screen.getByRole('button', { name: 'Continue' }));
-  await screen.findByLabelText('Code');
-  await userEvent.type(screen.getByLabelText('Code'), developmentCode());
-  await userEvent.click(screen.getByRole('button', { name: 'Verify' }));
-};
+const signIn = completeSignIn;
 
 const openAli = async () => {
   await userEvent.click(
@@ -103,7 +90,7 @@ describe('chat', () => {
   it('starts an empty conversation with a shop the farmer has never written to', async () => {
     render(<App />);
 
-    await userEvent.click(screen.getByRole('button', { name: 'Dealers' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Shop' }));
     await userEvent.click(
       await screen.findByRole('button', { name: 'Chat with Punjab Seed Corner' }, READY),
     );
@@ -125,7 +112,7 @@ describe('chat', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Send message' }));
 
     // Sending is accountable, so it is gated — and the send is what resumes.
-    expect(await screen.findByText('Create your account')).toBeInTheDocument();
+    expect(await screen.findByRole('dialog')).toBeInTheDocument();
     await signIn('0300 5556667');
 
     expect(await screen.findByText('Two bags of urea please')).toBeInTheDocument();

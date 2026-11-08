@@ -20,10 +20,14 @@ import { ChatScreen } from '@/screens/ChatScreen';
 import { CommunityScreen } from '@/screens/CommunityScreen';
 import { DealersScreen } from '@/screens/DealersScreen';
 import { HomeScreen } from '@/screens/HomeScreen';
+import { AlertSettingsScreen } from '@/screens/AlertSettingsScreen';
+import { InterestsScreen } from '@/screens/InterestsScreen';
 import { LocationSearchScreen } from '@/screens/LocationSearchScreen';
 import { SearchScreen } from '@/screens/SearchScreen';
 import { ProfileScreen } from '@/screens/ProfileScreen';
+import { ReviewScreen } from '@/screens/ReviewScreen';
 import { ScanScreen } from '@/screens/ScanScreen';
+import { WeatherScreen } from '@/screens/WeatherScreen';
 
 /**
  * Two levels of navigation: the tab bar, and one pushed screen on top of it.
@@ -33,7 +37,15 @@ import { ScanScreen } from '@/screens/ScanScreen';
  * from the home header and pushes over the tabs, which is also why the bar is
  * hidden while it is open.
  */
-type View = 'tabs' | 'profile' | 'locationSearch' | 'search';
+type View =
+  | 'tabs'
+  | 'profile'
+  | 'interests'
+  | 'alerts'
+  | 'review'
+  | 'locationSearch'
+  | 'search'
+  | 'weather';
 
 /**
  * The whole app.
@@ -166,12 +178,30 @@ function Shell() {
               setView('tabs');
               setTab('dealers');
             }}
+            onOpenInterests={() => setView('interests')}
+            onOpenAlerts={() => setView('alerts')}
+            onOpenReview={() => setView('review')}
             onOpenLocationSearch={() => {
               setLocationReturn('profile');
               setView('locationSearch');
             }}
           />
         ) : null}
+
+        {/* Advice preferences, pushed from Profile so the tab bar stays out of
+            the way and Back returns to the settings list the farmer left. */}
+        {view === 'interests' ? (
+          <InterestsScreen onBack={() => setView('profile')} />
+        ) : null}
+
+        {/* Alert preferences are account settings, pushed from Profile. */}
+        {view === 'alerts' ? (
+          <AlertSettingsScreen onBack={() => setView('profile')} />
+        ) : null}
+
+        {/* The reviewer workspace is pushed from Profile and is gated by the
+            server-derived named authority, not by the presence of this route. */}
+        {view === 'review' ? <ReviewScreen onBack={() => setView('profile')} /> : null}
 
         {/*
           Finding your area by name. It comes from the filter sheet rather than
@@ -197,10 +227,15 @@ function Shell() {
           />
         ) : null}
 
+        {/* The Home weather card at full size. A pushed screen, like Profile, so
+            the tab bar is out of the way while the sky has the room. */}
+        {view === 'weather' ? <WeatherScreen onBack={() => setView('tabs')} /> : null}
+
         {view === 'tabs' && tab === 'home' ? (
           <HomeScreen
             onScan={() => setTab('scan')}
             onOpenProfile={() => setView('profile')}
+            onOpenWeather={() => setView('weather')}
             onOpenLocationSearch={() => {
               setLocationReturn('tabs');
               setView('locationSearch');

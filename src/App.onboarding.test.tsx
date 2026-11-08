@@ -114,6 +114,32 @@ describe('first run', () => {
     expect(screen.getByRole('button', { name: 'English' })).toHaveAttribute('aria-pressed', 'true');
   });
 
+  it('keeps the language control top-right and in one order when the page flips to Urdu', async () => {
+    const user = await renderApp();
+    await throughSplash(user);
+
+    const control = await screen.findByRole('group', { name: 'زبان' }, READY);
+    const anchor = control.closest('header');
+
+    // The anchor is physically pinned by being LTR itself, not by the reading
+    // end of whatever language the page is in. That is what stops the control
+    // crossing the screen when document.dir becomes rtl.
+    expect(anchor).not.toBeNull();
+    expect(anchor).toHaveAttribute('dir', 'ltr');
+    expect(anchor?.className).toContain('absolute');
+    expect(anchor?.className).toContain('justify-end');
+
+    const order = () =>
+      [...control.querySelectorAll('button')].map((button) => button.textContent);
+    expect(order()).toEqual(['English', 'اردو']);
+
+    await user.click(screen.getByRole('button', { name: 'اردو' }));
+
+    expect(document.documentElement.dir).toBe('rtl');
+    expect(anchor).toHaveAttribute('dir', 'ltr');
+    expect(order()).toEqual(['English', 'اردو']);
+  });
+
   it('walks slides → crops → location and lands in Guest Mode with the crop kept', async () => {
     const user = await renderApp();
     await throughSplash(user);
@@ -137,7 +163,7 @@ describe('first run', () => {
 
     await user.click(screen.getByRole('button', { name: 'Skip for now' }));
 
-    expect(await screen.findByText(/Assalam o Alaikum, Guest/, {}, READY)).toBeInTheDocument();
+    expect(await screen.findByText(/Welcome back, Guest/, {}, READY)).toBeInTheDocument();
 
     /*
      * The crop has to survive into the product, not just be ticked. It is read
@@ -162,7 +188,7 @@ describe('first run', () => {
     await screen.findByText('Where is your farm?');
     await user.click(screen.getByRole('button', { name: 'Skip for now' }));
 
-    expect(await screen.findByText(/Assalam o Alaikum, Guest/, {}, READY)).toBeInTheDocument();
+    expect(await screen.findByText(/Welcome back, Guest/, {}, READY)).toBeInTheDocument();
     expect(isOnboardingComplete()).toBe(true);
 
     /*
@@ -173,7 +199,7 @@ describe('first run', () => {
      */
     cleanup();
     render(<App />);
-    expect(await screen.findByText(/Assalam o Alaikum, Guest/, {}, READY)).toBeInTheDocument();
+    expect(await screen.findByText(/Welcome back, Guest/, {}, READY)).toBeInTheDocument();
     expect(screen.queryByText('What do you grow?')).not.toBeInTheDocument();
     expect(screen.queryByRole('group', { name: 'Language' })).not.toBeInTheDocument();
   });

@@ -1,4 +1,4 @@
-import { BellRing, Camera, ChevronRight, Sprout, TriangleAlert } from 'lucide-react';
+import { BellRing, Camera, ChevronRight, Sprout, TriangleAlert, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import {
   Sheet,
@@ -7,12 +7,18 @@ import {
   SheetTitle,
 } from '@/components/ui/sheet';
 import { useCredit } from '@/credit/CreditProvider';
+import { personalizationNotice } from '@/intelligence/status';
+import { alertCategory, alertTrustKey, type AlertRow } from '@/intelligence/alerts';
+import { useOnline } from '@/services/persistence';
 import { useSession } from '@/session/SessionProvider';
 import { useLocale } from '@/i18n/LocaleProvider';
 import { formatDay, formatRelativeTime } from '@/i18n/format';
 import { initialsOf } from '@/lib/initials';
 import { useInsights } from '@/insights/InsightProvider';
 import { cropById, insightById, stageIsEstimate } from '@/insights/store';
+import { InsightFeedback } from './InsightFeedback';
+import { PersonalizedAdvice } from './PersonalizedAdvice';
+import { ProactiveAlert } from '@/components/alerts/ProactiveAlert';
 
 /**
  * The two surfaces that consume the canonical insight: the card on Home, and the
@@ -41,12 +47,33 @@ import { cropById, insightById, stageIsEstimate } from '@/insights/store';
  * — it is a decision the farmer makes, not one they stumble into.
  */
 
-export function CropCard({ onScan }: { onScan: () => void }) {
+export function CropCard({
+  onScan,
+  onOpenWeather,
+}: {
+  onScan: () => void;
+  onOpenWeather?: () => void;
+}) {
   const { t } = useLocale();
   const insights = useInsights();
   const { account, requestIdentity } = useSession();
+  const online = useOnline();
   const now = Date.now();
   const primary = insights.primary;
+  const serverRows = insights.personalized;
+  const alertRows = insights.alerts;
+  const alertIds = new Set(alertRows.map((row) => row.recommendationId));
+  const adviceRows = serverRows.filter((row) => !alertIds.has(row.recommendationId));
+  const serverReady =
+    account !== null && insights.personalizationStatus === 'ready' && serverRows.length > 0;
+  const showsServer = serverReady && adviceRows.length > 0;
+  const showsAlertPanel =
+    account !== null &&
+    insights.crops.length > 0 &&
+    (alertRows.length > 0 ||
+      insights.alertStatus === 'loading' ||
+      insights.alertStatus === 'error' ||
+      insights.alertStatus === 'offline');
 
   /*
    * The list the section renders: the main crop first, then the farmer's other
@@ -69,11 +96,41 @@ export function CropCard({ onScan }: { onScan: () => void }) {
    * What varies is whether there is advice to list, and whether the copy the
    * review asked for belongs on it.
    */
-  const showsAdvice = rows.length > 0;
-  const showsGuestCopy = rows.length === 0 && !account && primary !== undefined;
+  const showsAdvice = rows.length > 0 && !serverReady;
+  const showsGuestCopy =
+    !serverReady && rows.length === 0 && !account && primary !== undefined;
+  const notice = personalizationNotice({
+    account: account !== null,
+    online,
+    status: insights.personalizationStatus,
+    hasLocalAdvice: rows.length > 0,
+    hasServerAdvice: serverReady,
+    hasCrops: insights.crops.length > 0,
+  });
 
   return (
     <section className="rounded-lg border border-border bg-card p-4">
+      {showsAlertPanel ? (
+        <ProactiveAlert
+          alerts={alertRows}
+          status={insights.alertStatus}
+          onRead={insights.readAlert}
+          onDismiss={insights.dismissAlert}
+          onScan={onScan}
+          onOpenWeather={onOpenWeather}
+          onRefresh={insights.refreshAlerts}
+        />
+      ) : null}
+
+      {showsServer ? (
+        <PersonalizedAdvice
+          rows={adviceRows.slice(0, 3)}
+          onScan={onScan}
+          onOpenWeather={onOpenWeather}
+          onRefresh={insights.refreshPersonalized}
+        />
+      ) : null}
+
       {showsAdvice ? (
       <ul className="flex flex-col">
         {rows.map(({ crop, advice, top }, index) => {
@@ -141,6 +198,12 @@ export function CropCard({ onScan }: { onScan: () => void }) {
       </ul>
       ) : null}
 
+      {notice ? (
+        <p role="status" className="mt-2 text-body-sm text-muted-foreground">
+          {t(notice)}
+        </p>
+      ) : null}
+
       {/*
         Before there is an account — and only when there is a crop for the words to
         be about — what the farmer can expect here, and the way to it. No header row
@@ -174,7 +237,9 @@ export function CropCard({ onScan }: { onScan: () => void }) {
         onClick={onScan}
         className={[
           'flex w-full items-center gap-3 text-start',
-          showsAdvice || showsGuestCopy ? 'mt-3.5 border-t border-border pt-3.5' : '',
+          showsAlertPanel || showsServer || showsAdvice || showsGuestCopy || notice !== null
+            ? 'mt-3.5 border-t border-border pt-3.5'
+            : '',
         ].join(' ')}
       >
         <span className="grid size-10 shrink-0 place-items-center rounded-full bg-muted">
@@ -196,6 +261,8 @@ export function CropCard({ onScan }: { onScan: () => void }) {
 export function NotificationBell() {
   const { t } = useLocale();
   const insights = useInsights();
+  const { account } = useSession();
+  const unread = account ? insights.unreadAlerts : insights.unread;
 
   return (
     <button
@@ -205,7 +272,7 @@ export function NotificationBell() {
       className="relative grid size-10 shrink-0 place-items-center rounded-full bg-muted"
     >
       <BellRing className="size-5" aria-hidden />
-      {insights.unread > 0 ? (
+      {unread > 0 ? (
         <span className="absolute end-2 top-2 size-2 rounded-full bg-red-500 ring-2 ring-card" />
       ) : null}
     </button>
@@ -216,11 +283,14 @@ export function InsightSheets() {
   const { t, locale } = useLocale();
   const insights = useInsights();
   const credit = useCredit();
+  const { account } = useSession();
+  const serverAlerts = account ? insights.alerts : [];
 
   const insight = insights.openInsightId
     ? insightById(insights.data, insights.openInsightId)
     : undefined;
   const crop = insight ? cropById(insights.data, insight.cropId) : undefined;
+  const recommendation = insight ? insights.recommendationFor(insight.id) : null;
 
   return (
     <>
@@ -239,6 +309,14 @@ export function InsightSheets() {
               </SheetHeader>
               <div className="flex flex-col gap-4 p-4 pt-0">
                 <p className="text-body-sm leading-relaxed">{t(insight.bodyKey)}</p>
+
+                {recommendation ? (
+                  <InsightFeedback
+                    insightId={insight.id}
+                    insightKind={insight.kind}
+                    recommendationId={recommendation.recommendationId}
+                  />
+                ) : null}
 
                 <dl className="rounded-md bg-muted p-3.5 text-label">
                   <div className="flex items-baseline justify-between gap-3">
@@ -305,7 +383,41 @@ export function InsightSheets() {
           <SheetHeader>
             <SheetTitle>{t('notification.title')}</SheetTitle>
           </SheetHeader>
+          {account && insights.unreadAlerts > 0 ? (
+            <div className="px-4 pt-0">
+              <button
+                type="button"
+                onClick={() => void insights.readAllAlerts()}
+                className="py-1 text-caption font-medium text-brand"
+              >
+                {t('alerts.markAllRead')}
+              </button>
+            </div>
+          ) : null}
           <div className="flex flex-col gap-2 p-4 pt-0">
+            {account &&
+            serverAlerts.length === 0 &&
+            (insights.alertStatus === 'loading' ||
+              insights.alertStatus === 'error' ||
+              insights.alertStatus === 'offline') ? (
+              <p role="status" className="rounded-md border border-border bg-muted p-3.5 text-body-sm text-muted-foreground">
+                {insights.alertStatus === 'loading'
+                  ? t('alerts.loading')
+                  : insights.alertStatus === 'offline'
+                    ? t('alerts.offline')
+                    : t('alerts.error')}
+              </p>
+            ) : null}
+
+            {serverAlerts.map((alert) => (
+              <AlertInboxRow
+                key={alert.notificationId}
+                alert={alert}
+                onRead={insights.readAlert}
+                onDismiss={insights.dismissAlert}
+              />
+            ))}
+
             {credit.awaiting.map((request) => (
               <button
                 key={request.id}
@@ -335,7 +447,7 @@ export function InsightSheets() {
               </button>
             ))}
 
-            {insights.notifications.map((entry) => {
+            {!account ? insights.notifications.map((entry) => {
               const entryInsight = insightById(insights.data, entry.insightId);
               if (!entryInsight) return null;
               return (
@@ -362,9 +474,13 @@ export function InsightSheets() {
                   ) : null}
                 </button>
               );
-            })}
+            }) : null}
 
-            {credit.awaiting.length === 0 && insights.notifications.length === 0 ? (
+            {credit.awaiting.length === 0 &&
+            serverAlerts.length === 0 &&
+            (!account
+              ? insights.notifications.length === 0
+              : insights.alertStatus === 'empty') ? (
               <p className="py-10 text-center text-body-sm text-muted-foreground">
                 {t('notification.empty.body')}
               </p>
@@ -373,5 +489,92 @@ export function InsightSheets() {
         </SheetContent>
       </Sheet>
     </>
+  );
+}
+
+const ALERT_LEVEL_KEYS = {
+  urgent: 'alerts.level.urgent',
+  watch: 'alerts.level.watch',
+  info: 'alerts.level.info',
+} as const;
+
+const ALERT_CATEGORY_KEYS = {
+  weather: 'alerts.category.weather',
+  pest: 'alerts.category.pest',
+  disease: 'alerts.category.disease',
+  crop_stage: 'alerts.category.cropStage',
+} as const;
+
+const ALERT_TRUST_KEYS = {
+  weather: 'alerts.trust.weather',
+  official: 'alerts.trust.official',
+  forecast: 'alerts.trust.forecast',
+  verified: 'alerts.trust.verified',
+  supplementary: 'alerts.trust.supplementary',
+  community: 'alerts.trust.community',
+} as const;
+
+function AlertInboxRow({
+  alert,
+  onRead,
+  onDismiss,
+}: {
+  alert: AlertRow;
+  onRead: (notificationId: string) => Promise<boolean>;
+  onDismiss: (notificationId: string) => Promise<boolean>;
+}) {
+  const { t, locale } = useLocale();
+  const localized = locale === 'ur';
+  const title = localized ? alert.titleUr ?? alert.title : alert.title;
+  const body = localized ? alert.bodyUr ?? alert.body : alert.body;
+  const at = alert.alertAt ? new Date(alert.alertAt).getTime() : Number.NaN;
+  const when = Number.isFinite(at) ? formatRelativeTime(at, Date.now(), t) : null;
+  const category = alertCategory(alert.kind);
+  const trust = alertTrustKey(alert);
+
+  return (
+    <div className="flex items-start gap-2 rounded-md border border-border bg-card p-3.5">
+      <button
+        type="button"
+        onClick={() => void onRead(alert.notificationId)}
+        className="flex min-w-0 flex-1 items-start gap-3 text-start"
+      >
+        <span className="mt-0.5 grid size-9 shrink-0 place-items-center rounded-full bg-brand-soft">
+          <TriangleAlert className="size-4 text-brand" aria-hidden />
+        </span>
+        <span className="min-w-0 flex-1">
+          <span className="flex flex-wrap items-center gap-1.5">
+            <span className="rounded-full bg-brand-soft px-2 py-0.5 text-caption font-medium text-brand">
+              {t(ALERT_CATEGORY_KEYS[category])}
+            </span>
+            <span className="text-caption text-muted-foreground">
+              {t(ALERT_LEVEL_KEYS[alert.level])}
+            </span>
+            {when ? (
+              <span className="text-caption text-muted-foreground">{when}</span>
+            ) : null}
+          </span>
+          <span className="mt-1 block text-body font-medium">{title}</span>
+          <span className="mt-0.5 line-clamp-2 block text-body-sm leading-relaxed text-muted-foreground">
+            {body}
+          </span>
+          <span className="mt-1 block text-caption text-muted-foreground">
+            {alert.sourceLabel ?? t('alerts.source')}
+            {trust ? ` · ${t(ALERT_TRUST_KEYS[trust as keyof typeof ALERT_TRUST_KEYS] ?? 'alerts.trust.verified')}` : null}
+          </span>
+        </span>
+        {!alert.isRead ? (
+          <span aria-hidden className="mt-2 size-2 shrink-0 rounded-full bg-brand" />
+        ) : null}
+      </button>
+      <button
+        type="button"
+        aria-label={t('alerts.dismiss')}
+        onClick={() => void onDismiss(alert.notificationId)}
+        className="grid size-8 shrink-0 place-items-center rounded-full text-muted-foreground"
+      >
+        <X className="size-4" aria-hidden />
+      </button>
+    </div>
   );
 }

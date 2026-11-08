@@ -21,8 +21,17 @@
 
 export type Gate = 'agriculture' | 'off_domain' | 'not_covered';
 
+import type { AiCitation } from '@/services/types';
+
 export type Verdict =
-  | { kind: 'answer'; gate: 'agriculture' }
+  | {
+      kind: 'answer';
+      gate: 'agriculture';
+      text?: string;
+      citations?: AiCitation[];
+      generation?: 'model' | 'retrieval';
+      caveats?: string[];
+    }
   | { kind: 'refuse'; gate: 'off_domain' }
   | { kind: 'escalate'; gate: 'not_covered' };
 

@@ -45,7 +45,7 @@ Built and verified offline (typecheck, tests, `lint:migrations`, `lint:functions
 
 ### What is needed from the owner — four things, none of them code
 
-1. **Apply the two new migrations** (`supabase/migrations/2026101500*.sql`) and re-bundle `apply-all.sql`. Blocks: climate history, advisory rows, field-report intake and the district list. The `supabase/apply-all.sql` bundle has been regenerated, so the paste-into-SQL-editor route works without any credential sharing.
+1. **Apply the pending migrations to production.** They are now applied to staging; the bundle is regenerated as **45 migrations**. See `docs/PHASE-5.1-ADVISORIES-FORECAST.md` and `docs/PHASE-5.2-EVIDENCE-REVIEW.md` for the staging ledger caveat and the evidence-review handover. This unblocks climate history, advisory infrastructure, field-report intake, the district list and the evidence/review workflow. Do not use `supabase db push` against the staging history.
 2. **Deploy `climate-ingest` and `advisory-ingest`** alongside the existing functions. NASA POWER needs **no** secret; `ADVISORY_FEED_URL` stays unset until item 3 is answered.
 3. **A permission decision on the advisory and market pages.** `agripunjab.gov.pk/crop_advisory` and `amis.pk` are pages, not APIs, and neither publishes terms permitting automated collection. Either (a) request written permission, (b) supply the department's own feed if one exists internally, or (c) accept the CSV import path indefinitely. This is a decision, not a credential — nothing in the codebase will scrape without it.
 4. **The service-role key in the environment** for `npm run import:advisories` (never in a file, never in chat). Only needed when the first real advisory import is run.

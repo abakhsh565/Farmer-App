@@ -49,7 +49,7 @@ const header = `-- GENERATED FILE — do not edit. Run \`npm run db:bundle\` ins
 --
 -- After it succeeds, check the advisors (Advisors → Security) for any table
 -- without row level security, and then verify with:
---   select count(*) from pg_tables where schemaname = 'public';   -- 54
+--   select count(*) from pg_tables where schemaname = 'public';   -- 84
 `;
 
 const parts = files.map((name) => {

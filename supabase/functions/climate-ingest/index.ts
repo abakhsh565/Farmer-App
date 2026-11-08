@@ -28,7 +28,16 @@
  * cannot become a full-catalog download.
  */
 
-import { adminClient, clean, fail, json, preflight, readJson } from '../_shared/server.ts';
+import { adminClient, clean, fail, json, preflight, readJson, requireIngestAuth } from '../_shared/server.ts';
+import {
+  addIngestionError,
+  addWriteOutcome,
+  completedStatus,
+  emptyAccount,
+  finishIngestionRun,
+  ingestionFailurePayload,
+  type IngestionRpc,
+} from '../_shared/ingestion-accounting.ts';
 
 const VENDOR = 'https://power.larc.nasa.gov/api/temporal/daily/point';
 const PROVIDER_CODE = 'nasa_power';
@@ -60,12 +69,7 @@ function measured(value: unknown): number | null {
 
 type District = { code: string; hq_lat: number; hq_lon: number };
 
-async function fetchPower(
-  lat: number,
-  lon: number,
-  start: string,
-  end: string,
-): Promise<Record<string, Record<string, number>>> {
+function powerUrl(lat: number, lon: number, start: string, end: string): string {
   const compact = (d: string) => d.replace(/-/g, '');
   const params = new URLSearchParams({
     parameters: PARAMETERS,
@@ -77,7 +81,18 @@ async function fetchPower(
     format: 'JSON',
     'time-standard': 'UTC',
   });
-  const response = await fetch(`${VENDOR}?${params.toString()}`);
+  return `${VENDOR}?${params.toString()}`;
+}
+
+async function fetchPower(
+  lat: number,
+  lon: number,
+  start: string,
+  end: string,
+): Promise<Record<string, Record<string, number>>> {
+  const response = await fetch(powerUrl(lat, lon, start, end), {
+    signal: AbortSignal.timeout(30000),
+  });
   if (!response.ok) throw new Error(`NASA POWER answered ${response.status}.`);
   const body = (await response.json()) as {
     properties?: { parameter?: Record<string, Record<string, number>> };
@@ -92,6 +107,8 @@ async function fetchPower(
 Deno.serve(async (req) => {
   const options = preflight(req);
   if (options) return options;
+  const auth = requireIngestAuth(req);
+  if (auth) return auth;
 
   try {
     const url = new URL(req.url);
@@ -108,6 +125,13 @@ Deno.serve(async (req) => {
     }
 
     const client = adminClient();
+    const rpc: IngestionRpc = (name, args) => client.rpc(name, args);
+    const { error: recoveryError } = await client.rpc('recover_abandoned_ingestion_runs', {
+      p_limit: 10,
+    });
+    if (recoveryError) {
+      console.error(`[climate-ingest] abandoned-run recovery failed: ${recoveryError.message}`);
+    }
 
     const { data: districtRow, error: districtError } = await client
       .from('districts')
@@ -118,7 +142,7 @@ Deno.serve(async (req) => {
     if (districtError || !districtRow) return fail(`Unknown district '${district}'.`, 404);
     const target = districtRow as unknown as District;
 
-    const { data: runRow } = await client
+    const { data: runRow, error: runError } = await client
       .from('climate_ingestion_runs')
       .insert({
         provider_code: PROVIDER_CODE,
@@ -129,9 +153,32 @@ Deno.serve(async (req) => {
       })
       .select('id')
       .single();
-    const runId = (runRow as { id?: number } | null)?.id ?? null;
+    const runId = Number((runRow as { id?: number } | null)?.id);
+    if (runError || !Number.isInteger(runId)) {
+      return json({
+        ok: false,
+        error: 'Could not create the climate ingestion run.',
+        detail: runError?.message ?? 'run id was not returned',
+      }, 502);
+    }
+
+    const account = emptyAccount();
+    const errors: string[] = [];
+
+    const heartbeat = async () => {
+      const { data, error } = await client.rpc('touch_ingestion_run', {
+        p_kind: 'climate',
+        p_run_id: runId,
+      });
+      if (error || data === false) {
+        throw new Error(
+          `Run lease renewal failed: ${error?.message ?? 'run is no longer running'}`,
+        );
+      }
+    };
 
     try {
+      await heartbeat();
       const parameter = await fetchPower(target.hq_lat, target.hq_lon, start, end);
       const tmax = parameter['T2M_MAX'] ?? {};
       const tmin = parameter['T2M_MIN'] ?? {};
@@ -141,7 +188,10 @@ Deno.serve(async (req) => {
       const days = Object.keys(tmax).sort();
 
       if (days.length === 0) throw new Error('NASA POWER returned no days for this range.');
+      account.fetched = days.length;
 
+      const sourceUrl = powerUrl(target.hq_lat, target.hq_lon, start, end);
+      const retrievedAt = new Date().toISOString();
       const rows = days.map((day) => ({
         provider_code: PROVIDER_CODE,
         district_code: target.code,
@@ -156,24 +206,39 @@ Deno.serve(async (req) => {
           T2M_MAX: measured(tmax[day]),
           T2M_MIN: measured(tmin[day]),
           PRECTOTCORR: measured(rain[day]),
+          RH2M: measured(rh[day]),
+          WS10M: measured(wind[day]),
         },
+        source_url: sourceUrl,
+        units: {
+          tmax_c: '°C', tmin_c: '°C', precip_mm: 'mm', humidity_pct: '%', wind_kph: 'km/h',
+        },
+        provenance: {
+          provider: 'NASA POWER',
+          product: 'MERRA-2 daily reanalysis',
+          grid_resolution: '0.5 degree',
+          coordinates: { lat: target.hq_lat, lon: target.hq_lon },
+          license: 'CC BY 4.0',
+          retrieved_at: retrievedAt,
+          note: 'gridded reanalysis, not a ground observation',
+        },
+        data_kind: 'reanalysis',
       }));
 
-      const { error } = await client.from('climate_observations').upsert(rows, {
-        onConflict: 'provider_code,district_code,observed_on',
-      });
-      if (error) throw new Error(error.message);
+      try {
+        const { data, error } = await client.rpc('record_climate_observations', { p_rows: rows });
+        if (error) throw new Error(error.message);
+        addWriteOutcome(account, data);
+      } catch (error) {
+        account.failed += rows.length;
+        throw error;
+      }
 
-      if (runId !== null) {
-        await client
-          .from('climate_ingestion_runs')
-          .update({
-            status: 'ok',
-            finished_at: new Date().toISOString(),
-            rows_seen: days.length,
-            rows_written: rows.length,
-          })
-          .eq('id', runId);
+      const finished = await finishIngestionRun(
+        'climate-ingest', runId, 'climate', completedStatus(account), account, errors, null, rpc,
+      );
+      if (!finished.ok) {
+        return json(ingestionFailurePayload(runId, account, errors, finished), 500);
       }
 
       return json({
@@ -181,15 +246,17 @@ Deno.serve(async (req) => {
         provider: PROVIDER_CODE,
         district: target.code,
         days: rows.length,
+        accounting: account,
         range: { start, end },
       });
     } catch (error) {
       const detail = error instanceof Error ? error.message : 'ingestion failed';
-      if (runId !== null) {
-        await client
-          .from('climate_ingestion_runs')
-          .update({ status: 'failed', finished_at: new Date().toISOString(), error: detail })
-          .eq('id', runId);
+      addIngestionError(errors, detail);
+      const finished = await finishIngestionRun(
+        'climate-ingest', runId, 'climate', 'failed', account, errors, null, rpc,
+      );
+      if (!finished.ok) {
+        return json(ingestionFailurePayload(runId, account, errors, finished), 500);
       }
       return fail(detail, 502);
     }

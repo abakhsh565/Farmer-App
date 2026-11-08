@@ -2,6 +2,7 @@ import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { App } from '@/App';
+import { completeSignIn } from '@/testing/credential';
 import { resetPersistence } from '@/services/persistence';
 import { markOnboardingComplete } from '@/onboarding/OnboardingFlow';
 
@@ -27,21 +28,7 @@ beforeEach(() => {
 
 const READY = { timeout: 5000 };
 
-/** The code the development provider issued, read off the sheet it prints it on. */
-const developmentCode = (): string => {
-  const hint = screen.getByText(/Development build — the code is/).textContent ?? '';
-  const match = hint.match(/(\d{3,8})/);
-  if (!match?.[1]) throw new Error('the development sheet did not show a code');
-  return match[1];
-};
-
-const signIn = async (number: string) => {
-  await userEvent.type(screen.getByLabelText('Mobile number'), number);
-  await userEvent.click(screen.getByRole('button', { name: 'Continue' }));
-  await screen.findByLabelText('Code');
-  await userEvent.type(screen.getByLabelText('Code'), developmentCode());
-  await userEvent.click(screen.getByRole('button', { name: 'Verify' }));
-};
+const signIn = completeSignIn;
 
 /**
  * The first header control on Home is the farmer's own avatar, so the profile is
@@ -55,7 +42,7 @@ const openProfile = async () => {
 };
 
 const openDealer = async (name: string) => {
-  await userEvent.click(screen.getByRole('button', { name: 'Dealers' }));
+  await userEvent.click(screen.getByRole('button', { name: 'Shop' }));
   await userEvent.click(await screen.findByRole('button', { name: new RegExp(`^${name}`) }, READY));
 };
 
@@ -70,7 +57,7 @@ describe('the field-visit journey', () => {
 
     /* A visit goes to one shop and is answered by a person, so it is accountable
        like every other write — gated, with the reason, and not lost. */
-    expect(await screen.findByText('Create your account')).toBeInTheDocument();
+    expect(await screen.findByRole('dialog')).toBeInTheDocument();
     expect(
       screen.getByText(
         'A field visit request goes to a specific shop, so it needs your account.',
@@ -157,7 +144,7 @@ describe('signing out and back in', () => {
       post,
     );
     await userEvent.click(screen.getByRole('button', { name: 'Post' }));
-    await screen.findByText('Create your account');
+    await screen.findByRole('dialog');
     await signIn('0300 2223334');
 
     expect(await screen.findAllByText(post)).toHaveLength(1);
@@ -180,7 +167,7 @@ describe('signing out and back in', () => {
     render(<App />);
     await openProfile();
     await userEvent.click(
-      await screen.findByRole('button', { name: 'Create an account' }, READY),
+      await screen.findByRole('button', { name: /Tap to sign in/ }, READY),
     );
     await signIn('0300 2223334');
 

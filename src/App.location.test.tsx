@@ -1,25 +1,30 @@
 import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { App } from '@/App';
+import { clearPlaceCache } from '@/services/geocode';
 import { markOnboardingComplete } from '@/onboarding/OnboardingFlow';
 
 /**
  * The location rules, exercised through the real screens.
  *
- * These are the behaviours that cannot be checked by reading a service: a farmer
- * who searches somewhere else must be able to *see* that their saved location has
- * not moved, must be offered a way to keep the new place, and must not have it
- * written just because they looked at it. Each of those is a sentence on the
- * screen and a control beside it, so they are asserted where the farmer reads them.
- *
- * The guest path is the one under test here. Nothing is written without an account
- * — saving is the accountable act — and declining the account must leave the
- * search exactly where it was, still temporary and still unsaved.
+ * Choosing and saving are two acts: tapping a place shows the circle it produces
+ * and the range control, and “Save location” is the one write. A guest keeps the
+ * place on the phone; a signed-in farmer's store writes it to the account.
  */
 
-/** Long enough for a service read to land on a loaded machine. */
 const READY = { timeout: 4000 };
+
+const PLACE = {
+  place_id: 73,
+  lat: '32.1877',
+  lon: '74.1945',
+  display_name: 'Gujranwala, Punjab, Pakistan',
+};
+
+const fetchMock = vi.fn(
+  async () => ({ ok: true, json: async () => [PLACE] }) as unknown as Response,
+);
 
 beforeEach(() => {
   localStorage.clear();
@@ -27,18 +32,33 @@ beforeEach(() => {
   document.documentElement.lang = 'en';
   document.documentElement.dir = 'ltr';
   document.documentElement.classList.remove('dark');
+  clearPlaceCache();
+  vi.stubGlobal('fetch', fetchMock);
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
 });
 
 async function openDealers() {
-  await userEvent.click(screen.getByRole('button', { name: 'Dealers' }));
-  return screen.findByRole('region', { name: 'Your location' }, READY);
+  await userEvent.click(screen.getByRole('button', { name: 'Shop' }));
+  return screen.findByRole('region', { name: 'Current location' }, READY);
 }
 
-/** Chooses a named area from the search-settings sheet and closes it. */
+/** Opens the location page from the filter and picks a place. */
 async function chooseArea(name: string) {
   await userEvent.click(screen.getByRole('button', { name: 'Search settings' }));
-  await userEvent.click(await screen.findByRole('button', { name }, READY));
-  await userEvent.click(screen.getByRole('button', { name: 'Close' }));
+  await userEvent.click(await screen.findByRole('button', { name: 'Change' }, READY));
+  await screen.findByRole('heading', { name: 'Your location' }, READY);
+
+  await userEvent.type(screen.getByRole('searchbox', { name: /Search village or town/ }), name);
+  await userEvent.click(await screen.findByText(PLACE.display_name, {}, READY));
+}
+
+async function saveArea(name: string) {
+  await chooseArea(name);
+  await userEvent.click(screen.getByRole('button', { name: 'Save location' }));
+  expect(await screen.findByText('Saved on this phone only.', {}, READY)).toBeInTheDocument();
 }
 
 describe('a guest and their location', () => {
@@ -46,71 +66,38 @@ describe('a guest and their location', () => {
     render(<App />);
     const bar = await openDealers();
 
-    expect(within(bar).getByText('Not saved yet')).toBeInTheDocument();
+    expect(within(bar).getByText('Not set')).toBeInTheDocument();
     expect(
-      within(bar).getByText('The default area for your district until you save one.'),
+      within(bar).getByText('Set your location to see dealers and weather near you.'),
     ).toBeInTheDocument();
 
     // A guest is not blocked from the passive experience: the search still answers.
     expect(screen.getByText(/dealers within 10 km/)).toBeInTheDocument();
   });
 
-  it('keeps a chosen area temporary, says so, and offers to save it', async () => {
-    render(<App />);
-    await openDealers();
-    await chooseArea('Gujranwala');
-
-    // The rule, in the farmer's words: looking somewhere else did not move the
-    // saved location.
-    expect(
-      screen.getByText('Searching around Gujranwala. Your saved location stays Not saved yet.'),
-    ).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Save this location' })).toBeInTheDocument();
-  });
-
   it('keeps a chosen area for a guest, with no account asked for', async () => {
     render(<App />);
     await openDealers();
-    await chooseArea('Gujranwala');
+    await saveArea('Gujranwala');
 
-    await userEvent.click(screen.getByRole('button', { name: 'Save this location' }));
-
-    /*
-     * Saving no longer asks for an account. The farmer who cannot sign up is
-     * precisely the one who needs the shops near them, and choosing where you are
-     * is not said *to* anyone — see LocationProvider for why it is kept on the
-     * phone instead.
-     */
+    /* Saving does not ask for an account. Choosing where you are is kept on the
+       phone, the same way the guest's crops are. */
     expect(screen.queryByText('Create your account')).not.toBeInTheDocument();
 
     const kept = JSON.parse(localStorage.getItem('agri-shop.location') ?? '{}');
-    expect(kept.label).toBe('Gujranwala');
-
-    /*
-     * And it is the farmer's own location now, not a temporary area — said the way
-     * it can actually be true, since there is no account to have saved it to.
-     */
-    expect(await screen.findByText('Saved on this phone.', {}, READY)).toBeInTheDocument();
+    expect(kept.label).toBe(PLACE.display_name);
+    expect(await screen.findByText(PLACE.display_name, {}, READY)).toBeInTheDocument();
   });
 
-  it('names the place a temporary search will not replace', async () => {
+  it('does not write the place merely because the farmer looked at it', async () => {
     render(<App />);
     await openDealers();
-    await userEvent.click(screen.getByRole('button', { name: 'Search settings' }));
+    await chooseArea('Gujranwala');
 
-    // "My profile location" has to name what the account actually holds, rather
-    // than a place written into the build.
-    const profileRow = await screen.findByRole(
-      'button',
-      { name: /My profile location/ },
-      READY,
-    );
-    expect(profileRow).toHaveTextContent('Not saved yet');
-
-    await userEvent.click(screen.getByRole('button', { name: /Kot Ladha/ }));
-    expect(
-      screen.getByText('Temporary search area. Your profile location stays Not saved yet.'),
-    ).toBeInTheDocument();
+    // Picking fills the panel; it is not the write.
+    expect(screen.getByText('Chosen place')).toBeInTheDocument();
+    expect(localStorage.getItem('agri-shop.location')).toBeNull();
+    expect(screen.getByRole('button', { name: 'Save location' })).toBeEnabled();
   });
 });
 
@@ -150,18 +137,14 @@ describe('the search range', () => {
    * Every saved location carries a radius, and one of them was winning at every
    * launch: the filter wrote the phone's preference, the saved record still held
    * whatever was in force when it was saved, and the older number kept overwriting
-   * the newer one — so a range a farmer had chosen reverted the moment they
-   * reopened the app. The record's radius is adopted from the *account*, where it is
-   * the number the server searches with, and not from the phone's own copy.
+   * the newer one. This is the restart where that used to happen.
    */
   it('is not undone by a saved location on the same phone', async () => {
     const first = render(<App />);
     await openDealers();
 
     // Save an area as a guest, with the range at its default of 10 km.
-    await chooseArea('Gujranwala');
-    await userEvent.click(screen.getByRole('button', { name: 'Save this location' }));
-    await screen.findByText('Saved on this phone.', {}, READY);
+    await saveArea('Gujranwala');
 
     // Then widen it, which writes the phone's own preference.
     await userEvent.click(screen.getByRole('button', { name: 'Search settings' }));

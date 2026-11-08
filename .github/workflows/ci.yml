@@ -1,6 +1,6 @@
 name: CI
 
-# Every push and every pull request runs the same five gates a developer runs
+# Every push and every pull request runs the same gates a developer runs
 # locally, in the same order, so "it passed on my machine" is not a sentence
 # anybody has to say. The APK build is deliberately *not* here: it needs a JDK and
 # the Android SDK, it produces a binary nobody downloads from CI, and a red build
@@ -20,6 +20,24 @@ concurrency:
 permissions:
   contents: read
 jobs:
+  # Keep the ingestion lifecycle guard independent of unrelated failures. If a
+  # UI test or migration lint is red for an unrelated reason, the guard still
+  # reports its own result instead of being skipped behind an earlier step.
+  ingestion-lifecycle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+
+      - run: npm ci
+
+      - name: Ingestion lifecycle guard
+        run: npm run check:ingestion-lifecycle
+
   verify:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -53,6 +71,25 @@ jobs:
 
       - name: Production build
         run: npm run build
+
+  # Recovery and load are disposable-Postgres checks, not staging checks. They
+  # run independently so a failure names the gate that broke instead of hiding
+  # behind a UI test. Both use the same bundled schema the migration lint sees.
+  recovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Backup and restore drill
+        run: bash scripts/verify-recovery.sh
+
+  performance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bounded load and concurrency
+        run: bash scripts/verify-performance.sh
 
   # Vendor contracts drift: a field gets renamed, a unit changes, a code is added.
 # The only way to find out is to ask the real service, which is why this job

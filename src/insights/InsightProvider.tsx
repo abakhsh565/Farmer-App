@@ -7,9 +7,23 @@ import {
   type ReactNode,
 } from 'react';
 import { useLocale } from '@/i18n/LocaleProvider';
-import { ownerFor, usePersistentDocument } from '@/services/persistence';
+import { ownerFor, useOnline, usePersistentDocument } from '@/services/persistence';
 import { useSession } from '@/session/SessionProvider';
 import { InsightSheets } from '@/components/insights/Insights';
+import { track } from '@/intelligence/track';
+import { getIntelligenceGateway } from '@/intelligence/client';
+import { serviceConfig } from '@/services/config';
+import {
+  orderByServerRanking,
+  recommendationForInsight,
+  type RankedRecommendation,
+} from '@/intelligence/feed';
+import {
+  usePersonalizedFeed,
+  type PersonalizationStatus,
+} from '@/intelligence/usePersonalizedFeed';
+import { useAlerts, type AlertsStatus } from '@/intelligence/useAlerts';
+import type { AlertRow } from '@/intelligence/alerts';
 import {
   activeForCrop,
   addCrop as addCropIn,
@@ -46,6 +60,19 @@ export type InsightValue = {
   crops: CropInstance[];
   primary: CropInstance | undefined;
   forCrop: (cropId: string) => Insight[];
+  /** The one unambiguous server row behind an insight, when one exists. */
+  recommendationFor: (insightId: string) => RankedRecommendation | null;
+  /** Server-ranked rows; empty when the local document is the fallback. */
+  personalized: RankedRecommendation[];
+  personalizationStatus: PersonalizationStatus;
+  refreshPersonalized: () => void;
+  alerts: AlertRow[];
+  alertStatus: AlertsStatus;
+  unreadAlerts: number;
+  refreshAlerts: () => void;
+  readAlert: (notificationId: string) => Promise<boolean>;
+  dismissAlert: (notificationId: string) => Promise<boolean>;
+  readAllAlerts: () => Promise<number>;
   topFor: (cropId: string) => Insight | undefined;
   openInsightId: string | null;
   open: (insightId: string) => void;
@@ -97,6 +124,19 @@ export function InsightProvider({ children }: { children: ReactNode }) {
   const [now, setNow] = useState(() => Date.now());
   const [openInsightId, setOpenInsightId] = useState<string | null>(null);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
+  const online = useOnline();
+  const personalization = usePersonalizedFeed({
+    accountId: account?.id ?? null,
+    enabled: Boolean(account),
+    online,
+    crops: data.crops,
+  });
+  const alertsState = useAlerts({
+    accountId: account?.id ?? null,
+    enabled: Boolean(account),
+    online,
+    crops: data.crops,
+  });
 
   useEffect(() => {
     const id = window.setInterval(() => setNow(Date.now()), TICK_MS);
@@ -108,26 +148,79 @@ export function InsightProvider({ children }: { children: ReactNode }) {
       data,
       crops: data.crops,
       primary: primaryCrop(data),
-      forCrop: (cropId) => activeForCrop(data, cropId, now),
-      topFor: (cropId) => activeForCrop(data, cropId, now)[0],
+      forCrop: (cropId) =>
+        orderByServerRanking(activeForCrop(data, cropId, now), personalization.ranked),
+      topFor: (cropId) =>
+        orderByServerRanking(activeForCrop(data, cropId, now), personalization.ranked)[0],
+      recommendationFor: (insightId) => {
+        const insight = data.insights.find((entry) => entry.id === insightId);
+        return insight
+          ? recommendationForInsight(insight, data.insights, personalization.ranked)
+          : null;
+      },
       openInsightId,
       open: (insightId) => {
+        const opened = data.insights.find((entry) => entry.id === insightId);
+        if (opened) {
+          track({ type: 'insight_open', subject: opened.kind, context: { screen: 'home', topic: opened.kind } });
+        }
         setNotificationsOpen(false);
         setOpenInsightId(insightId);
         setData((current) => markViewed(current, insightId));
       },
       close: () => setOpenInsightId(null),
       act: (insightId) => {
+        const acted = data.insights.find((entry) => entry.id === insightId);
+        if (acted) {
+          track({ type: 'insight_act', subject: acted.kind, context: { screen: 'home', topic: acted.kind } });
+        }
         setData((current) => markActed(current, insightId));
         setOpenInsightId(null);
       },
       dismiss: (insightId) => {
+        const dismissed = data.insights.find((entry) => entry.id === insightId);
+        if (dismissed) {
+          track({ type: 'insight_dismiss', subject: dismissed.kind, context: { screen: 'home', topic: dismissed.kind } });
+        }
+        if (dismissed) {
+          const target = recommendationForInsight(
+            dismissed,
+            data.insights,
+            personalization.ranked,
+          );
+          if (target) {
+            void (async () => {
+              try {
+                const gateway = await getIntelligenceGateway(serviceConfig.supabase);
+                await gateway?.sendFeedback({
+                  key: `feedback:${target.recommendationId}:dismissed`,
+                  verdict: 'dismissed',
+                  recommendationId: target.recommendationId,
+                  insightRef: dismissed.id,
+                  context: { screen: 'home', topic: dismissed.kind },
+                });
+              } catch {
+                /* The local dismissal is complete; feedback is best-effort. */
+              }
+            })();
+          }
+        }
         setData((current) => dismissIn(current, insightId));
         setOpenInsightId(null);
       },
       makePrimary: (cropId) => setData((current) => makePrimaryIn(current, cropId)),
       addCrop: (input) => setData((current) => addCropIn(current, input, Date.now())),
       chooseCrop: (input) => setData((current) => chooseCropIn(current, input, Date.now())),
+      personalized: personalization.ranked,
+      personalizationStatus: personalization.status,
+      refreshPersonalized: personalization.refresh,
+      alerts: alertsState.alerts,
+      alertStatus: alertsState.status,
+      unreadAlerts: alertsState.unread,
+      refreshAlerts: alertsState.refresh,
+      readAlert: alertsState.markRead,
+      dismissAlert: alertsState.dismiss,
+      readAllAlerts: alertsState.readAll,
       notifications: visibleNotifications(data, now),
       unread: unreadCount(data, now),
       notificationsOpen,
@@ -135,7 +228,23 @@ export function InsightProvider({ children }: { children: ReactNode }) {
       closeNotifications: () => setNotificationsOpen(false),
       readAll: () => setData((current) => markAllRead(current)),
     }),
-    [data, now, openInsightId, notificationsOpen, t],
+    [
+      data,
+      now,
+      openInsightId,
+      notificationsOpen,
+      t,
+      personalization.ranked,
+      personalization.status,
+      personalization.refresh,
+      alertsState.alerts,
+      alertsState.status,
+      alertsState.unread,
+      alertsState.refresh,
+      alertsState.markRead,
+      alertsState.dismiss,
+      alertsState.readAll,
+    ],
   );
 
   return (

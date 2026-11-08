@@ -51,6 +51,27 @@ export function adminClient(): SupabaseClient {
   });
 }
 
+/**
+ * A client that acts as the caller, not as the service role.
+ *
+ * Farmer context is read through this client so `auth.uid()` and RLS apply. A
+ * service-role read would make every farmer's context reachable by a bug in one
+ * query; this one cannot read a row the JWT does not own. The publishable key is
+ * safe in a function environment — it is already shipped in the client — and is
+ * used only to construct the request, never returned.
+ */
+export function callerClient(token: string | null): SupabaseClient | null {
+  const key =
+    Deno.env.get('SUPABASE_ANON_KEY') ??
+    Deno.env.get('SUPABASE_PUBLISHABLE_KEY') ??
+    null;
+  if (!token || !SUPABASE_URL || !key) return null;
+  return createClient(SUPABASE_URL, key, {
+    auth: { persistSession: false, autoRefreshToken: false },
+    global: { headers: { Authorization: `Bearer ${token}` } },
+  });
+}
+
 /* -------------------------------------------------------------------------- */
 /* Responses                                                                  */
 /* -------------------------------------------------------------------------- */
@@ -62,7 +83,7 @@ export function adminClient(): SupabaseClient {
  */
 export const CORS: Record<string, string> = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-ingest-key',
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
 };
 
@@ -79,6 +100,39 @@ export function fail(message: string, status = 400): Response {
 
 export function preflight(req: Request): Response | null {
   return req.method === 'OPTIONS' ? new Response('ok', { headers: CORS }) : null;
+}
+
+/**
+ * Ingestion functions write with the service key, so they cannot be public.
+ * The scheduler sends the project's server key; a browser or anonymous caller
+ * must not be able to trigger provider spend or database writes.
+ */
+function serverKeys(): string[] {
+  const keys: string[] = [];
+  const bundle = Deno.env.get('SUPABASE_SECRET_KEYS');
+  if (bundle) {
+    try {
+      const parsed = JSON.parse(bundle) as Record<string, string>;
+      for (const value of Object.values(parsed)) {
+        if (typeof value === 'string' && value) keys.push(value);
+      }
+    } catch {
+      // Fall through to the legacy key.
+    }
+  }
+  const legacy = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY');
+  if (legacy) keys.push(legacy);
+  return [...new Set(keys)];
+}
+
+export function requireIngestAuth(req: Request): Response | null {
+  const expected = Deno.env.get('INGEST_TOKEN');
+  if (!expected) return fail('INGEST_TOKEN is not configured for this function.', 503);
+  const presented = req.headers.get('x-ingest-key')?.trim() ?? '';
+  if (!presented || presented !== expected) {
+    return fail('Ingestion credential is not valid.', 401);
+  }
+  return null;
 }
 
 /* -------------------------------------------------------------------------- */
