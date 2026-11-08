@@ -1,6 +1,13 @@
 # Phase 3/5 — contract matrix and staging acceptance
 
-Status: **local contracts verified; staging acceptance blocked.**
+Status: **local contracts verified; staging migrations and signed-out AI pass;
+human approvals, live AI and hosted recovery/performance remain blocked.**
+
+Latest hosted inspection: **2026-11-08T13:30Z**. Migrations `20261105000100` and
+`20261105000200` are recorded in staging, the later source-permission gate is
+applied forward-only as `20261108130627`, and the `ai` function (v15) returns
+`401` before body parsing. See the observed state below and the consolidated
+result in [`PHASE-8-LAUNCH-READINESS.md`](PHASE-8-LAUNCH-READINESS.md).
 
 This document is the bridge between the throwaway-Postgres evidence and the
 hosted environment. It does not claim that the new migrations are deployed. It
@@ -45,27 +52,49 @@ npm run build
 ```
 
 Expected today: isolation green, AI controls **41/41**, recovery **20/20**,
-performance **21/21**, intelligence **76/76** after the licensing/publishing
-cases, and the unit suite green (607 passed, 1 skipped at the Phase 8 baseline).
+performance **21/21**, intelligence **78/78** after the source-permission case,
+and the unit suite green (607 passed, 1 skipped at the Phase 8 baseline).
 
 ## Staging prerequisites
 
 The following are external and must not be invented:
 
-1. A SQL-write path to staging project `swmbmtvwgksicfnfsehg`: `psql` connection
-   string or a Management API token with write access. The MCP path is
-   permission-denied and there is no local `psql`.
-2. Explicit operator approval to apply the two forward-only migrations
-   `20261105000100_knowledge_lifecycle_completion.sql` and
-   `20261105000200_ai_gateway_controls.sql`. Do not use `supabase db push` from
-   this work, and do not insert ledger rows by hand.
-3. A named reviewer holding `evidence_reviewer` and/or `content_manager`
+1. **Resolved 2026-11-08.** A Management API token with access to
+   `swmbmtvwgksicfnfsehg` is available to the operator and was used with the
+   approved migration endpoint. Never commit or print it; do not substitute
+   another project.
+2. **Resolved 2026-11-08.** `20261105000100` and `20261105000200` are recorded
+   in the staging ledger; the source gate prepared after `00100` was recorded
+   was applied forward-only as `20261108130627`. `supabase db push` was not used,
+   no DDL was pasted into the SQL editor, and no ledger row was inserted by
+   hand.
+3. **Resolved 2026-11-08.** The repository `ai` function was redeployed as
+   version 15; signed-out requests now return `401` before body parsing.
+4. A named reviewer holding `evidence_reviewer` and/or `content_manager`
    authority, plus an agronomist sign-off for any agronomic threshold.
-4. A source record whose publisher permission and licence are actually recorded.
+5. A source record whose publisher permission and licence are actually recorded.
    `unknown` and `needs_permission` must stay blocked.
-5. An approved `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) in the Edge Function secret
-   store for a live-provider test. No key is present in this environment.
-6. Explicit authorization before any production operation. None is granted.
+6. An approved signed-in staging account and explicit cost authorisation for a
+   live-provider test. The deployed function reports Gemini configured.
+7. Explicit authorization before any production operation. None is granted.
+
+## Observed staging state (2026-11-08T13:30Z)
+
+| Probe | Result | Interpretation |
+| --- | --- | --- |
+| `auth/v1/settings` | 200 | Reachable |
+| `parties`, `agri_knowledge_sources`, `agri_knowledge_entries`, `agri_evidence_items` | 401 / 42501 | Present; anonymous access correctly denied |
+| `ai_request_events`, `ai_rate_windows`, `ai_answer_feedback` | present, RLS on | Applied by `20261105000200` |
+| `agri_knowledge_ingestion_runs`, `agri_knowledge_ingestion_items` | present, RLS on | Applied by `20261105000100` |
+| Staging ledger | 77 rows | Includes `20261105000100`, `20261105000200` and `20261108130627` |
+| `ai_knowledge_search`, `intelligence_recommendation_feed` | gate present in both definitions | Source permission/licence filter is persisted |
+| `POST /functions/v1/ai/ask` with no auth and `{}` | 401 `UNAUTHORIZED_NO_AUTH_HEADER` | Gateway rejects before the handler |
+| `POST /functions/v1/ai/ask` with only the publishable key | 401 `Sign in to use the assistant.` | Handler rejects before body parsing; no model call |
+| `GET /functions/v1/ai/health` unsigned | 401 | Health is not public |
+
+The 2026-11-06 observations remain in the previous revision of this document as
+history; they are superseded by the probes above. No signed-in AI request was
+made, so no provider spend was incurred.
 
 ## Staging procedure
 
@@ -89,16 +118,25 @@ psql "$STAGING_DATABASE_URL" -X -A -F '|' -c \
 
 ### 2. Apply the two migrations through the approved runner
 
-Use the organization's approved migration path. If it is the Supabase CLI, the
-operator command is:
+Use the organisation's approved migration path. The preferred path is the
+Supabase Management API migration endpoint, which records the migration ledger,
+or an equivalent approved runner. A connection-string runner is also acceptable
+if it records history correctly.
 
-```bash
-supabase db push --db-url "$STAGING_DATABASE_URL"
+```text
+POST https://api.supabase.com/v1/projects/$STAGING_PROJECT_REF/database/migrations
+Authorization: Bearer $SUPABASE_ACCESS_TOKEN
+Content-Type: application/json
+
+{"name":"20261105000100_knowledge_lifecycle_completion","query":"<exact migration SQL>"}
 ```
 
-This command is documented for the operator only; it was **not** run by this
-work. The required outcome is two ledger rows and no rewrite of any earlier
-migration.
+Use the same endpoint for `20261105000200_ai_gateway_controls`. Keep
+`SUPABASE_ACCESS_TOKEN` in the operator's secret environment; never paste it
+into this repository or a chat. `supabase db push` is explicitly **not** used by
+this closure. The dashboard SQL editor is also **not** used because it applies
+the schema without the ledger. The required outcome is two ledger rows and no
+rewrite of any earlier migration.
 
 ### 3. Persisted-state checks
 
@@ -171,8 +209,14 @@ result for staging evidence.
 
 ## Current blockers
 
-- No staging SQL-write credential or local `psql`.
+- ~~No staging SQL-write credential.~~ **Resolved 2026-11-08:** migrations were
+  applied through the approved Management API endpoint.
+- ~~The deployed staging Edge Function accepts anonymous requests.~~ **Resolved
+  2026-11-08:** `ai` v15 returns `401` before body parsing.
+- No approved signed-in staging account or explicit paid-provider authorisation,
+  despite a configured Gemini key in the deployed function.
 - No approved reviewer/content-manager identity or agronomist sign-off.
-- No permitted source record.
-- No approved Gemini key.
+- No permitted source record; `punjab_agri` remains `unknown` until a real
+  licence/permission is recorded.
+- No hosted backup/PITR confirmation or staging load-test authorisation.
 - No production authorization.

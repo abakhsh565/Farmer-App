@@ -1,8 +1,43 @@
 # Phase 5 — AI Development
 
-Status: **implemented and locally verified; not staging/runtime-verified.**
-Phase 5 is not complete while the two migrations below are absent from staging
-and no live provider call has been demonstrated.
+Status: **implemented and locally verified; staging schema and signed-out auth
+verified; authenticated live acceptance blocked.**
+The two migrations are recorded in staging, the later source gate is applied as
+`20261108130627`, and `ai` v15 now enforces the repository's signed-out `401`.
+No authenticated live lifecycle has been demonstrated. A Gemini key is reported
+as configured in staging, but that is not an accepted live result.
+
+## Staging evidence — 2026-11-08
+
+- Staging ledger: **77** rows, including `20261105000100`,
+  `20261105000200` and the forward-only source gate `20261108130627`.
+- `ai_request_events`, `ai_rate_windows`, `ai_answer_feedback`,
+  `agri_knowledge_ingestion_runs` and `agri_knowledge_ingestion_items` all
+  exist with RLS enabled.
+- `ai_knowledge_search` and `intelligence_recommendation_feed` both contain the
+  source-permission and licence filter.
+- `ai` **version 15** is deployed. A request with no auth header returns gateway
+  `401`; a request with only the publishable key returns
+  `401 {"error":"Sign in to use the assistant."}` before body parsing, so no
+  model call is attempted.
+
+## Staging evidence — 2026-11-06 (superseded)
+
+- `GET /functions/v1/ai/health` returned 200 with
+  `configured:true`, `active:"gemini"`, `model:"gemini-3.8-flash"` and
+  `gateway:false`.
+- `POST /functions/v1/ai/ask` with no auth and an empty body returned 400
+  `A question is required.`; with the publishable key as bearer it also returned
+  400; only a malformed bearer returned 401 at the gateway. The repository
+  router would return 401 before parsing the body. The deployed function is
+  therefore stale or misconfigured.
+- An earlier anonymous question returned 200 with a grounded retrieval answer
+  (`gate: agriculture`, confidence 60, citations). That is a live auth failure;
+  whether it attempted a paid provider call is unknown. No further request was
+  made without explicit cost authorisation.
+- No signed-in staging JWT was available, so provider timeouts, retries,
+  rate-limit responses, generated citations, Urdu/English output and telemetry
+  remain unverified.
 
 ## Reused, not rebuilt
 
@@ -104,30 +139,33 @@ provider exposes `feedback()`; no farmer-facing UI was added.
 These tests prove the local guards, the provider state machine and the database
 controls on a real PostgreSQL. They do **not** prove the migrations are applied
 to staging, that Gemini answers a live prompt, or that the Edge Function's HTTP
-surface behaves under a real JWT — no live provider call has been made.
+surface behaves under a real JWT. One anonymous staging request reached the
+answer path; it was not a signed-in lifecycle test and no authenticated live
+generation has been completed.
 
 ## Staging blockers and external dependencies
 
-- `20261105000100` and `20261105000200` are not applied to staging. This
-  environment has no `psql`, no SQL-write Management API credential, and the
-  Supabase MCP calls are permission-denied. No migration ledger, table, RPC,
-  RLS, rate-limit or telemetry result has been observed on a live database.
-- A live Gemini request needs an approved `GEMINI_API_KEY` (or
-  `GOOGLE_API_KEY`) in the function secret store. Do not put it in a request,
-  source file, `.env.example`, or client bundle.
-- Phase 3's acquisition/review/withdrawal migration is likewise still unverified
-  in staging, so retrieval's approved/current/withdrawn guarantees remain
-  unproven even though the gateway now validates what retrieval returns.
+- ~~`20261105000100` and `20261105000200` are not applied to staging.~~
+  **Resolved 2026-11-08:** both are recorded in the ledger, with the source gate
+  applied as `20261108130627`. Tables, RLS and function grants were read back.
+- A live Gemini request needs an approved signed-in staging account and explicit
+  cost authorisation. The deployed function reports Gemini configured; neither
+  an account nor a paid-call authorisation is available. Do not put a key in a
+  request, source file, `.env.example`, or client bundle.
+- ~~The deployed Edge Function must be replaced.~~ **Resolved 2026-11-08:**
+  `ai` v15 returns `401` before body parsing for signed-out callers.
+- Phase 3's acquisition/review/withdrawal schema is now present in staging, but
+  the human approval, reviewer identity and licence decisions remain absent.
 - No production deployment or production request was made.
 
 ## Status
 
-**Blocked for acceptance**, not complete. The throwaway-Postgres harness now
+**Blocked for live acceptance**, not complete. The throwaway-Postgres harness
 proves the schema, grants, RLS, rate limits, duplicate protection, telemetry and
-feedback persistence. What remains is staging-specific: apply
-`20261105000100` and `20261105000200` to staging, then observe a signed-out
-`401`; one farmer's context isolated from another through the HTTP route;
-a grounded answer with real citations; no-evidence / withdrawn / expired /
-unpublished exclusions; provider 429, 5xx, timeout and malformed behavior; and
-the same safety constraints in English and Urdu. A live Gemini call still needs
-an approved key and has not been attempted.
+feedback persistence; the staging schema and the signed-out `401` are now
+verified. What remains is authenticated: isolate one farmer's context from
+another through the HTTP route; obtain a grounded answer with real citations;
+exercise no-evidence / withdrawn / expired / unreviewed / unlicensed exclusions;
+exercise provider 429, 5xx, timeout and malformed behavior; and apply the same
+safety constraints in English and Urdu. No approved authenticated live call was
+completed. Do not make more paid calls without explicit authorisation.

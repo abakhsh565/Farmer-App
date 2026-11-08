@@ -270,6 +270,13 @@ case_out "an admin grants a licence with no name" refuse authenticated "$AUTH_AD
   "select code from public.agri_set_source_terms('uaf','granted',null)"
 
 echo
+echo "-- unlicensed or unreviewed sources are not trusted retrieval --"
+expect_eq "an unlicensed verified entry is excluded" \
+  "$(psql_value "select count(*) from public.ai_knowledge_search('pink bollworm', 'cotton', null, 8, null) where slug = 'cotton-pink-bollworm-etl'")" "0"
+expect_eq "a licensed editorial entry remains retrievable" \
+  "$(psql_value "select count(*) from public.ai_knowledge_search('pink bollworm', 'cotton', null, 8, null) where slug = 'cotton-pink-bollworm'")" "1"
+
+echo
 echo "-- the expert is made an expert through the real gate, not by hand --"
 # A verified contact is the PRD's first precondition, and a confirmed
 # qualification is the second. Both are done here the way the product does them.

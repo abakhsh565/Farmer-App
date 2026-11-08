@@ -4,12 +4,13 @@ Status: **ACCEPTED** for Phase 3 on 2026-11-03. This is not a claim that the ful
 App suite is green. The 33 App-suite failures below are accepted as the existing
 UI-redesign baseline; Phase 3 did not modify the production areas they exercise.
 
-Lifecycle completion addendum (2026-11-05, updated 2026-11-06): the later
+Lifecycle completion addendum (2026-11-05, updated 2026-11-08): the later
 acquisition, withdrawal, licence and stage-aware retrieval work is **not**
-covered by this acceptance. Its migration is still not applied to staging, so
-there is no staging persisted-state evidence and no human approval. The bundled
+covered by this acceptance. Its migration is now applied to staging (with the
+forward-only source gate `20261108130627`), but there is no signed-in lifecycle
+evidence and no human approval. The bundled
 schema including it now applies cleanly to throwaway Supabase Postgres and
-`scripts/verify-intel.sh` passes 76/76 cases there, including evidence-gated
+`scripts/verify-intel.sh` passes 78/78 cases there, including evidence-gated
 activation and risk generation; that is local runtime evidence, not staging
 acceptance. See [`docs/PHASE-3-KNOWLEDGE-ENGINE.md`](PHASE-3-KNOWLEDGE-ENGINE.md)
 §8. This document continues to describe only the 2026-11-03 retrieval acceptance.

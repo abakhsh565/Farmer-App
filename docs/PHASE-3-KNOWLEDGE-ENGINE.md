@@ -188,9 +188,10 @@ copy this section into the PRD) before treating the Notion handover as complete.
 
 ## 8. Knowledge lifecycle completion (2026-11-05)
 
-Status: implemented in source and statically verified; **not applied to staging**
-and **not runtime-verified**. This section adds to the earlier retrieval work; it
-does not replace the acceptance record in §1.
+Status: implemented in source and statically verified; **applied to staging on
+2026-11-08** (including forward-only gate `20261108130627`), but **not
+runtime-verified** under a signed-in lifecycle. This section adds to the earlier
+retrieval work; it does not replace the acceptance record in §1.
 
 ### Acquisition and source terms
 
