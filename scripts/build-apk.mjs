@@ -77,6 +77,34 @@ const OTA_DEFAULT_REPO = {
   production: 'abakhsh56/Farmer-App',
 };
 
+/**
+ * Blank out the endpoints a developer's `.env.local` may point at a local stack.
+ *
+ * Vite loads `.env.local` for every build, and `src/services/config.ts` prefers an
+ * explicit `VITE_SHOP_API_URL` / `VITE_MARKETPLACE_URL` over the per-environment
+ * table. Together that shipped a staging APK whose shop backend was
+ * `http://127.0.0.1:54321` — unreachable on a phone, and invisible in the build log
+ * because the build succeeded and the app simply looked unconfigured. An empty
+ * string overrides the file (process env wins) and reads back as "unset", so the
+ * environment table decides, which is the rule every CI build already follows.
+ *
+ * `dev` keeps the developer's own values: its backend *is* the local stack.
+ */
+function remoteEndpointOverrides(target) {
+  if (target === 'dev') return {};
+  return {
+    VITE_SHOP_API_URL: '',
+    VITE_SHOP_API_KEY: '',
+    VITE_MARKETPLACE_URL: '',
+    VITE_MARKETPLACE_KEY: '',
+    /* Unused by a staging or production build — `config.ts` takes the backend from
+       the environment table for both — but inlined all the same, and a localhost
+       URL inside a release artifact is a false alarm waiting to happen. */
+    VITE_SUPABASE_URL: '',
+    VITE_SUPABASE_ANON_KEY: '',
+  };
+}
+
 /** The `…/releases/download` base a flavour's build should poll. */
 function otaReleasesBase(target) {
   const configured = (process.env.OTA_RELEASE_REPO ?? '').trim();
@@ -258,6 +286,7 @@ function runWebBuild() {
     ...env,
     VITE_APP_ENV: flavor,
     VITE_OTA_BASE: `${otaReleasesBase(flavor)}/${selection.ota}`,
+    ...remoteEndpointOverrides(flavor),
   };
 
   // Run the tools through `node` and their own entry scripts, not through npm:
