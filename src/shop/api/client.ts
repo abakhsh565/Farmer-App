@@ -125,13 +125,46 @@ export function farmerMe(token: string) {
 }
 
 /**
+ * Who the farmer is, as the shop's join call records it.
+ *
+ * The shop has no farmer login of its own: it learns a farmer at the counter by
+ * name and phone number, and the phone is the identity — `0300…`, `+92300…` and
+ * `92300…` must resolve to one farmer rather than three. So the join carries all
+ * three facts the shop asks for, in the parameter names its function declares.
+ */
+export type FarmerIdentity = {
+  /** National digits without a plus (`923001234567`), as the shop normalises them. */
+  phone: string;
+  name: string;
+  village?: string | null;
+};
+
+/**
  * Join a shop with the code from its sticker.
  *
  * A shop id is deliberately not sent: the code names the shop, and a code that
  * also had to match a client-supplied shop id would be two facts where one will do.
+ *
+ * The phone and the name are not optional. `farmer_api_join_shop` is declared with
+ * `p_phone` and `p_name` having no defaults, so a call that omits them matches no
+ * signature at all and PostgREST answers `PGRST202` — which reads as "the function
+ * does not exist" and is why a join used to fail as if the shop were down.
  */
-export function farmerJoinShop(code: string) {
-  return callShopRpc<unknown>('farmer_api_join_shop', { p_code: code });
+export function farmerJoinShop(
+  code: string,
+  identity: FarmerIdentity,
+  config: ShopApiConfig = serviceConfig.shopApi,
+) {
+  return callShopRpc<unknown>(
+    'farmer_api_join_shop',
+    {
+      p_code: code,
+      p_phone: identity.phone,
+      p_name: identity.name,
+      p_village: identity.village ?? null,
+    },
+    config,
+  );
 }
 
 /**

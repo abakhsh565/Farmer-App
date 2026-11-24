@@ -84,14 +84,30 @@ export function firstRow(value: unknown): Record<string, unknown> | null {
  *
  * A `token` in the response is ignored: the app already holds one, and adopting a
  * second from a payload would let a stale response overwrite a fresh credential.
+ *
+ * Two shapes are read, because the shop answers with the second one and an older
+ * build of this app expected the first:
+ *
+ *   `{farmer_id, shop_id, shop_name}`                     — one shop per credential
+ *   `{id, name, shops: [{shop_id, shop_name}]}`           — the shop's actual answer
+ *
+ * A farmer joined to one shop still has exactly one conversation here, so the
+ * first entry of `shops` stands in for the pair. Reading only the flat shape was
+ * why a valid credential was reported as "not recognised by the shop".
  */
 export function normaliseMe(value: unknown): ShopMe | null {
   const row = firstRow(value);
   if (!row) return null;
 
   const shop = record(firstOf(row, ['shop', 'branch']));
-  const farmerId = text(firstOf(row, ['farmer_id', 'farmerId']));
-  const shopId = text(firstOf(row, ['shop_id', 'shopId'])) ?? text(shop.id);
+  const shops = Array.isArray(row.shops) ? row.shops : [];
+  const joined = record(shops[0] ?? {});
+
+  const farmerId = text(firstOf(row, ['farmer_id', 'farmerId', 'id']));
+  const shopId =
+    text(firstOf(row, ['shop_id', 'shopId'])) ??
+    text(shop.id) ??
+    text(firstOf(joined, ['shop_id', 'shopId', 'id']));
 
   /* Without these two the credential points at nothing this app can show. */
   if (!farmerId || !shopId) return null;
@@ -100,7 +116,11 @@ export function normaliseMe(value: unknown): ShopMe | null {
     farmerId,
     farmerName: text(firstOf(row, ['farmer_name', 'farmerName', 'name'])),
     shopId,
-    shopName: text(firstOf(row, ['shop_name', 'shopName'])) ?? text(shop.name) ?? '',
+    shopName:
+      text(firstOf(row, ['shop_name', 'shopName'])) ??
+      text(shop.name) ??
+      text(firstOf(joined, ['shop_name', 'shopName', 'name'])) ??
+      '',
     shopPhone: text(firstOf(row, ['shop_phone', 'phone'])) ?? text(shop.phone),
   };
 }
@@ -108,10 +128,14 @@ export function normaliseMe(value: unknown): ShopMe | null {
 /**
  * A message row, as a chat bubble.
  *
- * `sender_role` decides the side. The contract sends `farmer` or `shop_owner`;
- * `direction` is accepted as a fallback because it is the other obvious spelling.
- * A row that names neither is drawn as the shop's, since assuming the farmer wrote
- * it would show the farmer his own words as a reply.
+ * The shop marks each row with `direction`, and its two values are the two
+ * parties: `farmer` for what the farmer sent, `owner` for the shop's reply. That
+ * is not the same vocabulary as `sender_role`/`outbound`, so all of them are read:
+ * recognising only `outbound` drew the farmer's own messages on the shop's side of
+ * the conversation, and made his join notice look like an incoming line.
+ *
+ * A row that names no side at all is drawn as the shop's, since assuming the
+ * farmer wrote it would show him his own words as a reply.
  */
 function normaliseMessage(value: unknown, index: number): ChatMessage | null {
   const row = record(value);
@@ -120,7 +144,8 @@ function normaliseMessage(value: unknown, index: number): ChatMessage | null {
 
   const role = (text(firstOf(row, ['sender_role', 'role'])) ?? '').toLowerCase();
   const direction = (text(row.direction) ?? '').toLowerCase();
-  const mine = role === 'farmer' || direction === 'outbound' || direction === 'out';
+  const mine =
+    role === 'farmer' || direction === 'farmer' || direction === 'outbound' || direction === 'out';
 
   return {
     /* The thread's own order is the identity React needs: ids from two servers
@@ -148,11 +173,14 @@ export function normaliseThread(value: unknown): ShopThread {
       const offer = record(entry);
       const id = text(offer.id);
       if (!id) return null;
-      const amount = typeof offer.amount === 'number' ? offer.amount : Number(text(offer.amount));
+      /* The shop names these by what was asked for (`requested_amount`) and what it
+         offered (`offer_total`); the older flat names are still read beside them. */
+      const raw = firstOf(offer, ['amount', 'requested_amount', 'offer_total']);
+      const amount = typeof raw === 'number' ? raw : Number(text(raw));
       return {
         id,
         amount: Number.isFinite(amount) ? amount : null,
-        note: text(offer.note),
+        note: text(firstOf(offer, ['note', 'requested_note', 'offer_note'])),
         status: (text(offer.status) ?? 'unknown').toLowerCase(),
       } satisfies ShopOffer;
     })
@@ -172,7 +200,7 @@ export function normaliseThread(value: unknown): ShopThread {
       return {
         id,
         purpose: text(visit.purpose),
-        window: text(firstOf(visit, ['window', 'scheduled_for', 'day'])),
+        window: text(firstOf(visit, ['window', 'preferred_window', 'scheduled_for', 'day'])),
         status: (text(visit.status) ?? 'unknown').toLowerCase(),
       } satisfies ShopVisit;
     })

@@ -10,6 +10,8 @@ import {
   type ReactNode,
 } from 'react';
 import { serviceConfig } from '@/services/config';
+import { toE164 } from '@/services/supabaseClient';
+import { useSession } from '@/session/SessionProvider';
 import {
   farmerAnswerOffer,
   farmerCreateCreditRequest,
@@ -20,6 +22,7 @@ import {
   farmerSendMessage,
   farmerThread,
   isTerminal,
+  type FarmerIdentity,
   type ShopApiFailure,
 } from './api/client';
 import {
@@ -122,6 +125,21 @@ function saveSeen(ids: string[]): void {
 
 export function ShopApiProvider({ children }: { children: ReactNode }) {
   const configured = serviceConfig.shopApi.configured;
+  /*
+   * The farmer's own identity, for the one call that has to introduce him.
+   *
+   * Joining is the only place the shop learns who this is, and it learns it the way
+   * the owner does at the counter: a name and a phone number. The number is the
+   * identity on the shop's side, so it goes as national digits (`92300…`) — the
+   * shop normalises its own `0300…` and `+92300…` to the same key.
+   */
+  const { account } = useSession();
+  const identity = useMemo<FarmerIdentity | null>(() => {
+    if (!account?.phone) return null;
+    const phone = toE164(account.phone).replace(/^\+/, '');
+    if (!phone) return null;
+    return { phone, name: account.name.trim() || phone };
+  }, [account?.name, account?.phone]);
 
   const [credential, setCredential] = useState<ShopCredential | null>(() =>
     configured ? loadShopCredential() : null,
@@ -292,7 +310,17 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
       setBusy(true);
       setFailure(null);
       try {
-        const result = await farmerJoinShop(code);
+        /* A phone number is what the shop records, so a build that let an account
+           without one try to join would ask the owner to accept a nameless farmer. */
+        if (!identity) {
+          setFailure({
+            kind: 'validation',
+            message: 'Connecting to a shop needs a phone number on this account.',
+          });
+          return false;
+        }
+
+        const result = await farmerJoinShop(code, identity);
         if (!result.ok) {
           setFailure({ kind: result.error, message: result.message });
           return false;
@@ -319,7 +347,7 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
         setBusy(false);
       }
     },
-    [adopt, configured, load],
+    [adopt, configured, identity, load],
   );
 
   const joinWithLink = useCallback(
