@@ -60,6 +60,23 @@ export const VOICE_MIME_TYPES = [
 
 export type VoiceMimeType = (typeof VOICE_MIME_TYPES)[number];
 
+/**
+ * Whether this device can record at all, so the microphone is only drawn where it
+ * can be used.
+ *
+ * Kept here rather than borrowed from the speech/transcription module: that module
+ * is about turning an utterance into text and carries an endpoint, a twelve-second
+ * cap and a transcription call, none of which a voice note wants or should inherit.
+ */
+export function voiceRecordingSupported(): boolean {
+  return (
+    typeof navigator !== 'undefined' &&
+    typeof navigator.mediaDevices?.getUserMedia === 'function' &&
+    typeof window !== 'undefined' &&
+    typeof window.MediaRecorder !== 'undefined'
+  );
+}
+
 /** The device's best container, or `undefined` when it records none of them. */
 export function chooseVoiceMimeType(
   isSupported: (type: string) => boolean = (type) =>

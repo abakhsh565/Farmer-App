@@ -339,6 +339,11 @@ export const en = {
   'chat.voice.denied': 'Allow the microphone to record a voice message.',
   'chat.voice.unavailable': 'This device cannot record a voice message.',
   'chat.voice.label': 'Voice message',
+  /* Kept although `development` has retired these screens: `staging` still ships
+     AgentScreen and ScanScreen, and a catalogue that stops carrying their keys
+     breaks the staging build while looking like a chat change. */
+  'agent.disclaimer': 'Answers use this app’s own weather, market and shop data. Credit is spent when you send.',
+  'scan.openAgent': 'Ask the assistant instead',
   'chat.thread.open': 'Open conversation with {name}',
   'chat.unread': '{count} unread messages',
   /* The thread itself, in the order it reads. The dealer answers with the price
@@ -1839,6 +1844,8 @@ export const ur: Record<MessageKey, string> = {
   'chat.voice.denied': 'آواز کا پیغام ریکارڈ کرنے کے لیے مائیک کی اجازت دیں۔',
   'chat.voice.unavailable': 'یہ فون آواز کا پیغام ریکارڈ نہیں کر سکتا۔',
   'chat.voice.label': 'آواز کا پیغام',
+  'agent.disclaimer': 'جوابات اسی ایپ کے موسم، منڈی اور دکانوں کے ڈیٹا سے آتے ہیں۔ بھیجتے وقت کریڈٹ خرچ ہوتا ہے۔',
+  'scan.openAgent': 'بجائے اس کے معاون سے پوچھیں',
   'chat.thread.open': '{name} کے ساتھ بات چیت کھولیں',
   'chat.unread': '{count} نئے پیغام',
   'chat.msg1': 'السلام علیکم۔ راؤنڈ اپ موجود ہے؟',

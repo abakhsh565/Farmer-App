@@ -14,8 +14,7 @@ import { ShopConnectSheet, ShopRequestSheet } from '@/shop/ShopRequestSheet';
 import { VoiceBubble } from '@/chat/VoiceBubble';
 import { VoiceComposer, useRecorderFailureText } from '@/chat/VoiceComposer';
 import { useVoiceRecorder } from '@/chat/useVoiceRecorder';
-import { recordingSupported } from '@/speech/record';
-import { formatDuration } from '@/shop/api/voice';
+import { formatDuration, voiceRecordingSupported } from '@/shop/api/voice';
 
 type Props = { onBrowseDealers: () => void };
 
@@ -303,7 +302,7 @@ export function ChatScreen({ onBrowseDealers }: Props) {
             placeholder={t('chat.placeholder')}
             className="max-h-28 min-h-11 flex-1 resize-none rounded-md bg-muted px-3.5 py-3 text-body placeholder:text-muted-foreground focus-visible:outline-none"
           />
-          {chat.live && shop.voiceSupported && recordingSupported() ? (
+          {chat.live && shop.voiceSupported && voiceRecordingSupported() ? (
             <Button
               type="button"
               variant="outline"
