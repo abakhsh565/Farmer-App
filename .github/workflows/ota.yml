@@ -66,6 +66,18 @@ jobs:
       - name: Build, pack and publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          #
+          # Which repository's Releases are this environment's channel.
+          #
+          # Staging publishes to the repository this workflow runs in, because a
+          # workflow's `GITHUB_TOKEN` cannot write a release in another account's
+          # copy — the staging publish was refused 403 against
+          # `abakhsh56/Farmer-App`.
+          #
+          # Dev and production deliberately keep the default (`abakhsh56/Farmer-App`),
+          # which is the repository already-installed apps poll: moving those
+          # channels would strand every phone in the field until a new APK.
+          OTA_RELEASE_REPO: ${{ github.ref_name == 'staging' && 'abakhsh565/Farmer-App' || '' }}
         run: |
           npx --yes tsx scripts/ota-publish.mjs --env "${{ steps.channel.outputs.env }}" || \
             node scripts/ota-publish.mjs --env "${{ steps.channel.outputs.env }}"

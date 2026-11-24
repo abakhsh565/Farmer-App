@@ -57,7 +57,17 @@ const FLAVORS = {
   },
 };
 
-const OTA_RELEASES = 'https://github.com/abakhsh56/Farmer-App/releases/download';
+/**
+ * Where a build polls for its web bundle.
+ *
+ * The same repository `scripts/ota-publish.mjs` writes to, read the same way, so a
+ * phone cannot be pointed at a channel nobody publishes. Unset keeps the default
+ * every existing install already watches; a build made for a channel published
+ * from another account passes `OTA_RELEASE_REPO=owner/repository`.
+ */
+const OTA_RELEASE_REPO =
+  (process.env.OTA_RELEASE_REPO ?? '').trim() || 'abakhsh56/Farmer-App';
+const OTA_RELEASES = `https://github.com/${OTA_RELEASE_REPO}/releases/download`;
 
 function parseArgs(argv) {
   const flags = argv.slice(2);
