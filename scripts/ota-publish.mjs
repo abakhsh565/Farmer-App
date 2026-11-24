@@ -72,11 +72,41 @@ const { env } = parseArgs(process.argv);
 const tag = CHANNELS[env];
 
 /**
+ * The repository whose Releases are the update channels.
+ *
  * Named explicitly rather than inferred from `origin`: this checkout's remote is a
  * different account's copy of the app, and `gh` follows that remote — which is how
  * a release got asked for on the wrong repository the first time.
+ *
+ * It is configurable because the app is checked out under more than one GitHub
+ * account, and a workflow's `GITHUB_TOKEN` can only write releases in the
+ * repository it runs in: publishing staging from `abakhsh565/Farmer-App` was
+ * refused with HTTP 403 against `abakhsh56/Farmer-App`. Setting
+ * `OTA_RELEASE_REPO=owner/repository` moves one environment's channel without
+ * touching the others.
+ *
+ * The default is the repository every installed APK polls today, so a build that
+ * sets nothing publishes exactly where it always did. `scripts/build-apk.mjs`
+ * reads the same variable, which is what keeps a phone's download URL and the
+ * release being written the same repository.
  */
-const REPO = 'abakhsh56/Farmer-App';
+const DEFAULT_REPO = 'abakhsh56/Farmer-App';
+
+function resolveRepo() {
+  const configured = (process.env.OTA_RELEASE_REPO ?? '').trim();
+  if (!configured) return DEFAULT_REPO;
+  /* An owner/repository, not a URL: `gh --repo` takes the pair, and a pasted URL
+     would produce a confusing 404 rather than a publish. */
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(configured)) {
+    fail(`OTA_RELEASE_REPO is not \"owner/repository\": \"${configured}\".`);
+  }
+  return configured;
+}
+
+const REPO = resolveRepo();
+
+/** Printed so a workflow log states which repository it is writing to. */
+console.log(`ota-publish: channel ${tag} on ${REPO}`);
 
 const sha = git(['rev-parse', '--short', 'HEAD']);
 const builtAt = new Date().toISOString();
@@ -145,7 +175,7 @@ if (!existing.ok) {
   const notes = `Live-update channel for ${env}. Assets are replaced by \`npm run ota:publish -- --env ${env}\`; installed apps poll \`latest.json\` from this release.`;
   const created = gh(['release', 'create', tag, '--repo', REPO, '--title', `OTA ${env}`, '--notes', notes]);
   if (!created.ok) {
-    fail(`could not create the "${tag}" release.`, `  gh said: ${created.out.trim()}\n  Is \`gh auth status\` logged in with push rights to abakhsh56/Farmer-App?`);
+    fail(`could not create the "${tag}" release.`, `  gh said: ${created.out.trim()}\n  Is \`gh auth status\` logged in with push rights to ${REPO}?`);
   }
 }
 
