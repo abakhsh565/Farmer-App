@@ -2,7 +2,7 @@ import { Mic, Play, Square, Trash2 } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { useLocale } from '@/i18n/LocaleProvider';
-import { formatDuration } from '@/shop/api/voice';
+import { formatDuration } from '@/shop/api/media';
 import type { PendingRecording, RecorderFailure, RecorderStatus } from './useVoiceRecorder';
 
 /**

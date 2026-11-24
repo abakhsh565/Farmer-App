@@ -2,7 +2,7 @@ import { Pause, Play, RotateCcw, Trash2 } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import type { ChatAudio } from '@/data/chat';
 import { useLocale } from '@/i18n/LocaleProvider';
-import { formatDuration } from '@/shop/api/voice';
+import { formatDuration } from '@/shop/api/media';
 
 /**
  * A voice note, played in place.
@@ -24,11 +24,14 @@ import { formatDuration } from '@/shop/api/voice';
 export function VoiceBubble({
   audio,
   mine,
+  onResolve,
   onRetry,
   onDiscard,
 }: {
   audio: ChatAudio;
   mine: boolean;
+  /** Asks the shop for a fresh signed link. Links live sixty seconds, so play mints one. */
+  onResolve?: () => Promise<string | null>;
   onRetry?: () => void;
   onDiscard?: () => void;
 }) {
@@ -36,6 +39,7 @@ export function VoiceBubble({
   const elementRef = useRef<HTMLAudioElement | null>(null);
   const [playing, setPlaying] = useState(false);
   const [elapsed, setElapsed] = useState(0);
+  const [resolving, setResolving] = useState(false);
 
   useEffect(
     () => () => {
@@ -51,16 +55,35 @@ export function VoiceBubble({
   const progress = sending ? Math.max(0, Math.min(1, audio.progress ?? 0)) : 0;
   const played = duration > 0 ? Math.min(1, elapsed / duration) : 0;
 
-  const toggle = () => {
-    if (!audio.url) return;
-    const element = elementRef.current ?? new Audio(audio.url);
-    elementRef.current = element;
-
+  /**
+   * Play, pausing first.
+   *
+   * The link is fetched here rather than at render for the reason the shop's contract
+   * gives: a signature lives sixty seconds, and a thread opened for a minute would
+   * hold a key that has already expired. Tapping play on a note that is already
+   * loaded pauses it; tapping play again starts it over.
+   */
+  const toggle = async () => {
     if (playing) {
-      element.pause();
+      elementRef.current?.pause();
       setPlaying(false);
       return;
     }
+
+    let source = audio.url;
+    if (!source && onResolve) {
+      setResolving(true);
+      try {
+        source = await onResolve();
+      } finally {
+        setResolving(false);
+      }
+    }
+    if (!source) return;
+
+    const element = elementRef.current ?? new Audio(source);
+    if (elementRef.current && element.src !== source) element.src = source;
+    elementRef.current = element;
 
     element.currentTime = 0;
     void element.play().then(
@@ -89,8 +112,8 @@ export function VoiceBubble({
       <div className="flex items-center gap-2.5">
         <button
           type="button"
-          onClick={toggle}
-          disabled={!audio.url || sending || failed}
+          onClick={() => void toggle()}
+          disabled={(!audio.url && !onResolve) || sending || failed || resolving}
           aria-label={playing ? t('chat.voice.pause') : t('chat.voice.play')}
           className={`grid size-9 shrink-0 place-items-center rounded-full disabled:opacity-50 ${
             mine ? 'bg-brand-foreground/20' : 'bg-foreground/10'

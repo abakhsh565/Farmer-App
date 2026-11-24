@@ -339,6 +339,12 @@ export const en = {
   'chat.voice.denied': 'Allow the microphone to record a voice message.',
   'chat.voice.unavailable': 'This device cannot record a voice message.',
   'chat.voice.label': 'Voice message',
+  'chat.photo.send': 'Send a photo',
+  'chat.photo.label': 'Photo',
+  'chat.photo.tooLarge': 'That photo is too large to send. Try a smaller one.',
+  'chat.photo.unsupported': 'This phone cannot send that kind of picture.',
+  'chat.photo.failed': 'Photo not sent',
+  'chat.photo.unavailable': 'Photo could not be loaded',
   /* Kept although `development` has retired these screens: `staging` still ships
      AgentScreen and ScanScreen, and a catalogue that stops carrying their keys
      breaks the staging build while looking like a chat change. */
@@ -1844,6 +1850,12 @@ export const ur: Record<MessageKey, string> = {
   'chat.voice.denied': 'آواز کا پیغام ریکارڈ کرنے کے لیے مائیک کی اجازت دیں۔',
   'chat.voice.unavailable': 'یہ فون آواز کا پیغام ریکارڈ نہیں کر سکتا۔',
   'chat.voice.label': 'آواز کا پیغام',
+  'chat.photo.send': 'تصویر بھیجیں',
+  'chat.photo.label': 'تصویر',
+  'chat.photo.tooLarge': 'یہ تصویر بھیجنے کے لیے بہت بڑی ہے۔ چھوٹی تصویر منتخب کریں۔',
+  'chat.photo.unsupported': 'یہ فون اس قسم کی تصویر نہیں بھیج سکتا۔',
+  'chat.photo.failed': 'تصویر نہیں گئی',
+  'chat.photo.unavailable': 'تصویر کھل نہیں سکی',
   'agent.disclaimer': 'جوابات اسی ایپ کے موسم، منڈی اور دکانوں کے ڈیٹا سے آتے ہیں۔ بھیجتے وقت کریڈٹ خرچ ہوتا ہے۔',
   'scan.openAgent': 'بجائے اس کے معاون سے پوچھیں',
   'chat.thread.open': '{name} کے ساتھ بات چیت کھولیں',

@@ -1,5 +1,5 @@
-import { CheckCheck, ChevronLeft, MessageCircle, Mic, Search, Send, ShieldCheck } from 'lucide-react';
-import { useMemo, useState } from 'react';
+import { Camera, CheckCheck, ChevronLeft, MessageCircle, Mic, Search, Send, ShieldCheck } from 'lucide-react';
+import { useMemo, useRef, useState } from 'react';
 import { EmptyState, LoadingState } from '@/components/States';
 import { Button } from '@/components/ui/button';
 import { useChat } from '@/chat/ChatProvider';
@@ -11,10 +11,17 @@ import { initialsOf } from '@/lib/initials';
 import { useSession } from '@/session/SessionProvider';
 import { useShopApi } from '@/shop/ShopApiProvider';
 import { ShopConnectSheet, ShopRequestSheet } from '@/shop/ShopRequestSheet';
+import { PhotoBubble } from '@/chat/PhotoBubble';
 import { VoiceBubble } from '@/chat/VoiceBubble';
 import { VoiceComposer, useRecorderFailureText } from '@/chat/VoiceComposer';
 import { useVoiceRecorder } from '@/chat/useVoiceRecorder';
-import { formatDuration, voiceRecordingSupported } from '@/shop/api/voice';
+import {
+  MEDIA_LIMITS,
+  formatDuration,
+  imageMimeTypeFor,
+  voiceMimeTypeFor,
+  voiceRecordingSupported,
+} from '@/shop/api/media';
 
 type Props = { onBrowseDealers: () => void };
 
@@ -49,6 +56,8 @@ export function ChatScreen({ onBrowseDealers }: Props) {
      transient control, and a recording must not survive navigating away. */
   const recorder = useVoiceRecorder();
   const recorderMessage = useRecorderFailureText(recorder.failure);
+  const [photoError, setPhotoError] = useState<string | null>(null);
+  const photoInput = useRef<HTMLInputElement | null>(null);
 
   /** The shop's name, which on the live source comes from the shop, not a catalogue. */
   const nameFor = (dealerId: string) =>
@@ -109,8 +118,34 @@ export function ChatScreen({ onBrowseDealers }: Props) {
     const sendVoice = () => {
       const recording = recorder.take();
       if (!recording) return;
+      /* The container the shop accepts, not the codec string the recorder reports:
+         `audio/webm;codecs=opus` is answered with `400 unsupported mime type`. */
+      const mimeType = voiceMimeTypeFor(recording.mimeType);
       requestIdentity(() => {
-        void shop.sendVoice(recording);
+        void shop.sendMedia({
+          kind: 'voice',
+          blob: recording.blob,
+          mimeType,
+          durationMs: recording.durationMs,
+        });
+      }, 'session.why.message');
+    };
+
+    /* A photo is checked on this phone before it is offered to the shop: a farmer on
+       2G should learn that a 9 MB photo is too large without paying to upload it. */
+    const sendPhoto = (file: File) => {
+      const mimeType = imageMimeTypeFor(file);
+      if (!mimeType) {
+        setPhotoError(t('chat.photo.unsupported'));
+        return;
+      }
+      if (file.size > MEDIA_LIMITS.maxImageBytes) {
+        setPhotoError(t('chat.photo.tooLarge'));
+        return;
+      }
+      setPhotoError(null);
+      requestIdentity(() => {
+        void shop.sendMedia({ kind: 'image', blob: file, mimeType });
       }, 'session.why.message');
     };
 
@@ -214,7 +249,37 @@ export function ChatScreen({ onBrowseDealers }: Props) {
               const mine = message.from === 'me';
               return (
                 <div key={message.id} className={`flex ${mine ? 'justify-end' : 'justify-start'}`}>
-                  {message.audio ? (
+                  {message.image ? (
+                    <div
+                      className={`max-w-[78%] rounded-lg px-2 py-2 ${mine ? 'bg-brand text-brand-foreground' : 'bg-muted text-foreground'}`}
+                    >
+                      <span className="sr-only">
+                        {mine ? t('chat.you') : nameFor(dealerId)}: {t('chat.photo.label')}
+                      </span>
+                      <PhotoBubble
+                        image={message.image}
+                        mine={mine}
+                        onResolve={
+                          message.image.serverId
+                            ? () => shop.resolveMediaUrl(message.image?.serverId)
+                            : undefined
+                        }
+                        onRetry={
+                          message.image.localId
+                            ? () => void shop.retryMedia(message.image!.localId!)
+                            : undefined
+                        }
+                        onDiscard={
+                          message.image.localId
+                            ? () => shop.discardMedia(message.image!.localId!)
+                            : undefined
+                        }
+                      />
+                      {message.text ? (
+                        <p className="mt-1.5 px-1 text-body-sm leading-relaxed">{message.text}</p>
+                      ) : null}
+                    </div>
+                  ) : message.audio ? (
                     <div
                       className={`max-w-[78%] rounded-lg px-3 py-2 ${mine ? 'bg-brand text-brand-foreground' : 'bg-muted text-foreground'}`}
                     >
@@ -224,14 +289,19 @@ export function ChatScreen({ onBrowseDealers }: Props) {
                       <VoiceBubble
                         audio={message.audio}
                         mine={mine}
+                        onResolve={
+                          message.audio.serverId
+                            ? () => shop.resolveMediaUrl(message.audio?.serverId)
+                            : undefined
+                        }
                         onRetry={
                           message.audio.localId
-                            ? () => void shop.retryVoice(message.audio!.localId!)
+                            ? () => void shop.retryMedia(message.audio!.localId!)
                             : undefined
                         }
                         onDiscard={
                           message.audio.localId
-                            ? () => shop.discardVoice(message.audio!.localId!)
+                            ? () => shop.discardMedia(message.audio!.localId!)
                             : undefined
                         }
                       />
@@ -265,6 +335,12 @@ export function ChatScreen({ onBrowseDealers }: Props) {
         {recorderMessage ? (
           <p role="status" className="mx-3 mt-2 rounded-md bg-muted px-3 py-2 text-caption text-muted-foreground">
             {recorderMessage}
+          </p>
+        ) : null}
+
+        {photoError ? (
+          <p role="status" className="mx-3 mt-2 rounded-md bg-muted px-3 py-2 text-caption text-muted-foreground">
+            {photoError}
           </p>
         ) : null}
 
@@ -302,17 +378,48 @@ export function ChatScreen({ onBrowseDealers }: Props) {
             placeholder={t('chat.placeholder')}
             className="max-h-28 min-h-11 flex-1 resize-none rounded-md bg-muted px-3.5 py-3 text-body placeholder:text-muted-foreground focus-visible:outline-none"
           />
-          {chat.live && shop.voiceSupported && voiceRecordingSupported() ? (
-            <Button
-              type="button"
-              variant="outline"
-              size="icon"
-              className="size-11 shrink-0 rounded-full"
-              aria-label={t('chat.voice.record')}
-              onClick={() => void recorder.start()}
-            >
-              <Mic className="size-4" aria-hidden />
-            </Button>
+          {chat.live && shop.mediaSupported ? (
+            <>
+              {/* One media door for two kinds of file, so the camera appears exactly when
+                  the microphone does: a shop that cannot take a recording cannot take a
+                  picture either. */}
+              <input
+                ref={photoInput}
+                type="file"
+                accept="image/jpeg,image/png,image/webp"
+                capture="environment"
+                className="sr-only"
+                onChange={(event) => {
+                  const file = event.target.files?.[0];
+                  /* Reset first: choosing the same photo twice must send it twice, not
+                     do nothing because the input's value has not changed. */
+                  event.target.value = '';
+                  if (file) sendPhoto(file);
+                }}
+              />
+              <Button
+                type="button"
+                variant="outline"
+                size="icon"
+                className="size-11 shrink-0 rounded-full"
+                aria-label={t('chat.photo.send')}
+                onClick={() => photoInput.current?.click()}
+              >
+                <Camera className="size-4" aria-hidden />
+              </Button>
+              {voiceRecordingSupported() ? (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="icon"
+                  className="size-11 shrink-0 rounded-full"
+                  aria-label={t('chat.voice.record')}
+                  onClick={() => void recorder.start()}
+                >
+                  <Mic className="size-4" aria-hidden />
+                </Button>
+              ) : null}
+            </>
           ) : null}
           <Button type="submit" size="icon" className="size-11 shrink-0 rounded-full" aria-label={t('chat.send')}>
             <Send className="size-4 rtl:rotate-180" aria-hidden />
@@ -475,6 +582,7 @@ function previewOf(
   t: (key: MessageKey, values?: Record<string, string | number>) => string,
 ): string {
   if (!message) return '';
+  if (message.image) return t('chat.photo.label');
   if (message.audio) {
     return `${t('chat.voice.label')} · ${formatDuration(message.audio.durationMs)}`;
   }
