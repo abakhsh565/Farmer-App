@@ -1,4 +1,4 @@
-import type { ChatMessage } from '@/data/chat';
+import type { ChatAudio, ChatMessage } from '@/data/chat';
 
 /**
  * The shop backend's responses, as this app understands them.
@@ -137,10 +137,47 @@ export function normaliseMe(value: unknown): ShopMe | null {
  * A row that names no side at all is drawn as the shop's, since assuming the
  * farmer wrote it would show him his own words as a reply.
  */
+/**
+ * A voice row, as the shop stores it.
+ *
+ * The shop records `kind = 'voice'` beside the object it stored, and returns a
+ * signed `audio_url` in the thread so playback needs no second round trip. The
+ * duration is read from whichever name the backend uses — milliseconds first, then
+ * seconds — because a bar that says `0:00` for a real recording reads as a broken
+ * message rather than a missing field.
+ */
+function normaliseVoice(row: Record<string, unknown>): ChatAudio | null {
+  const kind = (text(firstOf(row, ['kind', 'message_kind', 'type'])) ?? '').toLowerCase();
+  const url = text(firstOf(row, ['audio_url', 'voice_url', 'audioUrl', 'signed_url']));
+  const flagged = row.audio === true || row.voice === true;
+  if (!flagged && kind !== 'voice' && kind !== 'audio' && !url) return null;
+
+  const asMs = (value: unknown): number => {
+    const number = typeof value === 'number' ? value : Number(text(value));
+    return Number.isFinite(number) && number > 0 ? number : 0;
+  };
+
+  const hoursMs = asMs(firstOf(row, ['duration_ms', 'durationMs', 'audio_duration_ms']));
+  const seconds = asMs(firstOf(row, ['duration_seconds', 'duration_s', 'duration']));
+  const durationMs = hoursMs > 0 ? hoursMs : seconds > 0 ? Math.round(seconds * 1000) : 0;
+
+  return {
+    /* Not every backend signs the URL on every read; a null here draws the bubble
+       with a duration and a disabled play control rather than hiding the message. */
+    url,
+    durationMs,
+    mimeType: text(firstOf(row, ['mime_type', 'mimeType'])),
+    status: 'sent',
+  };
+}
+
 function normaliseMessage(value: unknown, index: number): ChatMessage | null {
   const row = record(value);
   const body = text(firstOf(row, ['body', 'text', 'message']))?.trim();
-  if (!body) return null;
+  const audio = normaliseVoice(row);
+  /* A voice note has no text of its own, so the old "drop anything without a body"
+     rule would have silently deleted every recording from the conversation. */
+  if (!body && !audio) return null;
 
   const role = (text(firstOf(row, ['sender_role', 'role'])) ?? '').toLowerCase();
   const direction = (text(row.direction) ?? '').toLowerCase();
@@ -152,7 +189,8 @@ function normaliseMessage(value: unknown, index: number): ChatMessage | null {
        (a uuid here, an integer in the local store) must not be mixed. */
     id: index + 1,
     from: mine ? 'me' : 'dealer',
-    text: body,
+    text: body ?? undefined,
+    audio: audio ?? undefined,
   };
 }
 

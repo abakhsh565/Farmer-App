@@ -8,6 +8,27 @@ import type { MessageKey } from '@/i18n/catalog';
  * switching to Urdu re-renders the history in Urdu, which is what a bilingual
  * user expects.
  */
+/**
+ * A voice note attached to a message.
+ *
+ * `url` is a short-lived signed URL from the shop backend and is `null` until the
+ * upload finishes, which is what lets the bubble show progress in place instead of
+ * appearing only once it is already sent. `status` is meaningful only for a note
+ * this phone is still delivering; a note read from the shop's thread is `sent`.
+ */
+export type ChatAudio = {
+  url: string | null;
+  durationMs: number;
+  mimeType?: string | null;
+  status?: 'sending' | 'failed' | 'sent';
+  /** 0…1 while `status` is `sending`. */
+  progress?: number;
+  /** Stable local id, so a retry reuses the same bubble rather than adding one. */
+  localId?: string;
+  /** The shop's object path, kept so a failed send can be retried. */
+  path?: string | null;
+};
+
 export type ChatMessage = {
   id: number;
   from: 'me' | 'dealer';
@@ -15,6 +36,8 @@ export type ChatMessage = {
   key?: MessageKey;
   /** Free text the user typed, used instead of `key` when present. */
   text?: string;
+  /** Present on a voice message; `text` may then be empty. */
+  audio?: ChatAudio;
 };
 
 export type Threads = Record<string, ChatMessage[]>;

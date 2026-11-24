@@ -10,6 +10,7 @@ import {
   type ReactNode,
 } from 'react';
 import { serviceConfig } from '@/services/config';
+import { sendVoiceNote, voiceCapability } from './api/voice';
 import { toE164 } from '@/services/supabaseClient';
 import { useSession } from '@/session/SessionProvider';
 import {
@@ -77,6 +78,25 @@ export type ShopApiStatus =
 
 export type ShopFailure = { kind: ShopApiFailure; message: string } | null;
 
+/**
+ * A recording this phone is still delivering.
+ *
+ * The blob lives here, not in the thread, because the thread is the shop's record
+ * of what was said and a note that has not arrived is not part of it yet. Keeping it
+ * out of `thread` is also what makes retry honest: the bubble shows the recording
+ * it will actually re-send, with progress and a failure it can recover from.
+ */
+export type VoiceOutboxItem = {
+  localId: string;
+  blob: Blob;
+  mimeType: string;
+  durationMs: number;
+  status: 'sending' | 'failed';
+  /** 0…1 while uploading. */
+  progress: number;
+  error: string | null;
+};
+
 type ShopApiValue = {
   status: ShopApiStatus;
   configured: boolean;
@@ -91,6 +111,13 @@ type ShopApiValue = {
   joinWithLink: (link: string) => Promise<boolean>;
   forget: () => void;
   send: (text: string) => Promise<boolean>;
+  /** True once the shop backend has answered the voice contract. */
+  voiceSupported: boolean;
+  /** Recordings on their way to the shop, newest last. */
+  voiceOutbox: VoiceOutboxItem[];
+  sendVoice: (recording: { blob: Blob; mimeType: string; durationMs: number }) => Promise<boolean>;
+  retryVoice: (localId: string) => Promise<boolean>;
+  discardVoice: (localId: string) => void;
   askCredit: (amount: number, note: string | null) => Promise<boolean>;
   askVisit: (purpose: string | null, window: string | null) => Promise<boolean>;
   answerOffer: (requestId: string, accept: boolean, note: string | null) => Promise<boolean>;
@@ -153,6 +180,8 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
   const [failure, setFailure] = useState<ShopFailure>(null);
   const [busy, setBusy] = useState(false);
   const [seen, setSeen] = useState<string[]>(loadSeen);
+  const [voiceSupported, setVoiceSupported] = useState(false);
+  const [voiceOutbox, setVoiceOutbox] = useState<VoiceOutboxItem[]>([]);
 
   /** The credential as it is *now*, for callbacks that outlive a render. */
   const current = useRef<ShopCredential | null>(credential);
@@ -350,6 +379,90 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
     [adopt, configured, identity, load],
   );
 
+  /**
+   * Does this shop take voice notes?
+   *
+   * Asked once per connected session rather than assumed. The mic is hidden when the
+   * answer is no, because a control that records a message the shop cannot accept is
+   * worse than no control: the farmer talks for thirty seconds and loses it. An old
+   * backend answers `PGRST202`, which reads as "not supported" here and as an
+   * outage nowhere.
+   */
+  useEffect(() => {
+    if (!configured || status !== 'ready' || !credential?.token) return;
+    let cancelled = false;
+    void voiceCapability(credential.token).then((supported) => {
+      if (!cancelled) setVoiceSupported(supported);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [configured, credential?.token, status]);
+
+  const patchOutbox = useCallback((localId: string, patch: Partial<VoiceOutboxItem>) => {
+    setVoiceOutbox((current) =>
+      current.map((item) => (item.localId === localId ? { ...item, ...patch } : item)),
+    );
+  }, []);
+
+  /** Ticket → bytes → message, for one recording. Retry calls this again. */
+  const deliverVoice = useCallback(
+    async (item: VoiceOutboxItem): Promise<boolean> => {
+      const token = current.current?.token;
+      if (!token) return false;
+
+      patchOutbox(item.localId, { status: 'sending', progress: 0, error: null });
+
+      const result = await sendVoiceNote({
+        token,
+        blob: item.blob,
+        durationMs: item.durationMs,
+        mimeType: item.mimeType,
+        onProgress: (fraction) => patchOutbox(item.localId, { progress: fraction }),
+      });
+
+      if (!result.ok) {
+        if (isTerminal(result.error)) expire();
+        patchOutbox(item.localId, { status: 'failed', error: result.message });
+        return false;
+      }
+
+      /* Gone from the outbox, and back from the thread: the bubble the farmer sees
+         afterwards is the shop's row, not this phone's copy of it. */
+      setVoiceOutbox((current) => current.filter((entry) => entry.localId !== item.localId));
+      await load(token);
+      return true;
+    },
+    [expire, load, patchOutbox],
+  );
+
+  const sendVoice = useCallback(
+    async (recording: { blob: Blob; mimeType: string; durationMs: number }) => {
+      const item: VoiceOutboxItem = {
+        localId: `v-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        ...recording,
+        status: 'sending',
+        progress: 0,
+        error: null,
+      };
+      setVoiceOutbox((current) => [...current, item]);
+      return deliverVoice(item);
+    },
+    [deliverVoice],
+  );
+
+  const retryVoice = useCallback(
+    async (localId: string) => {
+      const item = voiceOutbox.find((entry) => entry.localId === localId);
+      return item ? deliverVoice(item) : false;
+    },
+    [deliverVoice, voiceOutbox],
+  );
+
+  const discardVoice = useCallback((localId: string) => {
+    setVoiceOutbox((current) => current.filter((entry) => entry.localId !== localId));
+  }, []);
+
   const joinWithLink = useCallback(
     async (link: string): Promise<boolean> => {
       const parsed = parseShopLink(link);
@@ -456,6 +569,11 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
         expire();
       },
       send: (text) => run((token) => farmerSendMessage(token, text)),
+      voiceSupported,
+      voiceOutbox,
+      sendVoice,
+      retryVoice,
+      discardVoice,
       askCredit: (amount, note) => run((token) => farmerCreateCreditRequest(token, amount, note)),
       askVisit: (purpose, window) => run((token) => farmerRequestVisit(token, purpose, window)),
       answerOffer: (requestId, accept, note) =>
@@ -472,6 +590,11 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
     credential,
     configured,
     failure,
+    discardVoice,
+    retryVoice,
+    sendVoice,
+    voiceOutbox,
+    voiceSupported,
     joinWithCode,
     joinWithLink,
     me,
