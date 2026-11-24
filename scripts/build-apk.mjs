@@ -58,16 +58,34 @@ const FLAVORS = {
 };
 
 /**
- * Where a build polls for its web bundle.
+ * The GitHub repository each flavour's update channel lives in.
  *
- * The same repository `scripts/ota-publish.mjs` writes to, read the same way, so a
- * phone cannot be pointed at a channel nobody publishes. Unset keeps the default
- * every existing install already watches; a build made for a channel published
- * from another account passes `OTA_RELEASE_REPO=owner/repository`.
+ * It is per flavour because the channels are not all published by the same
+ * account: staging is released by the workflow in `abakhsh565/Farmer-App`, whose
+ * token cannot write a release in the older `abakhsh56/Farmer-App` copy, while
+ * dev and production are published to — and polled from — that older copy by
+ * every build already installed.
+ *
+ * A default here rather than only an environment variable keeps the ordinary
+ * command honest: `npm run apk:staging` builds a phone that watches the channel
+ * staging actually publishes to. `OTA_RELEASE_REPO=owner/repository` still
+ * overrides it for a one-off build.
  */
-const OTA_RELEASE_REPO =
-  (process.env.OTA_RELEASE_REPO ?? '').trim() || 'abakhsh56/Farmer-App';
-const OTA_RELEASES = `https://github.com/${OTA_RELEASE_REPO}/releases/download`;
+const OTA_DEFAULT_REPO = {
+  dev: 'abakhsh56/Farmer-App',
+  staging: 'abakhsh565/Farmer-App',
+  production: 'abakhsh56/Farmer-App',
+};
+
+/** The `…/releases/download` base a flavour's build should poll. */
+function otaReleasesBase(target) {
+  const configured = (process.env.OTA_RELEASE_REPO ?? '').trim();
+  const repo = configured || OTA_DEFAULT_REPO[target];
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) {
+    fail(`OTA_RELEASE_REPO is not "owner/repository": "${repo}".`);
+  }
+  return `https://github.com/${repo}/releases/download`;
+}
 
 function parseArgs(argv) {
   const flags = argv.slice(2);
@@ -236,7 +254,11 @@ function runWebBuild() {
   // A plain command line through the shell: on Windows `shell: true` resolves
   // npm/npx through PATHEXT, which a quoted `npm.cmd` does not (Node then tries to
   // load the .cmd file as JavaScript and reports MODULE_NOT_FOUND).
-  const buildEnv = { ...env, VITE_APP_ENV: flavor, VITE_OTA_BASE: `${OTA_RELEASES}/${selection.ota}` };
+  const buildEnv = {
+    ...env,
+    VITE_APP_ENV: flavor,
+    VITE_OTA_BASE: `${otaReleasesBase(flavor)}/${selection.ota}`,
+  };
 
   // Run the tools through `node` and their own entry scripts, not through npm:
   // this project has an `npm` package in node_modules, so a shell resolves `npm`
