@@ -1,4 +1,5 @@
-import type { ChatAudio, ChatMessage } from '@/data/chat';
+import type { ChatAudio, ChatImage, ChatMessage } from '@/data/chat';
+import type { ShopMediaRow } from './media';
 
 /**
  * The shop backend's responses, as this app understands them.
@@ -11,8 +12,9 @@ import type { ChatAudio, ChatMessage } from '@/data/chat';
  *    `credit_requests` or `requests` — because a backend that renames a key must
  *    not blank the farmer's conversation.
  *  · Nothing is invented. A thread without messages is an empty thread, a message
- *    without a body is dropped rather than rendered as an empty bubble, and a
- *    field that is missing stays missing so the screen can say it does not know.
+ *    without a body and without a file is dropped rather than rendered as an empty
+ *    bubble, and a field that is missing stays missing so the screen can say it does
+ *    not know.
  */
 
 export type ShopMe = {
@@ -171,13 +173,53 @@ function normaliseVoice(row: Record<string, unknown>): ChatAudio | null {
   };
 }
 
-function normaliseMessage(value: unknown, index: number): ChatMessage | null {
+function normaliseMessage(
+  value: unknown,
+  index: number,
+  media: ShopMediaRow | undefined,
+): ChatMessage | null {
   const row = record(value);
   const body = text(firstOf(row, ['body', 'text', 'message']))?.trim();
-  const audio = normaliseVoice(row);
-  /* A voice note has no text of its own, so the old "drop anything without a body"
-     rule would have silently deleted every recording from the conversation. */
-  if (!body && !audio) return null;
+  const serverId = text(row.id);
+
+  /*
+   * The file, from the thread's own media call rather than from the message row.
+   *
+   * The shop keeps them apart on purpose: `farmer_api_thread` says who said what,
+   * `farmer_api_media` says which messages carry a file and how long it runs. So the
+   * two are joined here by message id, and a message with no attachment is an
+   * ordinary message. The older inline shape (`kind`/`audio_url` on the row) is still
+   * read as a fallback, because a backend that returns it is telling the truth too.
+   */
+  const voice: ChatAudio | null =
+    media?.kind === 'voice'
+      ? {
+          /* Never a stored URL: the shop mints a sixty-second signature on demand. */
+          url: null,
+          durationMs: media.durationMs ?? 0,
+          mimeType: media.mimeType,
+          status: 'sent',
+          serverId,
+        }
+      : media
+        ? null
+        : normaliseVoice(row);
+
+  const image: ChatImage | null =
+    media?.kind === 'image'
+      ? {
+          url: null,
+          mimeType: media.mimeType,
+          width: media.width,
+          height: media.height,
+          status: 'sent',
+          serverId,
+        }
+      : null;
+
+  /* A voice note or a photo has no text of its own, so the old "drop anything without
+     a body" rule would have silently deleted every recording and picture. */
+  if (!body && !voice && !image) return null;
 
   const role = (text(firstOf(row, ['sender_role', 'role'])) ?? '').toLowerCase();
   const direction = (text(row.direction) ?? '').toLowerCase();
@@ -189,18 +231,26 @@ function normaliseMessage(value: unknown, index: number): ChatMessage | null {
        (a uuid here, an integer in the local store) must not be mixed. */
     id: index + 1,
     from: mine ? 'me' : 'dealer',
+    /* The shop's id, kept for the one thing it is for: asking for this message's
+       file link. It is not used as a React key. */
+    ...(serverId ? { serverId } : {}),
     text: body ?? undefined,
-    audio: audio ?? undefined,
+    ...(voice ? { audio: voice } : {}),
+    ...(image ? { image } : {}),
   };
 }
 
-export function normaliseThread(value: unknown): ShopThread {
+export function normaliseThread(value: unknown, media: ShopMediaRow[] = []): ShopThread {
   const row = firstRow(value) ?? {};
   const shop = record(firstOf(row, ['shop', 'branch']));
   const rawMessages = firstOf(row, ['messages', 'thread', 'chat']) ?? [];
+  const mediaByMessage = new Map(media.map((entry) => [entry.messageId, entry]));
 
   const messages = (Array.isArray(rawMessages) ? rawMessages : [])
-    .map(normaliseMessage)
+    .map((message, index) => {
+      const serverId = text(record(message).id);
+      return normaliseMessage(message, index, serverId ? mediaByMessage.get(serverId) : undefined);
+    })
     .filter((message): message is ChatMessage => message !== null);
 
   const offers = (Array.isArray(firstOf(row, ['credit_requests', 'creditRequests', 'requests', 'offers']))

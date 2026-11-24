@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { VOICE_LIMITS, chooseVoiceMimeType } from '@/shop/api/voice';
+import { MEDIA_LIMITS, chooseVoiceMimeType } from '@/shop/api/media';
 
 /**
  * The microphone, for a voice message rather than a transcript.
@@ -28,7 +28,7 @@ export type PendingRecording = {
   durationMs: number;
 };
 
-export function useVoiceRecorder({ maxDurationMs = VOICE_LIMITS.maxDurationMs } = {}) {
+export function useVoiceRecorder({ maxDurationMs = MEDIA_LIMITS.maxVoiceDurationMs } = {}) {
   const [status, setStatus] = useState<RecorderStatus>('idle');
   const [durationMs, setDurationMs] = useState(0);
   const [failure, setFailure] = useState<RecorderFailure | null>(null);
@@ -95,7 +95,7 @@ export function useVoiceRecorder({ maxDurationMs = VOICE_LIMITS.maxDurationMs } 
         });
         teardown();
 
-        if (discardRef.current || blob.size < VOICE_LIMITS.minBytes) {
+        if (discardRef.current || blob.size < MEDIA_LIMITS.minBytes) {
           setStatus('idle');
           setRecording(null);
           setDurationMs(0);

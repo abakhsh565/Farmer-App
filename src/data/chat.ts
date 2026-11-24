@@ -11,10 +11,11 @@ import type { MessageKey } from '@/i18n/catalog';
 /**
  * A voice note attached to a message.
  *
- * `url` is a short-lived signed URL from the shop backend and is `null` until the
- * upload finishes, which is what lets the bubble show progress in place instead of
- * appearing only once it is already sent. `status` is meaningful only for a note
- * this phone is still delivering; a note read from the shop's thread is `sent`.
+ * `url` is a short-lived signed URL from the shop backend and is normally `null`: the
+ * shop mints links that live sixty seconds, so one is asked for when the farmer
+ * presses play and never kept in a message. `serverId` is the message's id on the
+ * shop's side, which is what that link is minted for. `status` is meaningful only
+ * for a note this phone is still delivering; a note read from the thread is `sent`.
  */
 export type ChatAudio = {
   url: string | null;
@@ -27,6 +28,30 @@ export type ChatAudio = {
   localId?: string;
   /** The shop's object path, kept so a failed send can be retried. */
   path?: string | null;
+  /** The message's id on the shop's side, for minting a playback link. */
+  serverId?: string | null;
+};
+
+/**
+ * A photo attached to a message.
+ *
+ * Same shape of life as a voice note: a link is minted on demand, and a photo this
+ * phone is still sending is drawn from its own bytes (`localBlob`) so the farmer
+ * sees what they picked next to the progress. `width`/`height` let the bubble hold
+ * the right space before the picture arrives, so the thread does not jump.
+ */
+export type ChatImage = {
+  url: string | null;
+  mimeType?: string | null;
+  width?: number | null;
+  height?: number | null;
+  status?: 'sending' | 'failed' | 'sent';
+  progress?: number;
+  localId?: string;
+  path?: string | null;
+  serverId?: string | null;
+  /** The bytes of a photo that has not reached the shop yet. */
+  localBlob?: Blob;
 };
 
 export type ChatMessage = {
@@ -38,6 +63,8 @@ export type ChatMessage = {
   text?: string;
   /** Present on a voice message; `text` may then be empty. */
   audio?: ChatAudio;
+  /** Present on a photo; `text` carries its caption when there is one. */
+  image?: ChatImage;
 };
 
 export type Threads = Record<string, ChatMessage[]>;
