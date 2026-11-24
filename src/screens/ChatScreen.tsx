@@ -1,4 +1,4 @@
-import { CheckCheck, ChevronLeft, MessageCircle, Search, Send, ShieldCheck } from 'lucide-react';
+import { CheckCheck, ChevronLeft, MessageCircle, Mic, Search, Send, ShieldCheck } from 'lucide-react';
 import { useMemo, useState } from 'react';
 import { EmptyState, LoadingState } from '@/components/States';
 import { Button } from '@/components/ui/button';
@@ -11,6 +11,11 @@ import { initialsOf } from '@/lib/initials';
 import { useSession } from '@/session/SessionProvider';
 import { useShopApi } from '@/shop/ShopApiProvider';
 import { ShopConnectSheet, ShopRequestSheet } from '@/shop/ShopRequestSheet';
+import { VoiceBubble } from '@/chat/VoiceBubble';
+import { VoiceComposer, useRecorderFailureText } from '@/chat/VoiceComposer';
+import { useVoiceRecorder } from '@/chat/useVoiceRecorder';
+import { recordingSupported } from '@/speech/record';
+import { formatDuration } from '@/shop/api/voice';
 
 type Props = { onBrowseDealers: () => void };
 
@@ -41,6 +46,10 @@ export function ChatScreen({ onBrowseDealers }: Props) {
   const [sheet, setSheet] = useState<null | 'credit' | 'visit'>(null);
   const [connecting, setConnecting] = useState(false);
   const liveDealerId = shop.credential?.shopId ?? null;
+  /* The microphone lives on this screen rather than in the provider: it is a
+     transient control, and a recording must not survive navigating away. */
+  const recorder = useVoiceRecorder();
+  const recorderMessage = useRecorderFailureText(recorder.failure);
 
   /** The shop's name, which on the live source comes from the shop, not a catalogue. */
   const nameFor = (dealerId: string) =>
@@ -68,7 +77,7 @@ export function ChatScreen({ onBrowseDealers }: Props) {
     if (!needle) return list;
     return list.filter(({ dealerId, last }) => {
       const name = nameFor(dealerId).toLowerCase();
-      const preview = (bodyText(last) || (last?.key ? t(last.key) : '')).toLowerCase();
+      const preview = previewOf(last, t).toLowerCase();
       return name.includes(needle) || preview.includes(needle);
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -93,6 +102,16 @@ export function ChatScreen({ onBrowseDealers }: Props) {
       requestIdentity(() => {
         chat.send(dealerId, text);
         setDraft('');
+      }, 'session.why.message');
+    };
+
+    /* The recording is taken before the identity gate opens, so the bar does not sit
+       on a blob that has already been handed over if the gate is dismissed. */
+    const sendVoice = () => {
+      const recording = recorder.take();
+      if (!recording) return;
+      requestIdentity(() => {
+        void shop.sendVoice(recording);
       }, 'session.why.message');
     };
 
@@ -196,18 +215,42 @@ export function ChatScreen({ onBrowseDealers }: Props) {
               const mine = message.from === 'me';
               return (
                 <div key={message.id} className={`flex ${mine ? 'justify-end' : 'justify-start'}`}>
-                  <p
-                    className={`max-w-[78%] rounded-lg px-3 py-2 text-body-sm leading-relaxed ${
-                      mine ? 'bg-brand text-brand-foreground' : 'bg-muted text-foreground'
-                    }`}
-                  >
-                    {/* A thread read aloud is otherwise a run of sentences with no
-                        one attached to them. */}
-                    <span className="sr-only">
-                      {mine ? t('chat.you') : nameFor(dealerId)}:{' '}
-                    </span>
-                    {message.text ?? (message.key ? t(message.key) : '')}
-                  </p>
+                  {message.audio ? (
+                    <div
+                      className={`max-w-[78%] rounded-lg px-3 py-2 ${mine ? 'bg-brand text-brand-foreground' : 'bg-muted text-foreground'}`}
+                    >
+                      <span className="sr-only">
+                        {mine ? t('chat.you') : nameFor(dealerId)}: {t('chat.voice.label')}
+                      </span>
+                      <VoiceBubble
+                        audio={message.audio}
+                        mine={mine}
+                        onRetry={
+                          message.audio.localId
+                            ? () => void shop.retryVoice(message.audio!.localId!)
+                            : undefined
+                        }
+                        onDiscard={
+                          message.audio.localId
+                            ? () => shop.discardVoice(message.audio!.localId!)
+                            : undefined
+                        }
+                      />
+                    </div>
+                  ) : (
+                    <p
+                      className={`max-w-[78%] rounded-lg px-3 py-2 text-body-sm leading-relaxed ${
+                        mine ? 'bg-brand text-brand-foreground' : 'bg-muted text-foreground'
+                      }`}
+                    >
+                      {/* A thread read aloud is otherwise a run of sentences with no
+                          one attached to them. */}
+                      <span className="sr-only">
+                        {mine ? t('chat.you') : nameFor(dealerId)}:{' '}
+                      </span>
+                      {message.text ?? (message.key ? t(message.key) : '')}
+                    </p>
+                  )}
                 </div>
               );
             })
@@ -220,6 +263,22 @@ export function ChatScreen({ onBrowseDealers }: Props) {
           )}
         </div>
 
+        {recorderMessage ? (
+          <p role="status" className="mx-3 mt-2 rounded-md bg-muted px-3 py-2 text-caption text-muted-foreground">
+            {recorderMessage}
+          </p>
+        ) : null}
+
+        {recorder.status !== 'idle' ? (
+          <VoiceComposer
+            status={recorder.status}
+            durationMs={recorder.durationMs}
+            recording={recorder.recording}
+            onStop={recorder.stop}
+            onCancel={recorder.cancel}
+            onSend={sendVoice}
+          />
+        ) : (
         <form
           className="flex items-end gap-2 border-t border-border p-3"
           onSubmit={(event) => {
@@ -244,10 +303,23 @@ export function ChatScreen({ onBrowseDealers }: Props) {
             placeholder={t('chat.placeholder')}
             className="max-h-28 min-h-11 flex-1 resize-none rounded-md bg-muted px-3.5 py-3 text-body placeholder:text-muted-foreground focus-visible:outline-none"
           />
+          {chat.live && shop.voiceSupported && recordingSupported() ? (
+            <Button
+              type="button"
+              variant="outline"
+              size="icon"
+              className="size-11 shrink-0 rounded-full"
+              aria-label={t('chat.voice.record')}
+              onClick={() => void recorder.start()}
+            >
+              <Mic className="size-4" aria-hidden />
+            </Button>
+          ) : null}
           <Button type="submit" size="icon" className="size-11 shrink-0 rounded-full" aria-label={t('chat.send')}>
             <Send className="size-4 rtl:rotate-180" aria-hidden />
           </Button>
         </form>
+        )}
 
         {sheet ? <ShopRequestSheet mode={sheet} onClose={() => setSheet(null)} /> : null}
       </div>
@@ -328,7 +400,7 @@ export function ChatScreen({ onBrowseDealers }: Props) {
             const meta = THREAD_META[dealerId];
             const unreadCount = chat.unread(dealerId);
             const name = nameFor(dealerId);
-            const preview = last ? (bodyText(last) || (last.key ? t(last.key) : '')) : '';
+            const preview = previewOf(last, t);
             const first = index === 0;
 
             return (
@@ -392,10 +464,22 @@ export function ChatScreen({ onBrowseDealers }: Props) {
   );
 }
 
-/** A message's own text, whether the farmer typed it or the catalogue carries it. */
-function bodyText(message: ChatMessage | undefined): string {
+/**
+ * The last line a conversation shows in the list.
+ *
+ * A voice note has no text of its own, and an empty preview would make a conversation
+ * that ends on a recording look like a conversation that ended on nothing — so it
+ * says what it is and how long it runs, which is what the bubble says too.
+ */
+function previewOf(
+  message: ChatMessage | undefined,
+  t: (key: MessageKey, values?: Record<string, string | number>) => string,
+): string {
   if (!message) return '';
-  return message.text ?? '';
+  if (message.audio) {
+    return `${t('chat.voice.label')} · ${formatDuration(message.audio.durationMs)}`;
+  }
+  return message.text ?? (message.key ? t(message.key) : '');
 }
 
 /**

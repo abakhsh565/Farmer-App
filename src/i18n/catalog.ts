@@ -35,6 +35,28 @@ export const en = {
   'nav.scanAria': 'Scan a crop',
   'nav.chat': 'Chat',
   'nav.community': 'Community',
+  /* The tab that used to be the camera. The camera is still a screen — it is
+     reached from the Home card's *Crop check* row and by attaching a photo in a
+     conversation — but it is no longer a destination of its own, because asking
+     a question is the thing a farmer does far more often than photographing a
+     leaf. */
+  'nav.assistant': 'Assistant',
+
+  // ── the assistant's conversation shell ───────────────────────────────────
+  'assist.empty.title': 'Ask about your crop',
+  'assist.empty.body':
+    'Weather, mandi rates, shops nearby, or what is wrong with a leaf. The answer comes from this app’s own data first.',
+  'assist.listen': 'Read aloud',
+  'assist.stop': 'Stop reading',
+  'assist.mic': 'Speak instead of typing',
+  'assist.listening': 'Listening…',
+  'assist.newChat': 'Start over',
+  /* Said only when a press produced no sound. Without it the pill answered with
+     nothing at all, which reads as a broken button rather than a busy voice. */
+  'voice.failed': 'The voice could not be played. Try again in a moment, or check the connection.',
+  'voice.micDenied': 'The microphone is blocked. Allow it for this app, then try again.',
+  'voice.micEmpty': 'Nothing was heard. Tap the microphone, speak, then tap it again.',
+  'voice.micFailed': 'The recording could not be turned into text. Check the connection and try again.',
 
   'common.seeAll': 'See all',
   'common.steady': '— steady',
@@ -298,6 +320,25 @@ export const en = {
   'chat.you': 'You',
   'chat.read': 'Read',
   'chat.repliesIn': 'Usually replies within 10 minutes',
+  /* Voice notes: the composer, the bubble, and the three things that can go wrong
+     while recording one. Each is a sentence the farmer can act on — "something went
+     wrong" is not, and a permission prompt is a setting rather than a failure. */
+  'chat.voice.record': 'Record a voice message',
+  'chat.voice.stop': 'Stop recording',
+  'chat.voice.cancel': 'Cancel recording',
+  'chat.voice.send': 'Send voice message',
+  'chat.voice.play': 'Play voice message',
+  'chat.voice.pause': 'Pause voice message',
+  'chat.voice.retry': 'Retry sending',
+  'chat.voice.discard': 'Delete recording',
+  'chat.voice.failed': 'Voice message not sent',
+  'chat.voice.uploading': 'Sending {percent}%',
+  'chat.voice.recording': 'Recording {duration}',
+  'chat.voice.preview': 'Ready to send · {duration}',
+  'chat.voice.tooShort': 'Too short — hold and speak, then stop.',
+  'chat.voice.denied': 'Allow the microphone to record a voice message.',
+  'chat.voice.unavailable': 'This device cannot record a voice message.',
+  'chat.voice.label': 'Voice message',
   'chat.thread.open': 'Open conversation with {name}',
   'chat.unread': '{count} unread messages',
   /* The thread itself, in the order it reads. The dealer answers with the price
@@ -1399,7 +1440,6 @@ export const en = {
   'agent.placeholder': 'Ask about your crop…',
   'agent.attach': 'Send a photo',
   'agent.send': 'Send',
-  'agent.disclaimer': 'Answers use this app’s own weather, market and shop data. Credit is spent when you send.',
   'agent.failed': 'That could not be answered',
   'agent.value.unknown': 'Not reported',
   'agent.value.temp': '{value}°C',
@@ -1425,7 +1465,6 @@ export const en = {
   'agent.escalate': 'This case is low-confidence — a person should confirm it.',
   'agent.notExpert': 'This is guidance, not a verified expert opinion.',
   'agent.source': 'Source: {source} · {age}',
-  'scan.openAgent': 'Ask the assistant instead',
   'dealer.detail.title': 'Dealer',
   'dealer.detail.missingTitle': 'This shop is not in range',
   'dealer.detail.missingBody': 'The dealer service did not return this shop. It may have closed, or be further than 100 km.',
@@ -1558,6 +1597,21 @@ export const ur: Record<MessageKey, string> = {
   'nav.scanAria': 'فصل اسکین کریں',
   'nav.chat': 'بات چیت',
   'nav.community': 'برادری',
+  'nav.assistant': 'معاون',
+
+  // ── the assistant's conversation shell ───────────────────────────────────
+  'assist.empty.title': 'اپنی فصل کے بارے میں پوچھیں',
+  'assist.empty.body':
+    'موسم، منڈی کے بھاؤ، قریبی دکانیں، یا پتے کا مسئلہ — جواب پہلے اسی ایپ کے اپنے ڈیٹا سے آتا ہے۔',
+  'assist.listen': 'سنو',
+  'assist.stop': 'روکیں',
+  'assist.mic': 'بول کر پوچھیں',
+  'assist.listening': 'سن رہے ہیں…',
+  'assist.newChat': 'نئی بات چیت',
+  'voice.failed': 'آواز نہیں چل سکی۔ کچھ دیر بعد دوبارہ کوشش کریں یا انٹرنیٹ دیکھیں۔',
+  'voice.micDenied': 'مائیکروفون بند ہے۔ اس ایپ کے لیے اجازت دیں، پھر دوبارہ کوشش کریں۔',
+  'voice.micEmpty': 'کچھ سنائی نہیں دیا۔ مائیک دبائیں، بولیں، پھر دوبارہ دبائیں۔',
+  'voice.micFailed': 'آواز کو متن میں نہیں بدلا جا سکا۔ انٹرنیٹ دیکھ کر دوبارہ کوشش کریں۔',
 
   'common.seeAll': 'سب دیکھیں',
   'common.steady': '— مستحکم',
@@ -1769,6 +1823,22 @@ export const ur: Record<MessageKey, string> = {
   'chat.you': 'آپ',
   'chat.read': 'پڑھ لیا',
   'chat.repliesIn': 'عموماً 10 منٹ میں جواب دیتے ہیں',
+  'chat.voice.record': 'آواز کا پیغام ریکارڈ کریں',
+  'chat.voice.stop': 'ریکارڈنگ روکیں',
+  'chat.voice.cancel': 'ریکارڈنگ منسوخ کریں',
+  'chat.voice.send': 'آواز کا پیغام بھیجیں',
+  'chat.voice.play': 'آواز کا پیغام چلائیں',
+  'chat.voice.pause': 'آواز کا پیغام روکیں',
+  'chat.voice.retry': 'دوبارہ بھیجیں',
+  'chat.voice.discard': 'ریکارڈنگ حذف کریں',
+  'chat.voice.failed': 'آواز کا پیغام نہیں گیا',
+  'chat.voice.uploading': 'بھیجا جا رہا ہے {percent}%',
+  'chat.voice.recording': 'ریکارڈنگ {duration}',
+  'chat.voice.preview': 'بھیجنے کے لیے تیار · {duration}',
+  'chat.voice.tooShort': 'بہت مختصر — دبا کر بولیں، پھر روکیں۔',
+  'chat.voice.denied': 'آواز کا پیغام ریکارڈ کرنے کے لیے مائیک کی اجازت دیں۔',
+  'chat.voice.unavailable': 'یہ فون آواز کا پیغام ریکارڈ نہیں کر سکتا۔',
+  'chat.voice.label': 'آواز کا پیغام',
   'chat.thread.open': '{name} کے ساتھ بات چیت کھولیں',
   'chat.unread': '{count} نئے پیغام',
   'chat.msg1': 'السلام علیکم۔ راؤنڈ اپ موجود ہے؟',
@@ -2788,7 +2858,6 @@ export const ur: Record<MessageKey, string> = {
   'agent.placeholder': 'اپنی فصل کے بارے میں پوچھیں…',
   'agent.attach': 'تصویر بھیجیں',
   'agent.send': 'بھیجیں',
-  'agent.disclaimer': 'جوابات اسی ایپ کے موسم، منڈی اور دکانوں کے ڈیٹا سے آتے ہیں۔ بھیجتے وقت کریڈٹ خرچ ہوتا ہے۔',
   'agent.failed': 'اس کا جواب نہیں مل سکا',
   'agent.value.unknown': 'معلوم نہیں',
   'agent.value.temp': '{value}°C',
@@ -2814,7 +2883,6 @@ export const ur: Record<MessageKey, string> = {
   'agent.escalate': 'اس کیس میں اعتماد کم ہے — کسی ماہر سے تصدیق کرائیں۔',
   'agent.notExpert': 'یہ رہنمائی ہے، تصدیق شدہ ماہر کی رائے نہیں۔',
   'agent.source': 'ذریعہ: {source} · {age}',
-  'scan.openAgent': 'بجائے اس کے معاون سے پوچھیں',
   'dealer.detail.title': 'ڈیلر',
   'dealer.detail.missingTitle': 'یہ دکان حد میں نہیں',
   'dealer.detail.missingBody': 'ڈیلر سروس نے یہ دکان واپس نہیں کی۔ ہو سکتا ہے بند ہو گئی ہو یا 100 کلومیٹر سے دور ہو۔',
