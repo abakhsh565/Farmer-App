@@ -49,7 +49,19 @@ import { isEmail, isPhone } from './store';
  * nothing to ask, so the answer is "new" and the account is kept on the phone.
  */
 
-type Step = 'contact' | 'otp' | 'password' | 'create';
+type Step = 'contact' | 'otp' | 'password' | 'newPassword' | 'create';
+
+/**
+ * Why the code is being asked for.
+ *
+ * `signin` is the ordinary path: prove the number, then say the password. `reset`
+ * is the way out of the password screen — and it exists because that screen can be
+ * a dead end. An account made by phone verification (which is every account this
+ * project actually has) carries **no password at all**, so "enter your password"
+ * is a question with no correct answer, and the only honest reply the app can give
+ * is a way to set one.
+ */
+type CodePurpose = 'signin' | 'reset';
 
 /** The shortest password Supabase accepts by default; below it, sign-up fails. */
 const MIN_PASSWORD = 6;
@@ -73,6 +85,7 @@ export function CredentialSheet() {
   const { pendingReason, signIn, dismiss } = useSession();
 
   const [step, setStep] = useState<Step>('contact');
+  const [purpose, setPurpose] = useState<CodePurpose>('signin');
   const [contact, setContact] = useState('');
   const [code, setCode] = useState<string[]>(emptyCode);
   const [password, setPassword] = useState('');
@@ -94,6 +107,7 @@ export function CredentialSheet() {
   useEffect(() => {
     if (!pendingReason) return;
     setStep('contact');
+    setPurpose('signin');
     setContact('');
     setCode(emptyCode());
     setPassword('');
@@ -164,10 +178,52 @@ export function CredentialSheet() {
     }
     setError(null);
     setDetail(null);
+    setPurpose('signin');
     setCode(emptyCode());
     setSecondsLeft(RESEND_SECONDS);
     setStep('otp');
   };
+
+  /**
+   * The way out of the password screen.
+   *
+   * Asks for a code to the number the farmer is already trying to sign in with, then
+   * lets them set a password once that code has proved the number is theirs. The
+   * request is `shouldCreateUser: false` on purpose: somebody who mistyped a digit
+   * into the reset flow must not have an account invented for that stranger's number.
+   *
+   * With no backend there is nothing to authenticate against, so the flow still
+   * reaches the new-password step and the account is the on-phone one — the same rule
+   * the rest of this sheet follows.
+   */
+  const startPasswordReset = useCallback(async () => {
+    setPurpose('reset');
+    setError(null);
+    setDetail(null);
+    setPassword('');
+    setCode(emptyCode());
+    setSecondsLeft(RESEND_SECONDS);
+    setStep('otp');
+
+    try {
+      const client = await getSupabaseClient(serviceConfig.supabase);
+      if (!client) return;
+      if (channel === 'email') {
+        await client.auth.signInWithOtp({
+          email: contact.trim().toLowerCase(),
+          options: { shouldCreateUser: false },
+        });
+      } else {
+        await client.auth.signInWithOtp({
+          phone: toE164(contact),
+          options: { shouldCreateUser: false },
+        });
+      }
+    } catch {
+      /* A send that fails is not hidden: the code step's own check says what to do
+         next, and the demo build accepts its fixed code without a delivery. */
+    }
+  }, [channel, contact]);
 
   const enterDigit = (index: number, raw: string) => {
     const typed = raw.replace(/[^0-9]/g, '');
@@ -237,6 +293,33 @@ export function CredentialSheet() {
     setDetail(null);
     try {
       const client = await getSupabaseClient(serviceConfig.supabase);
+
+      /*
+       * Resetting a password needs a session, not merely a correct-looking code:
+       * `updateUser` acts on whoever is signed in. So the code is exchanged with the
+       * server here (`verifyOtp`), which is also what makes the fixed demo code a
+       * real credential rather than a screen that accepts anything.
+       */
+      if (purpose === 'reset') {
+        if (!client) {
+          setStep('newPassword');
+          return;
+        }
+        const { data, error: refusal } = await client.auth.verifyOtp({
+          ...(channel === 'email'
+            ? { email: contact.trim().toLowerCase(), type: 'email' as const }
+            : { phone: toE164(contact), type: 'sms' as const }),
+          token: entered,
+        });
+        if (refusal || !data.session) {
+          setError('credential.otpWrong');
+          setDetail(refusal?.message ?? null);
+          return;
+        }
+        setStep('newPassword');
+        return;
+      }
+
       /* No backend: nothing knows whether the contact exists, so it is new. */
       if (!client) {
         setStep('create');
@@ -249,7 +332,7 @@ export function CredentialSheet() {
     } finally {
       setBusy(false);
     }
-  }, [code, contact]);
+  }, [channel, code, contact, purpose]);
 
   const continueWithPassword = useCallback(async () => {
     if (password === '') {
@@ -289,6 +372,43 @@ export function CredentialSheet() {
       setBusy(false);
     }
   }, [channel, contact, password]);
+
+  /**
+   * Saves the password the farmer chose, then signs them in.
+   *
+   * The session came from the code they just entered, so `updateUser` can only ever
+   * change the account that proved the number. The password is never sent anywhere
+   * else, never logged, and never held after this screen closes.
+   */
+  const continueWithNewPassword = useCallback(async () => {
+    if (password.length < MIN_PASSWORD) {
+      setError('credential.weakPassword');
+      return;
+    }
+
+    setBusy(true);
+    setError(null);
+    try {
+      const client = await getSupabaseClient(serviceConfig.supabase);
+      if (!client) {
+        finish(null);
+        return;
+      }
+
+      const { error: refusal } = await client.auth.updateUser({ password });
+      if (refusal) {
+        setError('credential.passwordSaveFailed');
+        setDetail(refusal.message);
+        return;
+      }
+
+      finish(await ensureParty(client));
+    } catch {
+      setError('credential.backendError');
+    } finally {
+      setBusy(false);
+    }
+  }, [password]);
 
   const continueWithNewAccount = useCallback(async () => {
     if (name.trim() === '') {
@@ -366,9 +486,11 @@ export function CredentialSheet() {
   const title =
     step === 'otp'
       ? t('credential.otpTitle')
-      : step === 'create'
-        ? t('session.title')
-        : t('credential.signIn');
+      : step === 'newPassword'
+        ? t('credential.newPasswordTitle')
+        : step === 'create'
+          ? t('session.title')
+          : t('credential.signIn');
 
   return (
     <Sheet
@@ -431,6 +553,7 @@ export function CredentialSheet() {
                 type="button"
                 onClick={() => {
                   setStep('contact');
+                  setPurpose('signin');
                   setCode(emptyCode());
                   setError(null);
                   setDetail(null);
@@ -492,6 +615,12 @@ export function CredentialSheet() {
             </>
           ) : null}
 
+          {step === 'newPassword' ? (
+            <p className="text-body-sm text-muted-foreground">
+              {t('credential.newPasswordPrompt', { contact: contact.trim() })}
+            </p>
+          ) : null}
+
           {step === 'password' ? (
             <>
               <p className="text-body-sm text-muted-foreground">
@@ -520,6 +649,32 @@ export function CredentialSheet() {
                 />
               </div>
             </>
+          ) : null}
+
+          {step === 'newPassword' ? (
+            <div>
+              <Label htmlFor="credential-new-password" className="text-label text-muted-foreground">
+                {t('credential.createPasswordLabel')}
+              </Label>
+              <Input
+                id="credential-new-password"
+                type="password"
+                autoComplete="new-password"
+                value={password}
+                onChange={(event) => {
+                  setPassword(event.target.value);
+                  if (error) setError(null);
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') void continueWithNewPassword();
+                }}
+                placeholder={t('credential.createPasswordPlaceholder')}
+                className="mt-2 h-12 rounded-xl px-4"
+                aria-invalid={fieldOf(error) === 'password'}
+                aria-describedby={error ? ERROR_ID : undefined}
+                readOnly={busy}
+              />
+            </div>
           ) : null}
 
           {step === 'create' ? (
@@ -608,12 +763,35 @@ export function CredentialSheet() {
           ) : null}
 
           {step === 'password' ? (
+            <>
+              <Button
+                className="mt-4 h-12 rounded-full"
+                onClick={() => void continueWithPassword()}
+                disabled={busy}
+              >
+                {busy ? t('credential.signingIn') : t('credential.signIn')}
+              </Button>
+              {/* Every phone account on this project was made by verifying the number,
+                  and none of them has a password — so this is not an edge case the
+                  sheet can leave the farmer guessing at. It is the way in. */}
+              <button
+                type="button"
+                onClick={() => void startPasswordReset()}
+                disabled={busy}
+                className="self-center rounded-full py-2 text-label text-brand disabled:opacity-50"
+              >
+                {t('credential.forgotPassword')}
+              </button>
+            </>
+          ) : null}
+
+          {step === 'newPassword' ? (
             <Button
               className="mt-4 h-12 rounded-full"
-              onClick={() => void continueWithPassword()}
+              onClick={() => void continueWithNewPassword()}
               disabled={busy}
             >
-              {busy ? t('credential.signingIn') : t('credential.signIn')}
+              {busy ? t('credential.savingPassword') : t('credential.savePassword')}
             </Button>
           ) : null}
 
