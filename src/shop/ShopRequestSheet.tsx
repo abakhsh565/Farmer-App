@@ -1,7 +1,8 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
 import { useLocale } from '@/i18n/LocaleProvider';
+import { useSession } from '@/session/SessionProvider';
 import { useShopApi } from './ShopApiProvider';
 import { normaliseShopCode } from './api/deepLink';
 
@@ -138,8 +139,22 @@ export function ShopRequestSheet({ mode, onClose }: Props) {
 export function ShopConnectSheet({ onClose }: { onClose: () => void }) {
   const { t } = useLocale();
   const shop = useShopApi();
+  /* The shop identifies a farmer by his phone number, so a connect has to be
+     attributable before it is sent — the same rule every other attributed action
+     in the app follows. */
+  const { account, requestIdentity } = useSession();
   const [code, setCode] = useState('');
   const [sending, setSending] = useState(false);
+  /*
+   * A join that waited for sign-in, resumed once the account is actually there.
+   *
+   * The sheet cannot hand the join to `requestIdentity` and let it run on its own:
+   * the callback it stores was created before sign-in, so the shop client inside it
+   * still sees "no account" and the join is refused with a generic failure. Waiting
+   * for `account` and submitting from the render that has it is what makes the
+   * code typed before signing in still work afterwards.
+   */
+  const [pendingJoin, setPendingJoin] = useState(false);
 
   const submit = async () => {
     const normalised = normaliseShopCode(code);
@@ -160,6 +175,16 @@ export function ShopConnectSheet({ onClose }: { onClose: () => void }) {
       setSending(false);
     }
   };
+
+  useEffect(() => {
+    if (!pendingJoin || !account) return;
+    setPendingJoin(false);
+    void submit();
+    /* `submit` is deliberately not a dependency: this effect exists to run it from
+       the render that has the account, and re-running on every render would send
+       the join twice. */
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingJoin, account]);
 
   return (
     <div className="fixed inset-0 z-50 flex items-end justify-center bg-ink-900/40 px-4 pb-6">
@@ -185,7 +210,17 @@ export function ShopConnectSheet({ onClose }: { onClose: () => void }) {
           <Button variant="outline" className="h-11 flex-1 rounded-full" onClick={onClose}>
             {t('common.cancel')}
           </Button>
-          <Button className="h-11 flex-1 rounded-full" onClick={() => void submit()} disabled={sending}>
+          <Button
+            className="h-11 flex-1 rounded-full"
+            onClick={() => {
+              if (!account) {
+                requestIdentity(() => setPendingJoin(true), 'session.why.message');
+                return;
+              }
+              void submit();
+            }}
+            disabled={sending}
+          >
             {t('shop.connect.submit')}
           </Button>
         </div>
