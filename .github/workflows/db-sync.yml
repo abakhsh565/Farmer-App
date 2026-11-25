@@ -24,6 +24,9 @@ on:
     branches: [development, staging, main]
     paths:
       - 'supabase/migrations/**'
+      # The job reads this file (it is what the CLI parses before pushing), so a
+      # change to it has to re-run the check that proves the CLI can still read it.
+      - 'supabase/config.toml'
       - 'src/**'
       - 'scripts/check-db-alignment.mjs'
       - '.github/workflows/db-sync.yml'
@@ -89,8 +92,12 @@ jobs:
           SUPABASE_PROJECT_REF: ${{ steps.target.outputs.project_ref }}
         run: |
           supabase link --project-ref "$SUPABASE_PROJECT_REF"
-          supabase db push --dry-run
-          supabase db push
+          # `--remote` is not optional any more: the current CLI defaults `db push` to
+          # the *local* stack and fails with ECONNREFUSED 127.0.0.1:54422 on a runner.
+          # On an older CLI the flag was implied by the link, which is why this only
+          # appeared once the job stopped being skipped.
+          supabase db push --dry-run --remote
+          supabase db push --remote
 
       # `db push` can exit 0 having applied less than the repo contains (a stamped
       # but missing file, a version clash). Asking the database what it is on is the
