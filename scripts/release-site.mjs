@@ -176,8 +176,19 @@ const files = walk(join(PAYLOAD, 'assets')).map((file) => ({
  * deployment gives away: a site serving an old `assets/index-*.js` while the
  * branch moved on is the drift this record exists to expose.
  */
-const entry = files.find((file) => /^assets\/index-[^/]+\.js$/.test(file.path));
-if (!entry) fail('no assets/index-*.js in the payload — the build did not produce an app entry.');
+/*
+ * The entry is the module `index.html` actually loads, not simply "some file
+ * called index-*.js". A build emits more than one (a 0.1 kB chunk and the real
+ * bundle), and recording the wrong one makes every verification compare a file
+ * the page never fetches — which is what happened on the first staging release:
+ * the record named `index-Bo21F54f.js` while the site served `index-DF-WD2Jb.js`.
+ */
+const page = readFileSync(join(PAYLOAD, 'assets', 'index.html'), 'utf8');
+const referenced = /<script[^>]+src="\/?([^"]+\.js)"/i.exec(page)?.[1] ?? null;
+const entry = referenced ? files.find((file) => file.path === referenced) : undefined;
+if (!entry) {
+  fail(`the page's entry script (${referenced ?? 'none found'}) is not in the payload — this build is incomplete.`);
+}
 
 const record = {
   env,
