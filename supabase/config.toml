@@ -32,9 +32,12 @@ major_version = 17
 [studio]
 port = 54423
 
-[inbucket]
+[local_smtp]
 # Where the local stack delivers email. The app never needs it (sign-in is by
 # phone), but a magic link or a password reset is testable without a provider.
+# `[inbucket]` was the old name for this section; the CLI now refuses to load a
+# config that still carries it, which blocked `supabase db push` in CI.
+enabled = true
 port = 54424
 smtp_port = 54425
 pop3_port = 54426
