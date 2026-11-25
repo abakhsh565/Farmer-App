@@ -74,8 +74,14 @@ jobs:
           echo "::warning::SUPABASE_ACCESS_TOKEN or the ${{ steps.target.outputs.env_name }} project ref is not set, so no migrations were applied."
           echo "Set the secret and the Actions variable, then re-run this workflow."
 
+      # Pinned deliberately, and *new*. `setup-cli@v1` defaults to 2.20.3, which
+      # cannot read this repository's `supabase/config.toml` (`db.major_version = 17`)
+      # and fails before it runs a single migration — the migrate job was green only
+      # while it was being skipped for lack of a token.
       - uses: supabase/setup-cli@v1
         if: env.SUPABASE_ACCESS_TOKEN != '' && steps.target.outputs.project_ref != ''
+        with:
+          version: latest
 
       - name: Show what would change, then apply it
         if: env.SUPABASE_ACCESS_TOKEN != '' && steps.target.outputs.project_ref != ''
