@@ -147,7 +147,18 @@ try {
      * deployment carries.
      */
     const deployedResponse = await fetch(`${target.site.url}/release.json`, { cache: 'no-store' }).catch(() => null);
-    const deployed = deployedResponse?.ok ? await deployedResponse.json() : null;
+    let deployed = null;
+    if (deployedResponse?.ok) {
+      /* A site deployed before this pipeline has no manifest, and an SPA answers
+         every unknown path with index.html — so this must read as "no manifest",
+         not as an exception that hides every check after it. */
+      const raw = await deployedResponse.text();
+      try {
+        deployed = JSON.parse(raw);
+      } catch {
+        deployed = null;
+      }
+    }
 
     if (!deployed) {
       check(
