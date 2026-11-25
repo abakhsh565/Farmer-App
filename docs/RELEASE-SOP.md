@@ -126,7 +126,7 @@ proves it happened, and on `main` the run requires the site to match
 | `sw.js` precache | the service worker cannot keep serving a previous bundle |
 | auth health + project ref | the right Supabase project answers |
 | `farmer_api_me` / `farmer-media` | the dealer contract the Shop and Chat tabs call is deployed |
-| migrations | **not proven** — `supabase_migrations` needs a service-role key (see §7) |
+| migrations | the newest applied version equals the newest migration in the commit (needs `SUPABASE_ACCESS_TOKEN`; without it this is a WARN) |
 
 ## 5. Caching
 
@@ -161,6 +161,21 @@ npm run verify:release -- --env staging
 
 The revert is a normal commit, so the record and the verification name it like any
 other release. For production, the same on `main` with `--approved`.
+
+**Re-release a known-good commit** (the faster path when the branch should not move
+at all — a bad deploy, not a bad commit):
+
+```bash
+git checkout --detach <last-good-sha>
+npm run release:site -- --env staging --rollback <last-good-sha>
+npm run publish:site -- --env staging
+npm run verify:release -- --env staging     # must report that sha
+git checkout staging
+```
+
+`--rollback` exists because the branch-name gate made this impossible to run: a
+branch cannot be "at" a commit it has moved past. It refuses unless HEAD is exactly
+the commit being re-released.
 
 **OTA only** (a bad bundle, no code change):
 
