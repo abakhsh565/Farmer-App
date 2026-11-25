@@ -190,17 +190,42 @@ if (!entry) {
   fail(`the page's entry script (${referenced ?? 'none found'}) is not in the payload — this build is incomplete.`);
 }
 
-const record = {
+/*
+ * The deployment carries its own manifest, as `/release.json` inside the payload.
+ *
+ * This is not decoration. Builds are not bit-reproducible across machines: a
+ * developer's untracked `.env.local` is compiled into the bundle, so CI's build of
+ * the same commit and this one differ legitimately. Verifying a live site against
+ * a local hash would therefore fail on a correct deployment — which it did, on the
+ * first staging release. The commit, however, cannot differ. Recording it *inside*
+ * the thing that is uploaded means the live site can always be asked which commit
+ * it is, from any machine, without trusting a file that shipped separately.
+ */
+const builtAt = new Date().toISOString();
+const deployedManifest = {
   env,
   branch,
   commit,
   commitFull: git('rev-parse', 'HEAD'),
-  builtAt: new Date().toISOString(),
+  builtAt,
+  entry: entry.path,
+  entrySha256: entry.sha256,
+  files: files.length,
+  bytes: files.reduce((sum, file) => sum + file.bytes, 0),
+};
+const manifestJson = `${JSON.stringify(deployedManifest, null, 2)}\n`;
+writeFileSync(join(PAYLOAD, 'assets', 'release.json'), manifestJson);
+files.push({
+  path: 'release.json',
+  bytes: Buffer.byteLength(manifestJson),
+  sha256: createHash('sha256').update(manifestJson).digest('hex'),
+});
+
+const record = {
+  ...deployedManifest,
   site: target.site.url,
   siteId: target.site.id,
   channel: target.ota,
-  entry: entry.path,
-  entrySha256: entry.sha256,
   files: files.length,
   bytes: files.reduce((sum, file) => sum + file.bytes, 0),
 };
