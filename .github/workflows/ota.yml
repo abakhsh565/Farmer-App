@@ -63,9 +63,43 @@ jobs:
             *) echo "Unknown branch ${{ github.ref_name }}"; exit 1 ;;
           esac
 
+      #
+      # Publishing ota-dev or ota-production needs write access to
+      # `abakhsh56/Farmer-App`, which this account does not have: the upload is
+      # refused 403. `OTA_TOKEN` is read when it exists (a PAT with Contents: write
+      # on that repository) and the workflow token is used otherwise, which is all
+      # the staging channel needs because it lives in this repository.
+      #
+      # An earlier version pre-checked `repos/:owner/:repo .permissions.push` and
+      # refused to run — it returned nothing for the workflow token even on its own
+      # repository, so it blocked a publish that would have worked. The note is
+      # printed instead; the upload is the authority.
+      - name: Note which channel this push publishes
+        if: github.ref_name != 'staging'
+        env:
+          OTA_TOKEN: ${{ secrets.OTA_TOKEN }}
+        run: |
+          if [ -z "$OTA_TOKEN" ]; then
+            echo "::warning::Publishing ${{ github.ref_name }} needs write access to abakhsh56/Farmer-App. Add OTA_TOKEN (Contents: write there) or this publish will be refused."
+          fi
+
       - name: Build, pack and publish
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # A token with write access to the channel repository. Falls back to the
+          # workflow token, which is enough for the staging channel (same repo).
+          GH_TOKEN: ${{ secrets.OTA_TOKEN || secrets.GITHUB_TOKEN }}
+          #
+          # Which repository's Releases are this environment's channel.
+          #
+          # Staging publishes to the repository this workflow runs in, because a
+          # workflow's `GITHUB_TOKEN` cannot write a release in another account's
+          # copy — the staging publish was refused 403 against
+          # `abakhsh56/Farmer-App`.
+          #
+          # Dev and production deliberately keep the default (`abakhsh56/Farmer-App`),
+          # which is the repository already-installed apps poll: moving those
+          # channels would strand every phone in the field until a new APK.
+          OTA_RELEASE_REPO: ${{ github.ref_name == 'staging' && 'abakhsh565/Farmer-App' || '' }}
         run: |
           npx --yes tsx scripts/ota-publish.mjs --env "${{ steps.channel.outputs.env }}" || \
             node scripts/ota-publish.mjs --env "${{ steps.channel.outputs.env }}"

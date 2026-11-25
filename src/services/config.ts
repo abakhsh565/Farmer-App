@@ -297,11 +297,18 @@ export function resolveProviders(
           ? 'gateway'
           : 'development',
     /*
-     * The marketplace wins when it is configured, because it is where the shops
-     * actually publish. The app's own backend remains the fallback for a build
-     * without it, and the fixture for a build with neither — so the Shop tab has
-     * an answer in all three states, and the choice is still one decision made in
-     * one place.
+     * The app's own dealer system is the primary source once there is a backend,
+     * and the marketplace completes it; the fixture covers a build with neither.
+     *
+     * This used to read the other way round — the marketplace won whenever it was
+     * configured — and that was wrong in a way that showed: `dealer_profiles` is
+     * where the shops this app knows are recorded, and the same table feeds the
+     * scan screen's stockist list and the shop's own page. Preferring the
+     * marketplace meant the Shop tab could show a different set of shops from the
+     * rest of the app, and showed *none* while the farmer's own shops sat in the
+     * database. The chain in `providers/fallback` asks the dealer system first and
+     * falls through to the marketplace only when it has nothing near the farmer,
+     * so the choice here is still one decision made in one place.
      */
     dealer: config.marketplace.configured
       ? 'marketplace'

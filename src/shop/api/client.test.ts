@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import { callShopRpc, classifyFailure, farmerMe, farmerSendMessage } from './client';
+import { callShopRpc, classifyFailure, farmerJoinShop, farmerMe, farmerSendMessage } from './client';
 
 /**
  * The client is tested against a socket, not a mocked `fetch`.
@@ -78,6 +78,19 @@ describe('callShopRpc', () => {
     );
     expect(seen[0]?.authorization).toBe('Bearer anon-key');
     expect(seen[0]?.body).toEqual({ p_token: 'credential-token', p_body: 'salam', p_shop_id: null });
+  });
+
+  it('introduces the farmer with the three parameters the shop’s join declares', async () => {
+    reply = { status: 200, body: [{ farmer_id: 'f1', token: 't', shop_id: 's1' }] };
+    await farmerJoinShop('WNYB2G', { phone: '923001234567', name: 'Bilal' }, config());
+
+    expect(seen[0]?.path).toBe('/rest/v1/rpc/farmer_api_join_shop');
+    expect(seen[0]?.body).toEqual({
+      p_code: 'WNYB2G',
+      p_phone: '923001234567',
+      p_name: 'Bilal',
+      p_village: null,
+    });
   });
 
   it('does not call anything when the build has no shop backend', async () => {

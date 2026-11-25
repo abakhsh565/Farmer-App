@@ -11,6 +11,17 @@ import {
 } from 'react';
 import { serviceConfig } from '@/services/config';
 import {
+  mediaCapability,
+  mediaLink,
+  fetchShopMedia,
+  sendAttachment,
+  uploadMedia,
+  validateMedia,
+  type MediaKind,
+} from './api/media';
+import { toE164 } from '@/services/supabaseClient';
+import { useSession } from '@/session/SessionProvider';
+import {
   farmerAnswerOffer,
   farmerCreateCreditRequest,
   farmerJoinShop,
@@ -20,6 +31,7 @@ import {
   farmerSendMessage,
   farmerThread,
   isTerminal,
+  type FarmerIdentity,
   type ShopApiFailure,
 } from './api/client';
 import {
@@ -74,6 +86,31 @@ export type ShopApiStatus =
 
 export type ShopFailure = { kind: ShopApiFailure; message: string } | null;
 
+/**
+ * A file this phone is still delivering — a voice note or a photo.
+ *
+ * The bytes live here, not in the thread, because the thread is the shop's record of
+ * what was said and a file that has not arrived is not part of it yet. Keeping it out
+ * of `thread` is also what makes retry honest: the bubble shows the recording or
+ * picture it will actually re-send, with progress and a failure it can recover from.
+ *
+ * `storagePath` is written as soon as the bytes are stored, so a failure at the
+ * second step (recording the message) is retried without uploading them again.
+ */
+export type MediaOutboxItem = {
+  localId: string;
+  kind: MediaKind;
+  blob: Blob;
+  mimeType: string;
+  /** `0` for a photo: the shop refuses a duration on an image. */
+  durationMs: number;
+  storagePath: string | null;
+  status: 'sending' | 'failed';
+  /** 0…1 while uploading. */
+  progress: number;
+  error: string | null;
+};
+
 type ShopApiValue = {
   status: ShopApiStatus;
   configured: boolean;
@@ -88,6 +125,15 @@ type ShopApiValue = {
   joinWithLink: (link: string) => Promise<boolean>;
   forget: () => void;
   send: (text: string) => Promise<boolean>;
+  /** True once the shop backend has answered the media contract — voice and photos. */
+  mediaSupported: boolean;
+  /** Files on their way to the shop, newest last. */
+  mediaOutbox: MediaOutboxItem[];
+  sendMedia: (file: { kind: MediaKind; blob: Blob; mimeType: string; durationMs?: number }) => Promise<boolean>;
+  retryMedia: (localId: string) => Promise<boolean>;
+  discardMedia: (localId: string) => void;
+  /** A fresh sixty-second link for one message's file, or `null` when it cannot be made. */
+  resolveMediaUrl: (serverId: string | null | undefined) => Promise<string | null>;
   askCredit: (amount: number, note: string | null) => Promise<boolean>;
   askVisit: (purpose: string | null, window: string | null) => Promise<boolean>;
   answerOffer: (requestId: string, accept: boolean, note: string | null) => Promise<boolean>;
@@ -122,6 +168,21 @@ function saveSeen(ids: string[]): void {
 
 export function ShopApiProvider({ children }: { children: ReactNode }) {
   const configured = serviceConfig.shopApi.configured;
+  /*
+   * The farmer's own identity, for the one call that has to introduce him.
+   *
+   * Joining is the only place the shop learns who this is, and it learns it the way
+   * the owner does at the counter: a name and a phone number. The number is the
+   * identity on the shop's side, so it goes as national digits (`92300…`) — the
+   * shop normalises its own `0300…` and `+92300…` to the same key.
+   */
+  const { account } = useSession();
+  const identity = useMemo<FarmerIdentity | null>(() => {
+    if (!account?.phone) return null;
+    const phone = toE164(account.phone).replace(/^\+/, '');
+    if (!phone) return null;
+    return { phone, name: account.name.trim() || phone };
+  }, [account?.name, account?.phone]);
 
   const [credential, setCredential] = useState<ShopCredential | null>(() =>
     configured ? loadShopCredential() : null,
@@ -135,6 +196,8 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
   const [failure, setFailure] = useState<ShopFailure>(null);
   const [busy, setBusy] = useState(false);
   const [seen, setSeen] = useState<string[]>(loadSeen);
+  const [mediaSupported, setMediaSupported] = useState(false);
+  const [mediaOutbox, setMediaOutbox] = useState<MediaOutboxItem[]>([]);
 
   /** The credential as it is *now*, for callbacks that outlive a render. */
   const current = useRef<ShopCredential | null>(credential);
@@ -152,10 +215,11 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
   /** Reads the thread and the outbox for a credential that is already trusted. */
   const load = useCallback(
     async (token: string): Promise<boolean> => {
-      const [meResult, threadResult, notificationsResult] = await Promise.all([
+      const [meResult, threadResult, notificationsResult, mediaResult] = await Promise.all([
         farmerMe(token),
         farmerThread(token),
         farmerNotifications(token),
+        fetchShopMedia(token),
       ]);
 
       if (!meResult.ok) {
@@ -179,7 +243,14 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
       /* A thread that failed on its own is not a reason to blank the screen the
          farmer just opened: an empty conversation with the shop named above it is
          the honest rendering, and the next refresh fills it. */
-      setThread(threadResult.ok ? normaliseThread(threadResult.data) : null);
+      /* The thread says who said what; the media call says which of those messages
+         carry a file and how long it runs. A conversation of plain text answers `[]`,
+         and a backend without the call at all is not a reason to blank the messages. */
+      setThread(
+        threadResult.ok
+          ? normaliseThread(threadResult.data, mediaResult.ok ? mediaResult.data : [])
+          : null,
+      );
       setNotifications(notificationsResult.ok ? normaliseNotifications(notificationsResult.data) : []);
 
       /* The shop's own name wins over the one stored at join time — a shop may
@@ -292,7 +363,17 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
       setBusy(true);
       setFailure(null);
       try {
-        const result = await farmerJoinShop(code);
+        /* A phone number is what the shop records, so a build that let an account
+           without one try to join would ask the owner to accept a nameless farmer. */
+        if (!identity) {
+          setFailure({
+            kind: 'validation',
+            message: 'Connecting to a shop needs a phone number on this account.',
+          });
+          return false;
+        }
+
+        const result = await farmerJoinShop(code, identity);
         if (!result.ok) {
           setFailure({ kind: result.error, message: result.message });
           return false;
@@ -319,8 +400,148 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
         setBusy(false);
       }
     },
-    [adopt, configured, load],
+    [adopt, configured, identity, load],
   );
+
+  /**
+   * Does this shop take voice notes and photos?
+   *
+   * Asked once per connected session rather than assumed. The microphone and the
+   * camera are hidden when the answer is no, because a control that sends a file the
+   * shop cannot accept is worse than no control: the farmer talks for thirty seconds
+   * and loses it. An older backend answers `PGRST202`, which reads as "not supported"
+   * here and as an outage nowhere.
+   */
+  useEffect(() => {
+    if (!configured || status !== 'ready' || !credential?.token) return;
+    let cancelled = false;
+    void mediaCapability(credential.token).then((supported) => {
+      if (!cancelled) setMediaSupported(supported);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [configured, credential?.token, status]);
+
+  const patchOutbox = useCallback((localId: string, patch: Partial<MediaOutboxItem>) => {
+    setMediaOutbox((current) =>
+      current.map((item) => (item.localId === localId ? { ...item, ...patch } : item)),
+    );
+  }, []);
+
+  /**
+   * Bytes → message row, for one recording or photo. Retry calls this again.
+   *
+   * The two steps are separate calls on the shop's side and they fail differently: a
+   * failed upload leaves no message at all, while a failure at the second step leaves
+   * an object nothing points at. Keeping the storage path in the outbox item is what
+   * makes the second kind of retry cheap — the bytes are already stored.
+   */
+  const deliverMedia = useCallback(
+    async (item: MediaOutboxItem): Promise<boolean> => {
+      const token = current.current?.token;
+      if (!token) return false;
+
+      const sane = validateMedia(item.kind, item.blob, item.durationMs);
+      if (!sane.ok) {
+        patchOutbox(item.localId, { status: 'failed', error: sane.message });
+        return false;
+      }
+
+      patchOutbox(item.localId, { status: 'sending', progress: 0, error: null });
+
+      let stored = item.storagePath
+        ? { storagePath: item.storagePath, mimeType: item.mimeType, sizeBytes: item.blob.size }
+        : null;
+
+      if (!stored) {
+        const uploaded = await uploadMedia({
+          token,
+          kind: item.kind,
+          blob: item.blob,
+          mimeType: item.mimeType,
+          durationMs: item.durationMs,
+          onProgress: (fraction) => patchOutbox(item.localId, { progress: fraction }),
+        });
+
+        if (!uploaded.ok) {
+          if (isTerminal(uploaded.error)) expire();
+          patchOutbox(item.localId, { status: 'failed', error: uploaded.message });
+          return false;
+        }
+
+        stored = uploaded.data;
+        patchOutbox(item.localId, { storagePath: stored.storagePath, progress: 1 });
+      }
+
+      const sent = await sendAttachment({
+        token,
+        kind: item.kind,
+        storagePath: stored.storagePath,
+        mimeType: stored.mimeType,
+        sizeBytes: stored.sizeBytes,
+        durationMs: item.kind === 'voice' ? item.durationMs : undefined,
+      });
+
+      if (!sent.ok) {
+        if (isTerminal(sent.error)) expire();
+        patchOutbox(item.localId, { status: 'failed', error: sent.message });
+        return false;
+      }
+
+      /* Gone from the outbox, and back from the thread: the bubble the farmer sees
+         afterwards is the shop's row, not this phone's copy of it. */
+      setMediaOutbox((current) => current.filter((entry) => entry.localId !== item.localId));
+      await load(token);
+      return true;
+    },
+    [expire, load, patchOutbox],
+  );
+
+  const sendMedia = useCallback(
+    async (file: { kind: MediaKind; blob: Blob; mimeType: string; durationMs?: number }) => {
+      const item: MediaOutboxItem = {
+        localId: `m-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        kind: file.kind,
+        blob: file.blob,
+        mimeType: file.mimeType,
+        durationMs: file.durationMs ?? 0,
+        storagePath: null,
+        status: 'sending',
+        progress: 0,
+        error: null,
+      };
+      setMediaOutbox((current) => [...current, item]);
+      return deliverMedia(item);
+    },
+    [deliverMedia],
+  );
+
+  const retryMedia = useCallback(
+    async (localId: string) => {
+      const item = mediaOutbox.find((entry) => entry.localId === localId);
+      return item ? deliverMedia(item) : false;
+    },
+    [deliverMedia, mediaOutbox],
+  );
+
+  const discardMedia = useCallback((localId: string) => {
+    setMediaOutbox((current) => current.filter((entry) => entry.localId !== localId));
+  }, []);
+
+  /**
+   * A playable link, minted when it is needed.
+   *
+   * Sixty seconds is the whole life of the signature the shop mints, so nothing here
+   * caches one: a cached URL is a message that plays today and is silent tomorrow,
+   * with nothing on screen to explain why.
+   */
+  const resolveMediaUrl = useCallback(async (serverId: string | null | undefined) => {
+    const token = current.current?.token;
+    if (!token || !serverId) return null;
+    const result = await mediaLink(token, serverId);
+    return result.ok ? result.data.url : null;
+  }, []);
 
   const joinWithLink = useCallback(
     async (link: string): Promise<boolean> => {
@@ -428,6 +649,12 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
         expire();
       },
       send: (text) => run((token) => farmerSendMessage(token, text)),
+      mediaSupported,
+      mediaOutbox,
+      sendMedia,
+      retryMedia,
+      discardMedia,
+      resolveMediaUrl,
       askCredit: (amount, note) => run((token) => farmerCreateCreditRequest(token, amount, note)),
       askVisit: (purpose, window) => run((token) => farmerRequestVisit(token, purpose, window)),
       answerOffer: (requestId, accept, note) =>
@@ -444,6 +671,12 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
     credential,
     configured,
     failure,
+    discardMedia,
+    retryMedia,
+    sendMedia,
+    mediaOutbox,
+    mediaSupported,
+    resolveMediaUrl,
     joinWithCode,
     joinWithLink,
     me,

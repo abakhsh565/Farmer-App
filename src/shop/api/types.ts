@@ -1,4 +1,5 @@
-import type { ChatMessage } from '@/data/chat';
+import type { ChatAudio, ChatImage, ChatMessage } from '@/data/chat';
+import type { ShopMediaRow } from './media';
 
 /**
  * The shop backend's responses, as this app understands them.
@@ -11,8 +12,9 @@ import type { ChatMessage } from '@/data/chat';
  *    `credit_requests` or `requests` — because a backend that renames a key must
  *    not blank the farmer's conversation.
  *  · Nothing is invented. A thread without messages is an empty thread, a message
- *    without a body is dropped rather than rendered as an empty bubble, and a
- *    field that is missing stays missing so the screen can say it does not know.
+ *    without a body and without a file is dropped rather than rendered as an empty
+ *    bubble, and a field that is missing stays missing so the screen can say it does
+ *    not know.
  */
 
 export type ShopMe = {
@@ -84,14 +86,30 @@ export function firstRow(value: unknown): Record<string, unknown> | null {
  *
  * A `token` in the response is ignored: the app already holds one, and adopting a
  * second from a payload would let a stale response overwrite a fresh credential.
+ *
+ * Two shapes are read, because the shop answers with the second one and an older
+ * build of this app expected the first:
+ *
+ *   `{farmer_id, shop_id, shop_name}`                     — one shop per credential
+ *   `{id, name, shops: [{shop_id, shop_name}]}`           — the shop's actual answer
+ *
+ * A farmer joined to one shop still has exactly one conversation here, so the
+ * first entry of `shops` stands in for the pair. Reading only the flat shape was
+ * why a valid credential was reported as "not recognised by the shop".
  */
 export function normaliseMe(value: unknown): ShopMe | null {
   const row = firstRow(value);
   if (!row) return null;
 
   const shop = record(firstOf(row, ['shop', 'branch']));
-  const farmerId = text(firstOf(row, ['farmer_id', 'farmerId']));
-  const shopId = text(firstOf(row, ['shop_id', 'shopId'])) ?? text(shop.id);
+  const shops = Array.isArray(row.shops) ? row.shops : [];
+  const joined = record(shops[0] ?? {});
+
+  const farmerId = text(firstOf(row, ['farmer_id', 'farmerId', 'id']));
+  const shopId =
+    text(firstOf(row, ['shop_id', 'shopId'])) ??
+    text(shop.id) ??
+    text(firstOf(joined, ['shop_id', 'shopId', 'id']));
 
   /* Without these two the credential points at nothing this app can show. */
   if (!farmerId || !shopId) return null;
@@ -100,7 +118,11 @@ export function normaliseMe(value: unknown): ShopMe | null {
     farmerId,
     farmerName: text(firstOf(row, ['farmer_name', 'farmerName', 'name'])),
     shopId,
-    shopName: text(firstOf(row, ['shop_name', 'shopName'])) ?? text(shop.name) ?? '',
+    shopName:
+      text(firstOf(row, ['shop_name', 'shopName'])) ??
+      text(shop.name) ??
+      text(firstOf(joined, ['shop_name', 'shopName', 'name'])) ??
+      '',
     shopPhone: text(firstOf(row, ['shop_phone', 'phone'])) ?? text(shop.phone),
   };
 }
@@ -108,36 +130,127 @@ export function normaliseMe(value: unknown): ShopMe | null {
 /**
  * A message row, as a chat bubble.
  *
- * `sender_role` decides the side. The contract sends `farmer` or `shop_owner`;
- * `direction` is accepted as a fallback because it is the other obvious spelling.
- * A row that names neither is drawn as the shop's, since assuming the farmer wrote
- * it would show the farmer his own words as a reply.
+ * The shop marks each row with `direction`, and its two values are the two
+ * parties: `farmer` for what the farmer sent, `owner` for the shop's reply. That
+ * is not the same vocabulary as `sender_role`/`outbound`, so all of them are read:
+ * recognising only `outbound` drew the farmer's own messages on the shop's side of
+ * the conversation, and made his join notice look like an incoming line.
+ *
+ * A row that names no side at all is drawn as the shop's, since assuming the
+ * farmer wrote it would show him his own words as a reply.
  */
-function normaliseMessage(value: unknown, index: number): ChatMessage | null {
+/**
+ * A voice row, as the shop stores it.
+ *
+ * The shop records `kind = 'voice'` beside the object it stored, and returns a
+ * signed `audio_url` in the thread so playback needs no second round trip. The
+ * duration is read from whichever name the backend uses — milliseconds first, then
+ * seconds — because a bar that says `0:00` for a real recording reads as a broken
+ * message rather than a missing field.
+ */
+function normaliseVoice(row: Record<string, unknown>): ChatAudio | null {
+  const kind = (text(firstOf(row, ['kind', 'message_kind', 'type'])) ?? '').toLowerCase();
+  const url = text(firstOf(row, ['audio_url', 'voice_url', 'audioUrl', 'signed_url']));
+  const flagged = row.audio === true || row.voice === true;
+  if (!flagged && kind !== 'voice' && kind !== 'audio' && !url) return null;
+
+  const asMs = (value: unknown): number => {
+    const number = typeof value === 'number' ? value : Number(text(value));
+    return Number.isFinite(number) && number > 0 ? number : 0;
+  };
+
+  const hoursMs = asMs(firstOf(row, ['duration_ms', 'durationMs', 'audio_duration_ms']));
+  const seconds = asMs(firstOf(row, ['duration_seconds', 'duration_s', 'duration']));
+  const durationMs = hoursMs > 0 ? hoursMs : seconds > 0 ? Math.round(seconds * 1000) : 0;
+
+  return {
+    /* Not every backend signs the URL on every read; a null here draws the bubble
+       with a duration and a disabled play control rather than hiding the message. */
+    url,
+    durationMs,
+    mimeType: text(firstOf(row, ['mime_type', 'mimeType'])),
+    status: 'sent',
+  };
+}
+
+function normaliseMessage(
+  value: unknown,
+  index: number,
+  media: ShopMediaRow | undefined,
+): ChatMessage | null {
   const row = record(value);
   const body = text(firstOf(row, ['body', 'text', 'message']))?.trim();
-  if (!body) return null;
+  const serverId = text(row.id);
+
+  /*
+   * The file, from the thread's own media call rather than from the message row.
+   *
+   * The shop keeps them apart on purpose: `farmer_api_thread` says who said what,
+   * `farmer_api_media` says which messages carry a file and how long it runs. So the
+   * two are joined here by message id, and a message with no attachment is an
+   * ordinary message. The older inline shape (`kind`/`audio_url` on the row) is still
+   * read as a fallback, because a backend that returns it is telling the truth too.
+   */
+  const voice: ChatAudio | null =
+    media?.kind === 'voice'
+      ? {
+          /* Never a stored URL: the shop mints a sixty-second signature on demand. */
+          url: null,
+          durationMs: media.durationMs ?? 0,
+          mimeType: media.mimeType,
+          status: 'sent',
+          serverId,
+        }
+      : media
+        ? null
+        : normaliseVoice(row);
+
+  const image: ChatImage | null =
+    media?.kind === 'image'
+      ? {
+          url: null,
+          mimeType: media.mimeType,
+          width: media.width,
+          height: media.height,
+          status: 'sent',
+          serverId,
+        }
+      : null;
+
+  /* A voice note or a photo has no text of its own, so the old "drop anything without
+     a body" rule would have silently deleted every recording and picture. */
+  if (!body && !voice && !image) return null;
 
   const role = (text(firstOf(row, ['sender_role', 'role'])) ?? '').toLowerCase();
   const direction = (text(row.direction) ?? '').toLowerCase();
-  const mine = role === 'farmer' || direction === 'outbound' || direction === 'out';
+  const mine =
+    role === 'farmer' || direction === 'farmer' || direction === 'outbound' || direction === 'out';
 
   return {
     /* The thread's own order is the identity React needs: ids from two servers
        (a uuid here, an integer in the local store) must not be mixed. */
     id: index + 1,
     from: mine ? 'me' : 'dealer',
-    text: body,
+    /* The shop's id, kept for the one thing it is for: asking for this message's
+       file link. It is not used as a React key. */
+    ...(serverId ? { serverId } : {}),
+    text: body ?? undefined,
+    ...(voice ? { audio: voice } : {}),
+    ...(image ? { image } : {}),
   };
 }
 
-export function normaliseThread(value: unknown): ShopThread {
+export function normaliseThread(value: unknown, media: ShopMediaRow[] = []): ShopThread {
   const row = firstRow(value) ?? {};
   const shop = record(firstOf(row, ['shop', 'branch']));
   const rawMessages = firstOf(row, ['messages', 'thread', 'chat']) ?? [];
+  const mediaByMessage = new Map(media.map((entry) => [entry.messageId, entry]));
 
   const messages = (Array.isArray(rawMessages) ? rawMessages : [])
-    .map(normaliseMessage)
+    .map((message, index) => {
+      const serverId = text(record(message).id);
+      return normaliseMessage(message, index, serverId ? mediaByMessage.get(serverId) : undefined);
+    })
     .filter((message): message is ChatMessage => message !== null);
 
   const offers = (Array.isArray(firstOf(row, ['credit_requests', 'creditRequests', 'requests', 'offers']))
@@ -148,11 +261,14 @@ export function normaliseThread(value: unknown): ShopThread {
       const offer = record(entry);
       const id = text(offer.id);
       if (!id) return null;
-      const amount = typeof offer.amount === 'number' ? offer.amount : Number(text(offer.amount));
+      /* The shop names these by what was asked for (`requested_amount`) and what it
+         offered (`offer_total`); the older flat names are still read beside them. */
+      const raw = firstOf(offer, ['amount', 'requested_amount', 'offer_total']);
+      const amount = typeof raw === 'number' ? raw : Number(text(raw));
       return {
         id,
         amount: Number.isFinite(amount) ? amount : null,
-        note: text(offer.note),
+        note: text(firstOf(offer, ['note', 'requested_note', 'offer_note'])),
         status: (text(offer.status) ?? 'unknown').toLowerCase(),
       } satisfies ShopOffer;
     })
@@ -172,7 +288,7 @@ export function normaliseThread(value: unknown): ShopThread {
       return {
         id,
         purpose: text(visit.purpose),
-        window: text(firstOf(visit, ['window', 'scheduled_for', 'day'])),
+        window: text(firstOf(visit, ['window', 'preferred_window', 'scheduled_for', 'day'])),
         status: (text(visit.status) ?? 'unknown').toLowerCase(),
       } satisfies ShopVisit;
     })

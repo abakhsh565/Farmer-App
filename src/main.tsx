@@ -20,6 +20,7 @@ import '@/styles/theme.css';
 import { App } from '@/App';
 import { initAnalytics } from '@/services/analytics';
 import { startLiveUpdates } from '@/services/liveUpdate';
+import { startServiceWorker } from '@/services/serviceWorker';
 
 const container = document.getElementById('root');
 
@@ -37,6 +38,11 @@ initAnalytics();
 // that deployment's files — so this is a no-op off the native platform, and it
 // never blocks the first render.
 startLiveUpdates();
+
+// The worker belongs to the browser, not to the installed app: there it is what
+// keeps a phone opening yesterday's bundle after a new build arrives. Registered
+// (or removed) before the first render so the very first paint is the shipped one.
+void startServiceWorker();
 
 createRoot(container).render(
   <StrictMode>

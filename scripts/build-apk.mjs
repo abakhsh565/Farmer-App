@@ -57,7 +57,63 @@ const FLAVORS = {
   },
 };
 
-const OTA_RELEASES = 'https://github.com/abakhsh56/Farmer-App/releases/download';
+/**
+ * The GitHub repository each flavour's update channel lives in.
+ *
+ * It is per flavour because the channels are not all published by the same
+ * account: staging is released by the workflow in `abakhsh565/Farmer-App`, whose
+ * token cannot write a release in the older `abakhsh56/Farmer-App` copy, while
+ * dev and production are published to — and polled from — that older copy by
+ * every build already installed.
+ *
+ * A default here rather than only an environment variable keeps the ordinary
+ * command honest: `npm run apk:staging` builds a phone that watches the channel
+ * staging actually publishes to. `OTA_RELEASE_REPO=owner/repository` still
+ * overrides it for a one-off build.
+ */
+const OTA_DEFAULT_REPO = {
+  dev: 'abakhsh56/Farmer-App',
+  staging: 'abakhsh565/Farmer-App',
+  production: 'abakhsh56/Farmer-App',
+};
+
+/**
+ * Blank out the endpoints a developer's `.env.local` may point at a local stack.
+ *
+ * Vite loads `.env.local` for every build, and `src/services/config.ts` prefers an
+ * explicit `VITE_SHOP_API_URL` / `VITE_MARKETPLACE_URL` over the per-environment
+ * table. Together that shipped a staging APK whose shop backend was
+ * `http://127.0.0.1:54321` — unreachable on a phone, and invisible in the build log
+ * because the build succeeded and the app simply looked unconfigured. An empty
+ * string overrides the file (process env wins) and reads back as "unset", so the
+ * environment table decides, which is the rule every CI build already follows.
+ *
+ * `dev` keeps the developer's own values: its backend *is* the local stack.
+ */
+function remoteEndpointOverrides(target) {
+  if (target === 'dev') return {};
+  return {
+    VITE_SHOP_API_URL: '',
+    VITE_SHOP_API_KEY: '',
+    VITE_MARKETPLACE_URL: '',
+    VITE_MARKETPLACE_KEY: '',
+    /* Unused by a staging or production build — `config.ts` takes the backend from
+       the environment table for both — but inlined all the same, and a localhost
+       URL inside a release artifact is a false alarm waiting to happen. */
+    VITE_SUPABASE_URL: '',
+    VITE_SUPABASE_ANON_KEY: '',
+  };
+}
+
+/** The `…/releases/download` base a flavour's build should poll. */
+function otaReleasesBase(target) {
+  const configured = (process.env.OTA_RELEASE_REPO ?? '').trim();
+  const repo = configured || OTA_DEFAULT_REPO[target];
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) {
+    fail(`OTA_RELEASE_REPO is not "owner/repository": "${repo}".`);
+  }
+  return `https://github.com/${repo}/releases/download`;
+}
 
 function parseArgs(argv) {
   const flags = argv.slice(2);
@@ -226,7 +282,12 @@ function runWebBuild() {
   // A plain command line through the shell: on Windows `shell: true` resolves
   // npm/npx through PATHEXT, which a quoted `npm.cmd` does not (Node then tries to
   // load the .cmd file as JavaScript and reports MODULE_NOT_FOUND).
-  const buildEnv = { ...env, VITE_APP_ENV: flavor, VITE_OTA_BASE: `${OTA_RELEASES}/${selection.ota}` };
+  const buildEnv = {
+    ...env,
+    VITE_APP_ENV: flavor,
+    VITE_OTA_BASE: `${otaReleasesBase(flavor)}/${selection.ota}`,
+    ...remoteEndpointOverrides(flavor),
+  };
 
   // Run the tools through `node` and their own entry scripts, not through npm:
   // this project has an `npm` package in node_modules, so a shell resolves `npm`

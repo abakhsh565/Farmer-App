@@ -62,6 +62,18 @@ export type SupabaseLike = {
       error: { message: string; status?: number } | null;
     }>;
     /**
+     * Set a password on the account the current session belongs to.
+     *
+     * The only way to give a password to an account that was created by verifying a
+     * number, which is every phone account on this project. It acts on the session,
+     * never on a contact typed into a field, so it cannot reach another farmer's
+     * account.
+     */
+    updateUser: (input: { password: string }) => Promise<{
+      data: unknown;
+      error: { message: string; status?: number } | null;
+    }>;
+    /**
      * Credential sign-in. Used by the credential sheet and the dev demo provider;
      * the password check is still the server's.
      */

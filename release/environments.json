@@ -1,0 +1,88 @@
+{
+  "$comment": [
+    "The one machine-readable list of what exists where. Every script that needs to",
+    "know an environment's branch, site, update channel or project reads this file;",
+    "nothing else keeps its own copy. Two copies of this table is how staging ended",
+    "up with a site on one commit, an OTA channel on another, and two repositories",
+    "that each looked canonical.",
+    "",
+    "Keys are never stored here. The app's publishable keys live in",
+    "src/services/appEnvironments.ts (a build needs to import them); this file only",
+    "names which project each environment is, so a reader can tell whether the",
+    "right one answered.",
+    "",
+    "site.role is the difference that used to be invisible:",
+    "  delivered  — this URL is the environment. It must match the branch.",
+    "  mirror     — a convenience copy for looking at the dev branch; it runs against",
+    "               whatever .env.local held at build time, so it is not evidence."
+  ],
+  "version": 1,
+  "environments": {
+    "dev": {
+      "branch": "development",
+      "label": "Development",
+      "site": {
+        "id": "3a7f2b41-6c8d-4e59-9b3a-1d2f4c6e8a01",
+        "url": "https://farmer-app-dev-97xtwn.freebuff.site",
+        "worker": "site-889ef993cf8047498592dcae0f6ef25f",
+        "accountId": "6e5a40dd9362fb315de7ecbaad2ca12b",
+        "role": "mirror",
+        "note": "A static copy of the dev branch for looking at. Its backend was whatever .env.local held when it was built, so it proves layout, never data."
+      },
+      "ota": {
+        "repo": "abakhsh56/Farmer-App",
+        "tag": "ota-dev",
+        "why": "Pinned to this repository because dev APKs were built to poll it."
+      },
+      "app": { "id": "pk.agrishop.farmer.dev", "name": "Farmer Dev" },
+      "backend": {
+        "kind": "local",
+        "url": "http://127.0.0.1:54421",
+        "projectRef": null,
+        "note": "Docker on the developer's machine. Nothing here reaches a shared project."
+      },
+      "shop": { "kind": "local", "projectRef": null },
+      "localApp": "http://127.0.0.1:5173"
+    },
+    "staging": {
+      "branch": "staging",
+      "label": "Staging",
+      "site": {
+        "id": "5c2e9d73-1b4a-4f86-8d27-3e5a7c9b1f02",
+        "url": "https://farmer-app-staging-i1iih6.freebuff.site",
+        "worker": "site-84b8e8f6ff184cdab4eaa895ef29ecbe",
+        "accountId": "6e5a40dd9362fb315de7ecbaad2ca12b",
+        "role": "delivered"
+      },
+      "ota": {
+        "repo": "abakhsh565/Farmer-App",
+        "tag": "ota-staging",
+        "why": "The canonical repository. Its workflow token can publish releases here and cannot in abakhsh56."
+      },
+      "app": { "id": "pk.agrishop.farmer.staging", "name": "Farmer Staging" },
+      "backend": { "kind": "cloud", "url": "https://zmyvkwijloqylvftvhvq.supabase.co", "projectRef": "zmyvkwijloqylvftvhvq" },
+      "shop": { "kind": "cloud", "projectRef": "bpybjrjenwccowvtrevu" },
+      "localApp": null
+    },
+    "production": {
+      "branch": "main",
+      "label": "Production",
+      "site": {
+        "id": "9e4b1c85-7d3f-4a29-bc56-2f8d3a5c7e03",
+        "url": "https://farmer-app-production-8sc6a2.freebuff.site",
+        "worker": "site-a2524705d31d451da3b35dbb803e20cd",
+        "accountId": "6e5a40dd9362fb315de7ecbaad2ca12b",
+        "role": "delivered"
+      },
+      "ota": {
+        "repo": "abakhsh56/Farmer-App",
+        "tag": "ota-production",
+        "why": "Every installed production app polls this channel; moving it would strand them until a reinstall."
+      },
+      "app": { "id": "pk.agrishop.farmer", "name": "Farmer" },
+      "backend": { "kind": "cloud", "url": "https://swmbmtvwgksicfnfsehg.supabase.co", "projectRef": "swmbmtvwgksicfnfsehg" },
+      "shop": { "kind": "cloud", "projectRef": "gkswcfljxlutkfdvvqng" },
+      "localApp": null
+    }
+  }
+}

@@ -1,15 +1,5 @@
-import { Camera,
-  ChevronLeft,
-  Image as ImageIcon,
-  Leaf,
-  MessageCircle,
-  Mic,
-  Send,
-  ShieldAlert,
-  Volume2,
-} from 'lucide-react';
-import { useEffect, useRef, useState } from 'react';
-import { toast } from 'sonner';
+import { Camera, ChevronLeft, Image as ImageIcon, Leaf, ShieldAlert, Volume2 } from 'lucide-react';
+import { useEffect, useState } from 'react';
 import { useAiCredits } from '@/aiagent/AiCreditsProvider';
 import { SectionLabel } from '@/components/SectionLabel';
 import { EmptyState, LoadingState } from '@/components/States';
@@ -18,10 +8,8 @@ import { dealerNameKey } from '@/data/dealers';
 import { useLocation } from '@/location/LocationProvider';
 import { ROUNDUP } from '@/data/products';
 import { useStockists } from '@/services/hooks';
-import { useServices } from '@/services/registry';
-import type { AiAnswer, AiCitation } from '@/services/types';
-import { verdictFor, type Verdict } from '@/scan/analyze';
-import { useSession } from '@/session/SessionProvider';
+import { useSpeech } from '@/speech/SpeechProvider';
+import { LOCALE_REGISTRY } from '@/i18n/locales';
 import {
   Choicebox,
   ChoiceboxIndicator,
@@ -37,43 +25,12 @@ import { formatMoney, formatNumber, formatRelativeTime, intlLocale } from '@/i18
 
 type Step = 'capture' | 'crop' | 'symptom' | 'analysing' | 'blocked' | 'result';
 
-/**
- * The platform's speech recogniser, which the DOM typings do not carry. Declared
- * here as the two methods this screen uses rather than pulling in a package for
- * one constructor — and read through a nullable lookup, because a browser that
- * cannot listen must not be offered a control that pretends to.
- */
-type Recognition = {
-  lang: string;
-  continuous: boolean;
-  interimResults: boolean;
-  start: () => void;
-  onresult: ((event: { results: ArrayLike<ArrayLike<{ transcript: string }>> }) => void) | null;
-  onend: (() => void) | null;
-};
-
-const speechWindow = window as Window & {
-  SpeechRecognition?: new () => Recognition;
-  webkitSpeechRecognition?: new () => Recognition;
-};
-
-const recognitionCtor = () =>
-  speechWindow.SpeechRecognition ?? speechWindow.webkitSpeechRecognition;
-
 const CROPS: ReadonlyArray<{ nameKey: MessageKey; price: number }> = [
   { nameKey: 'crop.cotton', price: 8200 },
   { nameKey: 'crop.wheat', price: 3900 },
   { nameKey: 'crop.maize', price: 2650 },
   { nameKey: 'crop.rice', price: 4300 },
 ];
-
-/** The catalogue key is not the crop code the gateway speaks. */
-const CROP_CODES: Record<string, string> = {
-  'crop.cotton': 'cotton',
-  'crop.wheat': 'wheat',
-  'crop.maize': 'maize',
-  'crop.rice': 'rice',
-};
 
 const SYMPTOMS: ReadonlyArray<MessageKey> = [
   'scan.symptom.holes',
@@ -86,42 +43,39 @@ const SYMPTOMS: ReadonlyArray<MessageKey> = [
 const MATCH = 82;
 
 
-/** A follow-up the farmer typed, and what the assistant did with it. */
-type Turn =
-  | { id: number; from: 'farmer'; text: string }
-  | { id: number; from: 'assistant'; verdict: Verdict };
-
 /**
- * A gateway answer and a local fallback are the same three outcomes, so the
- * screen has one rendering path. A low-confidence answer is escalated rather
- * than shown as a treatment, because the gateway's confidence is about evidence,
- * not tone.
+ * The camera flow: a photo, two questions, and what to do about the plant.
+ *
+ * It used to hold a conversation as well — the diagnosis ended in a composer, and
+ * the tab it lived in was one half of "Scan / AI". Both halves have moved: the
+ * conversation is the Assistant tab, where a farmer can open it without a leaf in
+ * their hand, and this screen is what it says it is. Reached from the Home card's
+ * *Crop check* row, which is where a farmer already goes when something looks
+ * wrong.
+ *
+ * What was removed is worth naming, because it was not only layout. The follow-up
+ * composer, its turns, its offline fallback and the evidence list all left with
+ * it; the answer cards and their sources now live in `AssistantScreen`, so there
+ * is one place that renders an answer rather than two that can disagree.
  */
-function verdictFromAnswer(answer: AiAnswer): Verdict {
-  if (answer.gate === 'off_domain') return { kind: 'refuse', gate: 'off_domain' };
-  if (answer.gate === 'not_covered' || answer.escalate) {
-    return { kind: 'escalate', gate: 'not_covered' };
-  }
-  return {
-    kind: 'answer',
-    gate: 'agriculture',
-    ...(answer.text ? { text: answer.text } : {}),
-    ...(answer.citations.length > 0 ? { citations: answer.citations } : {}),
-    ...(answer.generation ? { generation: answer.generation } : {}),
-    ...(answer.caveats.length > 0 ? { caveats: answer.caveats } : {}),
-  };
-}
-
 export function ScanScreen({
+  onBack,
   onOpenDealers,
-  onOpenAgent,
 }: {
+  /** Leaves the flow entirely — the pushed screen's own Back. */
+  onBack: () => void;
   onOpenDealers: () => void;
-  /** The conversational half of the same tab. */
-  onOpenAgent?: () => void;
 }) {
   const { t, locale } = useLocale();
   const credit = useCredit();
+  /*
+   * The verdict is read aloud, and it is the one sentence on this screen a farmer
+   * acts on in a field. It goes through the same voice as the weather card, so the
+   * pill answers with an Urdu voice or with a sentence saying why it could not.
+   */
+  const speech = useSpeech();
+  const speechTag = LOCALE_REGISTRY.ur.tag;
+  const listening = speech.speaking === 'scan-verdict';
   /*
    * The daily allowance. A photo analysis is the expensive AI action, so it is
    * charged here — before the result is produced — and a farmer without the
@@ -129,21 +83,9 @@ export function ScanScreen({
    * record. The follow-up questions below charge as conversation.
    */
   const aiCredits = useAiCredits();
-  const services = useServices();
-  const { requestIdentity } = useSession();
   const [step, setStep] = useState<Step>('capture');
-  const [turns, setTurns] = useState<Turn[]>([]);
-  const [thinking, setThinking] = useState(false);
-  const [fallback, setFallback] = useState(false);
-  const nextTurnId = useRef(1);
-  const [expertAsked, setExpertAsked] = useState(false);
   const [crop, setCrop] = useState<string>('crop.cotton');
   const [symptom, setSymptom] = useState<string>('scan.symptom.holes');
-  const [question, setQuestion] = useState('');
-  /** Photos the farmer adds to the conversation after the diagnosis. */
-  const [photos, setPhotos] = useState<string[]>([]);
-  const [listening, setListening] = useState(false);
-  const fileInput = useRef<HTMLInputElement>(null);
 
   /* The radius the farmer chose on the location page, so "no shop within N km"
      here is about the same N km the dealer list searched. */
@@ -161,14 +103,6 @@ export function ScanScreen({
    * warm by then.
    */
   const stockists = useStockists(ROUNDUP.id, location.radiusKm);
-
-  /* Object URLs for attached photos, released on unmount and only then — a
-     cleanup keyed on the photo list would revoke the last one while it is still
-     on screen. */
-  const objectUrls = useRef<string[]>([]);
-  useEffect(() => () => objectUrls.current.forEach((url) => URL.revokeObjectURL(url)), []);
-
-  const voice = Boolean(recognitionCtor());
 
   useEffect(() => {
     if (step !== 'analysing') return;
@@ -196,81 +130,18 @@ export function ScanScreen({
     setStep('analysing');
   };
 
-  /**
-   * The follow-up goes to the real assistant, not to a second gate copy in the
-   * screen. The crop the farmer selected is the one the answer should be about;
-   * the gateway adds the authenticated farmer's crops, district and interests.
-   * If the gateway is unavailable, the existing deterministic gate still answers
-   * and the screen says which path produced the reply.
-   */
-  const askAssistant = async (text: string) => {
-    if (thinking) return;
-    /* One turn, one credit — the same price as a turn in the assistant, because it
-       is the same assistant answering. */
-    if (!aiCredits.spend('chat')) {
-      toast.error(t(aiCredits.refusedReason('chat') ?? 'agent.credits.exhausted'));
-      return;
-    }
-    setThinking(true);
-    setFallback(false);
-    const id = nextTurnId.current++;
-    setTurns((current) => [...current, { id, from: 'farmer', text }]);
-    setQuestion('');
-
-    const cropCode = CROP_CODES[crop];
-    try {
-      const answer = await services.ai.ask(text, {
-        ...(cropCode ? { cropCode } : {}),
-        language: locale,
-      });
-      setTurns((current) => [
-        ...current,
-        { id: nextTurnId.current++, from: 'assistant', verdict: verdictFromAnswer(answer) },
-      ]);
-    } catch {
-      setTurns((current) => [
-        ...current,
-        { id: nextTurnId.current++, from: 'assistant', verdict: verdictFor(text) },
-      ]);
-      setFallback(true);
-    } finally {
-      setThinking(false);
-    }
-  };
-
-  /**
-   * The camera and microphone in the design's composer are actions, not
-   * decoration: the photo joins the conversation, and the mic dictates. Both are
-   * real — a file the farmer picked and the platform's own speech engine — rather
-   * than an icon that looks like a feature.
-   */
-  const attachPhoto = (file: File | undefined) => {
-    if (!file) return;
-    const url = URL.createObjectURL(file);
-    objectUrls.current.push(url);
-    setPhotos((current) => [...current, url]);
-  };
-
-  const dictate = () => {
-    const Recognition = recognitionCtor();
-    if (!Recognition) return;
-    const recognition = new Recognition();
-    recognition.lang = intlLocale(locale);
-    recognition.continuous = false;
-    recognition.interimResults = false;
-    recognition.onresult = (event) => {
-      const said = event.results[0]?.[0]?.transcript ?? '';
-      setQuestion((current) => (current ? `${current} ${said}` : said));
-    };
-    recognition.onend = () => setListening(false);
-    recognition.start();
-    setListening(true);
-  };
-
   if (step === 'capture') {
     return (
       <div className="flex flex-col px-4 pt-4 pb-6">
         <header className="flex items-center gap-2">
+          <button
+            type="button"
+            aria-label={t('common.back')}
+            onClick={onBack}
+            className="-ms-2 grid size-9 shrink-0 place-items-center rounded-full"
+          >
+            <ChevronLeft className="size-5 rtl:rotate-180" aria-hidden />
+          </button>
           <h1 className="text-title">{t('scan.title')}</h1>
         </header>
         <p className="mt-2 text-body-sm text-muted-foreground">{t('scan.intro')}</p>
@@ -290,19 +161,6 @@ export function ScanScreen({
           <ImageIcon className="size-4.5" aria-hidden />
           {t('scan.gallery')}
         </Button>
-
-        {/* The other way to ask. Same tab, same services, same allowance — a
-            farmer who would rather describe the problem than photograph it. */}
-        {onOpenAgent ? (
-          <Button
-            variant="outline"
-            className="mt-2 h-12 w-full rounded-md"
-            onClick={onOpenAgent}
-          >
-            <MessageCircle className="size-4.5" aria-hidden />
-            {t('scan.openAgent')}
-          </Button>
-        ) : null}
 
         <p className="mt-3 text-caption text-muted-foreground">
           {t('agent.credits.costs', {
@@ -454,14 +312,6 @@ export function ScanScreen({
           </span>
         </div>
 
-        {photos.map((url) => (
-          <div key={url} className="flex justify-end">
-            <span className="rounded-lg rounded-ee-sm bg-brand p-1.5">
-              <img src={url} alt={t('scan.photoAlt')} className="size-32 rounded-md object-cover" />
-            </span>
-          </div>
-        ))}
-
         <Bubble>
           {/* Confidence is stated before the advice, and the limit of the method
               with it: a match against stored cases is not a lab result, and the
@@ -489,12 +339,28 @@ export function ScanScreen({
           >
             {t('scan.adviceOther')}
           </p>
+          {/* Wired to the voice, not drawn beside it. The pill was a picture of a
+              speaker for as long as it existed: it had no handler, so a press did
+              nothing and the feature read as broken. */}
           <button
             type="button"
+            aria-label={listening ? t('weather.stopListening') : t('scan.listen')}
+            aria-pressed={listening}
+            onClick={() => {
+              if (listening) {
+                speech.stop();
+                return;
+              }
+              speech.speak({
+                id: 'scan-verdict',
+                text: `${t('scan.diagnosis', { percent: MATCH })}. ${t('scan.advice')}`,
+                lang: speechTag,
+              });
+            }}
             className="mt-2.5 inline-flex w-fit items-center gap-1.5 rounded-full bg-brand-soft px-2.5 py-1.5 text-label text-brand"
           >
             <Volume2 className="size-3.5" aria-hidden />
-            {t('scan.listen')}
+            {listening ? t('weather.stopListening') : t('scan.listen')}
           </button>
         </Bubble>
 
@@ -575,143 +441,7 @@ export function ScanScreen({
           </div>
         </Bubble>
 
-        {/* Follow-up questions, answered only inside the domain and only from
-            the approved sources — or handed to a person, which is a result too. */}
-        {turns.map((turn) =>
-          turn.from === 'farmer' ? (
-            <div key={turn.id} className="flex justify-end">
-              <p className="max-w-[78%] rounded-lg rounded-ee-sm bg-brand px-3.5 py-3 text-body-sm leading-relaxed text-brand-foreground">
-                {turn.text}
-              </p>
-            </div>
-          ) : turn.verdict.kind === 'answer' ? (
-            <Bubble key={turn.id}>
-              {turn.verdict.generation === 'retrieval' ? (
-                <p className="mb-1.5 text-caption font-medium text-brand">
-                  {t('scan.answer.retrieval')}
-                </p>
-              ) : null}
-              <p className="text-body-sm leading-relaxed">
-                {turn.verdict.text ?? t('scan.answer.local')}
-              </p>
-              {turn.verdict.generation === 'model' ? (
-                <p className="mt-2 text-caption leading-relaxed text-muted-foreground">
-                  {t('scan.answer.model')}
-                </p>
-              ) : null}
-              {turn.verdict.citations ? (
-                <AnswerSources
-                  citations={turn.verdict.citations}
-                  locale={locale}
-                  t={t}
-                />
-              ) : null}
-            </Bubble>
-          ) : turn.verdict.kind === 'refuse' ? (
-            <Bubble key={turn.id}>
-              <p className="text-body font-medium">{t('scan.offDomain.title')}</p>
-              <p className="mt-1 text-body-sm leading-relaxed">{t('scan.offDomain.body')}</p>
-            </Bubble>
-          ) : (
-            <Bubble key={turn.id} className="border border-amber-700/30 bg-amber-50 dark:bg-amber-500/15">
-              <p className="flex items-center gap-2 text-body font-medium text-amber-900 dark:text-amber-100">
-                <ShieldAlert className="size-4 shrink-0" aria-hidden />
-                {t('scan.notCovered.title')}
-              </p>
-              <p className="mt-1 text-body-sm leading-relaxed text-amber-900/85 dark:text-amber-100/85">
-                {t('scan.notCovered.body')}
-              </p>
-              {expertAsked ? (
-                <p className="mt-2 text-label font-medium text-amber-900 dark:text-amber-100">
-                  {t('scan.escalate.sent')}
-                </p>
-              ) : (
-                <button
-                  type="button"
-                  onClick={() => requestIdentity(() => setExpertAsked(true), 'session.why.expert')}
-                  className="mt-2.5 rounded-md bg-amber-900/10 px-3 py-2 text-label font-medium text-amber-900 dark:bg-amber-100/15 dark:text-amber-100"
-                >
-                  {t('scan.escalate.cta')}
-                </button>
-              )}
-            </Bubble>
-          ),
-        )}
-
-        {thinking ? (
-          <p role="status" className="px-1 text-caption text-muted-foreground">
-            {t('scan.assistant.thinking')}
-          </p>
-        ) : null}
-        {fallback ? (
-          <p role="status" className="px-1 text-caption text-muted-foreground">
-            {t('scan.assistant.fallback')}
-          </p>
-        ) : null}
       </div>
-
-      <form
-        className="flex items-center gap-2 border-t border-border p-3"
-        aria-busy={thinking}
-        onSubmit={(event) => {
-          event.preventDefault();
-          const text = question.trim();
-          if (!text || thinking) return;
-          void askAssistant(text);
-        }}
-      >
-        <label className="sr-only" htmlFor="scan-question">
-          {t('scan.ask')}
-        </label>
-        <button
-          type="button"
-          aria-label={t('scan.cameraAria')}
-          onClick={() => fileInput.current?.click()}
-          className="grid size-9 shrink-0 place-items-center rounded-full text-muted-foreground"
-        >
-          <Camera className="size-5" aria-hidden />
-        </button>
-        <input
-          ref={fileInput}
-          type="file"
-          accept="image/*"
-          className="sr-only"
-          onChange={(event) => {
-            attachPhoto(event.target.files?.[0]);
-            // Cleared so the same photo can be attached again after a retake.
-            event.target.value = '';
-          }}
-        />
-        <input
-          id="scan-question"
-          value={question}
-          onChange={(event) => setQuestion(event.target.value)}
-          placeholder={t('scan.ask')}
-          className="h-11 min-w-0 flex-1 bg-transparent text-body placeholder:text-muted-foreground focus-visible:outline-none"
-        />
-        {voice ? (
-          <button
-            type="button"
-            aria-label={t('scan.micAria')}
-            aria-pressed={listening}
-            onClick={dictate}
-            className={`grid size-9 shrink-0 place-items-center rounded-full ${
-              listening ? 'bg-brand-soft text-brand' : 'text-muted-foreground'
-            }`}
-          >
-            <Mic className="size-5" aria-hidden />
-          </button>
-        ) : null}
-        <Button
-          type="submit"
-          size="icon"
-          aria-label={t('scan.sendAria')}
-          disabled={thinking}
-          className="size-9 shrink-0 rounded-full"
-        >
-          <Send className="size-4 rtl:rotate-180" aria-hidden />
-        </Button>
-      </form>
     </div>
   );
 }
@@ -727,94 +457,6 @@ function stockistName(
 ): string {
   const key = dealerNameKey(dealerId);
   return key ? t(key) : reported;
-}
-
-function sourceTierKey(tier: AiCitation['evidenceTier']): MessageKey {
-  if (tier === 'verified') return 'scan.sources.verified';
-  if (tier === 'community') return 'scan.sources.community';
-  return 'scan.sources.supplementary';
-}
-
-function sourceDate(value: string | undefined, locale: Parameters<typeof intlLocale>[0]): string | null {
-  if (!value) return null;
-  const date = new Date(`${value}T00:00:00`);
-  if (Number.isNaN(date.getTime())) return null;
-  return new Intl.DateTimeFormat(intlLocale(locale), {
-    day: 'numeric',
-    month: 'short',
-    year: 'numeric',
-  }).format(date);
-}
-
-/**
- * The evidence under an answer. It is deliberately a list of published entries,
- * not a sentence naming a department: a model answer can only claim the sources
- * that the gateway actually retrieved.
- */
-function AnswerSources({
-  citations,
-  locale,
-  t,
-}: {
-  citations: AiCitation[];
-  locale: Parameters<typeof intlLocale>[0];
-  t: (key: MessageKey, values?: Record<string, string | number>) => string;
-}) {
-  const sources = citations.filter((citation) => citation.kind === 'knowledge');
-  if (sources.length === 0) return null;
-
-  return (
-    <section aria-label={t('scan.sources.title')} className="mt-3 border-t border-border/60 pt-2.5">
-      <p className="text-overline text-muted-foreground uppercase">{t('scan.sources.title')}</p>
-      <ul className="mt-1.5 space-y-2">
-        {sources.map((citation, index) => {
-          const tier = citation.evidenceTier ?? 'supplementary';
-          const date = citation.updatedOn ?? citation.publishedOn;
-          const dateLabel = date
-            ? t(citation.updatedOn ? 'scan.sources.updated' : 'scan.sources.published', {
-                date: sourceDate(date, locale) ?? date,
-              })
-            : citation.accessedOn
-              ? t('scan.sources.accessed', {
-                  date: sourceDate(citation.accessedOn, locale) ?? citation.accessedOn,
-                })
-              : t('scan.sources.noDate');
-
-          return (
-            <li key={`${citation.slug ?? citation.label}-${index}`} className="text-label leading-snug">
-              <span className="block font-medium">{citation.label}</span>
-              <span className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-caption text-muted-foreground">
-                <span
-                  className={`rounded-sm px-1.5 py-0.5 ${
-                    tier === 'verified'
-                      ? 'bg-brand-soft text-brand'
-                      : tier === 'community'
-                        ? 'bg-muted text-muted-foreground'
-                        : 'bg-amber-50 text-amber-800 dark:bg-amber-500/15 dark:text-amber-100'
-                  }`}
-                >
-                  {t(sourceTierKey(tier))}
-                </span>
-                <span>{citation.source ?? t('scan.sources.unknown')}</span>
-                {citation.version ? <span>v{citation.version}</span> : null}
-                <span>{dateLabel}</span>
-              </span>
-              {citation.sourceUrl?.startsWith('https://') ? (
-                <a
-                  href={citation.sourceUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="mt-0.5 inline-block text-caption font-medium text-brand underline underline-offset-2"
-                >
-                  {t('scan.sources.open')}
-                </a>
-              ) : null}
-            </li>
-          );
-        })}
-      </ul>
-    </section>
-  );
 }
 
 /** An incoming message row: assistant avatar, then the bubble. */

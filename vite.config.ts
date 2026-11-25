@@ -1,13 +1,121 @@
 import { defineConfig } from 'vitest/config';
+import { loadEnv, type Plugin } from 'vite';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import react from '@vitejs/plugin-react';
 import tailwindcss from '@tailwindcss/vite';
 import { VitePWA } from 'vite-plugin-pwa';
 import { fileURLToPath, URL } from 'node:url';
+import speak, { type HandlerRequest, type HandlerResponse } from './api/tts';
+import transcribe from './api/transcribe';
 
-export default defineConfig(({ mode }) => ({
+/**
+ * The Urdu voice, served by the dev server as well as by a deployment.
+ *
+ * `api/tts.ts` is a Vercel-style serverless function, and `vite dev` has no
+ * functions: every Listen press in a development build used to request
+ * `/api/tts`, get a `404` from the Vite server, fall back to the hosted Worker,
+ * and — on a day when that Worker's model quota was spent — end in silence. The
+ * pill then looked broken on the one machine where the voice was being worked on.
+ *
+ * So the same handler is mounted here, unchanged. It reads `GEMINI_API_KEY` from
+ * `process.env` exactly as it does in production, which is why the key stays
+ * server-side in both: nothing is inlined into the JavaScript the browser loads.
+ * `apply: 'serve'` keeps it out of every build, so a bundle can never contain it.
+ *
+ * This is a development aid, not an environment: it holds the developer's own key
+ * and talks to no database of its own.
+ */
+function voiceInDevelopment(): Plugin {
+  async function handle(
+    request: IncomingMessage,
+    response: ServerResponse,
+    /** One of the two API functions: the adapter below is identical for both. */
+    handler: (request: HandlerRequest, response: HandlerResponse) => Promise<void>,
+  ): Promise<void> {
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) chunks.push(Buffer.from(chunk as Buffer));
+
+    const raw = Buffer.concat(chunks).toString('utf8');
+    let body: unknown = {};
+    try {
+      body = raw.length > 0 ? JSON.parse(raw) : {};
+    } catch {
+      body = {};
+    }
+
+    /*
+     * The handler speaks Express's `res`, not Node's. This adapter is the whole
+     * of the difference between the two, which is why the function itself did not
+     * need a second implementation.
+     */
+    const adapter: HandlerResponse = {
+      status(code) {
+        response.statusCode = code;
+        return adapter;
+      },
+      setHeader(name, value) {
+        response.setHeader(name, value);
+      },
+      json(payload) {
+        response.setHeader('Content-Type', 'application/json; charset=utf-8');
+        response.end(JSON.stringify(payload));
+      },
+      send(payload) {
+        response.end(payload);
+      },
+      end(payload) {
+        response.end(payload);
+      },
+    };
+
+    try {
+      await handler({ method: request.method, body }, adapter);
+    } catch {
+      /* A missing key or a dead provider is already a status the app understands;
+         anything else is a bug in the handler and must not hang the request. */
+      response.statusCode = 500;
+      response.end(JSON.stringify({ error: 'voice-failed' }));
+    }
+  }
+
+  return {
+    name: 'farmer-voice-in-development',
+    apply: 'serve',
+    configureServer(server) {
+      /*
+       * Both halves of the voice, mounted the same way. The microphone is not a
+       * development-only idea — `api/transcribe.ts` ships with the deployment — but
+       * a dev server has no functions, so without this the mic would fail on the
+       * one machine where it is being worked on.
+       */
+      server.middlewares.use('/api/tts', (request, response) => {
+        void handle(request, response, speak);
+      });
+      server.middlewares.use('/api/transcribe', (request, response) => {
+        void handle(request, response, transcribe);
+      });
+    },
+  };
+}
+
+export default defineConfig(({ mode }) => {
+  /*
+   * The key the voice function reads is not a `VITE_` variable, so Vite does not
+   * put it in `import.meta.env` — and that is the point: it must never reach the
+   * browser bundle. `loadEnv` with an empty prefix reads the whole file for the
+   * *server* process, which is where `api/tts.ts` looks.
+   */
+  const env = loadEnv(mode, process.cwd(), '');
+  process.env.GEMINI_API_KEY ||= env.GEMINI_API_KEY ?? '';
+  process.env.GEMINI_TTS_MODEL ||= env.GEMINI_TTS_MODEL ?? '';
+  process.env.GEMINI_TTS_VOICE ||= env.GEMINI_TTS_VOICE ?? '';
+
+
+  return {
   plugins: [
     react(),
     tailwindcss(),
+    voiceInDevelopment(),
     /*
      * Installability for phones that will never see a store listing.
      *
@@ -24,6 +132,13 @@ export default defineConfig(({ mode }) => ({
       : [
           VitePWA({
             registerType: 'autoUpdate',
+            /*
+             * Registered by `src/services/serviceWorker.ts`, not by the generated
+             * snippet: the native shell must run no worker at all, and the only way
+             * to make that decision at runtime is to own the registration. The
+             * generated `registerSW.js` cannot tell a phone from a browser.
+             */
+            injectRegister: false,
             includeAssets: ['icons/apple-touch-icon.png', 'icons/mark.svg'],
             manifest: {
               name: 'Farmer — apni dukan',
@@ -171,4 +286,5 @@ export default defineConfig(({ mode }) => ({
       VITE_DEMO_FARMERS: '',
     },
   },
-}));
+  };
+});

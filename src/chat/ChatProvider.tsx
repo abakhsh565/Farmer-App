@@ -97,6 +97,43 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       setOpenThreadKey(dealerId);
     };
 
+    /*
+     * Files still on their way to the shop, drawn at the end of the thread as the
+     * farmer's own bubbles.
+     *
+     * They are not part of `shop.thread` on purpose: that is the shop's record of what
+     * it received, and a note that is still uploading is not part of it. Drawing them
+     * here is what lets the farmer see progress and a retry without the screen needing
+     * a second kind of message list.
+     */
+    const outboxMessages: ChatMessage[] = shop.mediaOutbox.map((item, index) => ({
+      id: 1_000_000 + index,
+      from: 'me' as const,
+      ...(item.kind === 'voice'
+        ? {
+            audio: {
+              url: null,
+              durationMs: item.durationMs,
+              mimeType: item.mimeType,
+              status: item.status,
+              progress: item.progress,
+              localId: item.localId,
+            },
+          }
+        : {
+            image: {
+              url: null,
+              mimeType: item.mimeType,
+              status: item.status,
+              progress: item.progress,
+              localId: item.localId,
+              /* The picture is drawn from these bytes until the shop has it, so the
+                 farmer sees the photo they picked rather than a placeholder. */
+              localBlob: item.blob,
+            },
+          }),
+    }));
+
     if (live) {
       return {
         status: shop.status === 'loading' ? 'loading' : 'ready',
@@ -104,7 +141,8 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         pending: shop.busy ? 1 : 0,
         online,
         threadKeys: liveDealerId ? [liveDealerId] : [],
-        messages: (dealerId) => (dealerId === liveDealerId ? (shop.thread?.messages ?? []) : []),
+        messages: (dealerId) =>
+          dealerId === liveDealerId ? [...(shop.thread?.messages ?? []), ...outboxMessages] : [],
         unread: (dealerId) => (dealerId === liveDealerId ? shop.unread : 0),
         unreadTotal: shop.unread,
         openThreadKey,

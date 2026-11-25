@@ -1,3 +1,4 @@
+import { toast } from 'sonner';
 import {
   createContext,
   useCallback,
@@ -7,6 +8,7 @@ import {
   useState,
   type ReactNode,
 } from 'react';
+import { useLocale } from '@/i18n/LocaleProvider';
 import {
   pickVoice,
   speakText,
@@ -76,7 +78,22 @@ export type SpeechValue = {
 
 const SpeechContext = createContext<SpeechValue | null>(null);
 
+/** The one language this app reads aloud in. */
+const VOICE_LANGUAGE = 'ur-PK';
+
+/**
+ * True when the text can be read by an Urdu voice without translating it first.
+ *
+ * A sentence of Roman Urdu ("aaj mausam theek hai") contains no Urdu script and so
+ * is treated as needing translation, which is the safe direction to be wrong in:
+ * the endpoint translates it and the farmer hears Urdu either way.
+ */
+export function isUrduText(text: string): boolean {
+  return /[\u0600-\u06FF]/.test(text);
+}
+
 export function SpeechProvider({ children }: { children: ReactNode }) {
+  const { t } = useLocale();
   const supported = speechSupported();
   const [voices, setVoices] = useState<readonly SpeechSynthesisVoice[]>(() =>
     supported ? window.speechSynthesis.getVoices() : [],
@@ -106,22 +123,33 @@ export function SpeechProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const warm = useCallback(
-    (lang: string, text: string) => {
+    (_lang: string, text: string) => {
       /* The device's own voice needs no warming — it answers the moment it is
          asked. Only the carried voice has a cost to pay before the first word. */
-      if (!text || pickVoice(voices, lang)) return;
+      if (!text || (isUrduText(text) && pickVoice(voices, VOICE_LANGUAGE))) return;
       warmAppVoice(text);
     },
     [voices],
   );
 
   const speak = useCallback<SpeechValue['speak']>(
-    ({ id, text, lang }) => {
+    ({ id, text }) => {
       const onEnd = () => setSpeaking((current) => (current === id ? null : current));
-      const voice = pickVoice(voices, lang);
+
+      /*
+       * Read-aloud is Urdu, in the whole app, whatever the interface language is.
+       *
+       * Two cases, and the text decides which: Urdu text goes to an Urdu voice on
+       * the device when there is one; anything else is handed to the app's own
+       * voice, which translates before it speaks (`api/tts.ts`). An English voice
+       * on an English sentence is deliberately not an option — the farmer asked to
+       * hear the advice, and hearing it in a language they did not ask for is the
+       * failure this app exists not to make.
+       */
+      const voice = isUrduText(text) ? pickVoice(voices, VOICE_LANGUAGE) : null;
 
       if (voice) {
-        const started = speakText(text, { lang, voice, onEnd });
+        const started = speakText(text, { lang: VOICE_LANGUAGE, voice, onEnd });
         setSpeaking(started ? id : null);
         return started;
       }
@@ -144,6 +172,16 @@ export function SpeechProvider({ children }: { children: ReactNode }) {
           if (!spokenByApp) {
             setPreparing((current) => (current === id ? null : current));
             setSpeaking((current) => (current === id ? null : current));
+            /*
+             * A press that cannot be answered has to say so.
+             *
+             * It used to end in a console warning and nothing else, and that is
+             * exactly how "the voice does not speak" becomes a mystery: the pill
+             * looked pressed, then looked unpressed, and the farmer had no way to
+             * tell a spent quota from a broken button. One sentence, in the
+             * farmer's language, naming the thing they can do about it.
+             */
+            toast.error(t('voice.failed'));
           }
         })
         .catch((failure: unknown) => {
@@ -152,10 +190,11 @@ export function SpeechProvider({ children }: { children: ReactNode }) {
           console.warn('[speech] the app voice could not be used:', failure);
           setPreparing((current) => (current === id ? null : current));
           setSpeaking((current) => (current === id ? null : current));
+          toast.error(t('voice.failed'));
         });
       return true;
     },
-    [supported, voices],
+    [supported, voices, t],
   );
 
   const value = useMemo<SpeechValue>(
