@@ -47,6 +47,9 @@ type Manifest = {
 const MANIFEST_FILE = 'latest.json';
 const BUNDLE_FILE = 'bundle.zip';
 
+/** How long an install that is already open waits before asking again. */
+const RECHECK_AFTER_MS = 15 * 60 * 1000;
+
 /**
  * The channel this build watches, or null when the build was made without one
  * (a plain `npm run build` for the browser, or a local debug build).
@@ -62,7 +65,14 @@ async function check(base: string): Promise<void> {
   const current = await LiveUpdate.getCurrentBundle();
   const next = await LiveUpdate.getNextBundle();
 
-  const response = await fetch(`${base}/${MANIFEST_FILE}`, { cache: 'no-store' });
+  /*
+   * The query string is not decoration: GitHub's release CDN caches assets by URL
+   * and was seen serving the previous publish's `latest.json` after a new one had
+   * been uploaded — the app read the bundleId it was already running, concluded it
+   * was up to date, and stayed on the old code with nothing in the log. A unique
+   * URL per check is a different cache key, so the manifest read is never stale.
+   */
+  const response = await fetch(`${base}/${MANIFEST_FILE}?v=${Date.now()}`, { cache: 'no-store' });
   if (!response.ok) return;
 
   const manifest = (await response.json()) as Manifest | null;
@@ -77,12 +87,45 @@ async function check(base: string): Promise<void> {
   }
 
   await LiveUpdate.downloadBundle({
-    url: `${base}/${BUNDLE_FILE}`,
+    /* Keyed by bundleId for the same reason: an asset URL that has already been
+       served once must not hand this bundle a zip from an earlier publish. The
+       checksum would reject it, which is safe but silent. */
+    url: `${base}/${BUNDLE_FILE}?v=${encodeURIComponent(manifest.bundleId)}`,
     bundleId: manifest.bundleId,
     checksum: manifest.checksum,
   });
   await LiveUpdate.setNextBundle({ bundleId: manifest.bundleId });
   await LiveUpdate.reload();
+}
+
+/**
+ * When the last check ran, and whether one is running now.
+ *
+ * Module scope because it must survive a screen changing: the app is one WebView,
+ * and re-mounting React is in no way a reason to ask the channel again.
+ */
+let lastCheckAt = 0;
+let checking = false;
+
+/**
+ * Ask the channel, at most once per interval and never twice at once.
+ *
+ * Checking only at cold start meant a phone that is opened from the background
+ * every morning — which is how a messaging app is actually used — could sit on a
+ * bundle from weeks ago and never see a fix. The interval is what keeps that from
+ * becoming a network call every time the farmer glances at the screen.
+ */
+async function checkWhenDue(base: string): Promise<void> {
+  if (checking) return;
+  if (lastCheckAt !== 0 && Date.now() - lastCheckAt < RECHECK_AFTER_MS) return;
+
+  checking = true;
+  try {
+    await check(base);
+  } finally {
+    checking = false;
+    lastCheckAt = Date.now();
+  }
 }
 
 /**
@@ -99,8 +142,23 @@ export function startLiveUpdates(): void {
   const base = channelBase();
   if (!base) return;
 
-  void check(base).catch(() => {
+  const quietly = () => {
     // Offline, a manifest that is not there yet, or a plugin that is not built
     // into this APK. The shipped bundle keeps running.
-  });
+  };
+
+  void checkWhenDue(base).catch(quietly);
+
+  // Returning to the app is the other moment it can update: Android keeps a
+  // WebView alive for days, so "next launch" may not happen for a week.
+  void (async () => {
+    try {
+      const { App } = await import('@capacitor/app');
+      await App.addListener('appStateChange', ({ isActive }) => {
+        if (isActive) void checkWhenDue(base).catch(quietly);
+      });
+    } catch {
+      // No App plugin (an older shell): the startup check still happened.
+    }
+  })();
 }

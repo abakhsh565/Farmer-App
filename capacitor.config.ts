@@ -31,6 +31,23 @@ const config: CapacitorConfig = {
     // exactly the prototype dependency this build is meant to remove.
     androidScheme: 'https',
   },
+
+  plugins: {
+    LiveUpdate: {
+      /*
+       * The safety net that makes live updates worth having. The plugin's own
+       * default is `0`, which disables the rollback timer entirely: a downloaded
+       * bundle that fails to boot would leave the phone on a blank screen with no
+       * way back, and the only cure is a reinstall — exactly the thing live updates
+       * exist to avoid. Ten seconds is far longer than this app takes to call
+       * `ready()` and far shorter than a farmer's patience.
+       */
+      readyTimeout: 10000,
+      // Bundles that are no longer running are removed once the new one is ready,
+      // so a phone that updates every week does not keep every copy.
+      autoDeleteBundles: true,
+    },
+  },
 };
 
 export default config;
