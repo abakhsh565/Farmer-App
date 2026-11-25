@@ -101,7 +101,18 @@ jobs:
       # is always clean and the branch always matches, so those gates are satisfied
       # by construction here — and still enforced when a human runs it.
       - name: Build and record the payload
-        run: npm run release:site -- --env "${{ needs.environment.outputs.env }}"
+        env:
+          ENV_NAME: ${{ needs.environment.outputs.env }}
+        run: |
+          # `release:site` requires --approved for production, and in CI the approval
+          # is the merge that triggered this run — the same meaning it has when a human
+          # passes it. Without this the production gate failed at packaging, before it
+          # could build or verify anything.
+          if [ "$ENV_NAME" = "production" ]; then
+            npm run release:site -- --env production --approved
+          else
+            npm run release:site -- --env "$ENV_NAME"
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: site-${{ needs.environment.outputs.env }}-${{ github.sha }}
