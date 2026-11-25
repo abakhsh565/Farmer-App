@@ -3,6 +3,7 @@ import {
   Check,
   Map,
   MessageCircle,
+  Plus,
   Search,
   ShieldCheck,
   TriangleAlert,
@@ -29,6 +30,7 @@ import type { MessageKey } from '@/i18n/catalog';
 import { formatHour, formatMoney, formatNumber, formatRelativeTime } from '@/i18n/format';
 import { initialsOf } from '@/lib/initials';
 import { useDealerSearch, useProductSearch } from '@/services/hooks';
+import { ShopConnectSheet } from '@/shop/ShopRequestSheet';
 import type { DealerSummary } from '@/services/types';
 
 /**
@@ -93,6 +95,13 @@ export function DealersScreen({
    * the section had reset to its default while they were away.
    */
   const [ownSection, setOwnSection] = useState<'products' | 'dealers'>('dealers');
+  /*
+   * Adding a dealer by code is still here, beside the heading, but it is no longer
+   * the way in: the list above is discovered by the farmer's area and radius, and
+   * a shop code is what someone uses when they already know which counter they
+   * want. Two ways to reach a shop, one of which requires nothing.
+   */
+  const [connectOpen, setConnectOpen] = useState(false);
   const shopSection = section ?? ownSection;
   const setShopSection = onSectionChange ?? setOwnSection;
 
@@ -179,13 +188,19 @@ export function DealersScreen({
         <h1 className="text-title">{t('dealers.title')}</h1>
         <div className="flex shrink-0 items-center gap-2">
           {/*
-            One control, not two. A farmer who can name their area needs a field
-            to type it in, not a basemap to pan — and where they are is a filter
-            on this list, so it is reached from this control rather than from a
-            second button beside it. The glyph is the map with a verified badge
-            because the sheet answers exactly two questions: which area, and how
-            far around it.
+            The manual way in, exactly where a farmer looks for "add": on the
+            heading's trailing edge. It opens the same sheet as before, so a shop
+            code the farmer was given still works — the difference is that it is no
+            longer the only door.
           */}
+          <button
+            type="button"
+            aria-label={t('shop.connect.title')}
+            onClick={() => setConnectOpen(true)}
+            className="grid size-10 place-items-center rounded-full bg-brand-soft text-brand"
+          >
+            <Plus className="size-5" aria-hidden />
+          </button>
           <SearchSettingsSheet
             radius={location.radiusKm}
             onChangeRadius={location.setRadiusKm}
@@ -527,7 +542,8 @@ export function DealersScreen({
         </>
       ) : null}
 
-      
+      {/* The manual door, opened from the + beside the heading. */}
+      {connectOpen ? <ShopConnectSheet onClose={() => setConnectOpen(false)} /> : null}
     </div>
   );
 }

@@ -12,6 +12,7 @@ import { useSession } from '@/session/SessionProvider';
 import { useShopApi } from '@/shop/ShopApiProvider';
 import { ShopConnectSheet, ShopRequestSheet } from '@/shop/ShopRequestSheet';
 import { PhotoBubble } from '@/chat/PhotoBubble';
+import { IMAGE_TARGET_BYTES, compressImage } from '@/chat/compressImage';
 import { VoiceBubble } from '@/chat/VoiceBubble';
 import { VoiceComposer, useRecorderFailureText } from '@/chat/VoiceComposer';
 import { useVoiceRecorder } from '@/chat/useVoiceRecorder';
@@ -131,8 +132,10 @@ export function ChatScreen({ onBrowseDealers }: Props) {
       }, 'session.why.message');
     };
 
-    /* A photo is checked on this phone before it is offered to the shop: a farmer on
-       2G should learn that a 9 MB photo is too large without paying to upload it. */
+    /* A photo is prepared on this phone before it is offered to the shop: a farmer
+       on 2G should learn that a 9 MB photo is too large without paying to upload it,
+       and a 6 MB photo is shrunk to 400 KB so the label still reads and the send
+       takes seconds. */
     const sendPhoto = (file: File) => {
       const mimeType = imageMimeTypeFor(file);
       if (!mimeType) {
@@ -145,7 +148,20 @@ export function ChatScreen({ onBrowseDealers }: Props) {
       }
       setPhotoError(null);
       requestIdentity(() => {
-        void shop.sendMedia({ kind: 'image', blob: file, mimeType });
+        void (async () => {
+          const compressed = await compressImage(file, { mimeType });
+          /* Compression is best effort. If the platform could not encode, the
+             original is all there is — and it is sent only if it was small enough. */
+          if (compressed.blob.size > IMAGE_TARGET_BYTES && compressed.compressed) {
+            setPhotoError(t('chat.photo.tooLarge'));
+            return;
+          }
+          void shop.sendMedia({
+            kind: 'image',
+            blob: compressed.blob,
+            mimeType: compressed.compressed ? compressed.mimeType : mimeType,
+          });
+        })();
       }, 'session.why.message');
     };
 
