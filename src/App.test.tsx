@@ -98,7 +98,7 @@ describe('App', () => {
       (button) => button.textContent?.trim() || button.getAttribute('aria-label'),
     );
 
-    expect(labels).toEqual(['Home', 'Shop', 'Scan a crop', 'Chat', 'Community']);
+    expect(labels).toEqual(['Home', 'Shop', 'Assistant', 'Chat', 'Community']);
     expect(screen.queryByRole('button', { name: 'Me' })).not.toBeInTheDocument();
   });
 
@@ -354,10 +354,14 @@ describe('chat', () => {
 });
 
 describe('scan', () => {
-  it('walks from a photo to the assistant conversation', async () => {
+  /*
+   * The camera flow, reached the way a farmer reaches it now: the Home card's
+   * *Crop check* row. It used to be the middle tab, and the tab is the assistant's.
+   */
+  it('walks from the Crop check row on Home through a photo to a diagnosis', async () => {
     render(<App />);
 
-    await userEvent.click(screen.getByRole('button', { name: 'Scan a crop' }));
+    await userEvent.click(screen.getByRole('button', { name: /Crop check/ }));
     await userEvent.click(screen.getByRole('button', { name: /Take a photo/ }));
     await userEvent.click(screen.getByRole('button', { name: 'Next' }));
     await userEvent.click(screen.getByRole('button', { name: 'Next' }));
@@ -376,22 +380,63 @@ describe('scan', () => {
      */
     expect(await screen.findByText(/Ali Traders · 1\.8 km · Rs\. 1,850/)).toBeInTheDocument();
     expect(screen.getByText(/Green Agro Store · 3\.4 km · Rs\. 1,880/)).toBeInTheDocument();
-    expect(screen.getByPlaceholderText('Ask a follow-up question')).toBeInTheDocument();
+
+    /*
+     * The conversation is not here any more. The scanner is a photo flow that
+     * ends in a verdict, and the proof is that the screen which used to end in a
+     * composer has no composer at all.
+     */
+    expect(screen.queryByPlaceholderText('Ask a follow-up question')).toBeNull();
+    /* A pushed screen, so the tab bar is out of the way while it is open. */
+    expect(screen.queryByRole('navigation', { name: 'Main' })).toBeNull();
+
+    // Back leaves the result for the start of the flow, and Back again leaves it.
+    await userEvent.click(screen.getByRole('button', { name: 'Back' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Back' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Shop' }));
 
     // The same product on the same shop's page, at the same price.
-    await userEvent.click(screen.getByRole('button', { name: 'Shop' }));
-    // The row body, not the chat button beside it — both name the shop.
     await userEvent.click(await screen.findByRole('button', { name: /^Ali Traders/ }, READY));
     expect(await screen.findByText('Roundup', {}, READY)).toBeInTheDocument();
     expect(screen.getByText(/Rs\. 1,850/)).toBeInTheDocument();
   });
+});
+
+describe('assistant', () => {
+  /** The tab, and the composer it opens on. */
+  const openAssistant = async () => {
+    await userEvent.click(screen.getByRole('button', { name: 'Assistant' }));
+    return screen.findByPlaceholderText('Ask about your crop…');
+  };
 
   /**
-   * Two refusals and one hand-off, on the screen the farmer actually sees. An
-   * assistant that answers off-topic questions "just this once" is not the
-   * assistant the rules describe.
+   * A conversation, not a tab. Opening the assistant hides the tab bar and the
+   * back button is the way out — and the allowance, which used to be a line of
+   * small print under the title, is now a control that explains the rule behind
+   * the number instead of leaving "97 of 100" to be guessed at.
    */
-  it('sends a follow-up through the server assistant with the selected crop', async () => {
+  it('takes the whole screen, explains the credits, and goes back to its tab', async () => {
+    render(<App />);
+    await openAssistant();
+
+    expect(screen.queryByRole('navigation')).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: 'AI credits today' }));
+    expect(
+      await screen.findByText('A question costs 1 · a photo costs 5', {}, READY),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Allowance returns after/)).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Back' }));
+    expect(await screen.findByRole('navigation', {}, READY)).toBeInTheDocument();
+  });
+
+  /**
+   * The answer is the server assistant's, and the crop is not guessed: the
+   * assistant asks without a crop code and the gateway adds the farmer's own
+   * crops, district and interests from the session.
+   */
+  it('sends a question to the server assistant and renders its answer', async () => {
     const ask = vi.fn(async () => ({
       gate: 'agriculture' as const,
       confidence: 88,
@@ -417,25 +462,21 @@ describe('scan', () => {
     services.ai = fakeAi;
     render(<App services={services} />);
 
-    await userEvent.click(screen.getByRole('button', { name: 'Scan a crop' }));
-    await userEvent.click(screen.getByRole('button', { name: /Take a photo/ }));
-    await userEvent.click(screen.getByRole('button', { name: 'Next' }));
-    await userEvent.click(screen.getByRole('button', { name: 'Next' }));
-
-    const box = await screen.findByPlaceholderText('Ask a follow-up question', {}, READY);
+    const box = await openAssistant();
     await userEvent.type(box, 'How do I treat bollworm?');
-    await userEvent.click(screen.getByRole('button', { name: 'Send question' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Send' }));
 
     expect(
-      await screen.findByText('Scout the field first, then treat only if you find the pest.') ,
+      await screen.findByText('Scout the field first, then treat only if you find the pest.'),
     ).toBeInTheDocument();
-    expect(ask).toHaveBeenCalledWith('How do I treat bollworm?', {
-      cropCode: 'cotton',
-      language: 'en',
-    });
+    expect(ask).toHaveBeenCalledWith('How do I treat bollworm?', { language: 'en' });
   });
 
-  it('shows source trust and labels a retrieval-only answer without claiming it came from the model', async () => {
+  /**
+   * The evidence under an answer, and the honesty label above it: a retrieval-only
+   * answer says so rather than passing itself off as the model's own words.
+   */
+  it('shows source trust and labels a retrieval-only answer', async () => {
     const answer: AiAnswer = {
       gate: 'agriculture',
       confidence: 86,
@@ -482,14 +523,9 @@ describe('scan', () => {
     services.ai = fakeAi;
     render(<App services={services} />);
 
-    await userEvent.click(screen.getByRole('button', { name: 'Scan a crop' }));
-    await userEvent.click(screen.getByRole('button', { name: /Take a photo/ }));
-    await userEvent.click(screen.getByRole('button', { name: 'Next' }));
-    await userEvent.click(screen.getByRole('button', { name: 'Next' }));
-
-    const box = await screen.findByPlaceholderText('Ask a follow-up question', {}, READY);
+    const box = await openAssistant();
     await userEvent.type(box, 'How many pink bollworm should trigger a spray?');
-    await userEvent.click(screen.getByRole('button', { name: 'Send question' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Send' }));
 
     expect(
       await screen.findByText('Published guidance only · the AI model is unavailable'),
@@ -505,7 +541,12 @@ describe('scan', () => {
     );
   });
 
-  it('shows a loading state and falls back locally when the assistant is offline', async () => {
+  /**
+   * The live call failing must not read as the assistant having nothing to say.
+   * The deterministic gate still answers, and the screen says which of the two
+   * spoke — that sentence is the difference between degraded and broken.
+   */
+  it('falls back to the offline gate when the assistant cannot be reached', async () => {
     let rejectAsk: ((error: Error) => void) | null = null;
     const ask = vi.fn(
       () =>
@@ -524,16 +565,12 @@ describe('scan', () => {
     services.ai = fakeAi;
     render(<App services={services} />);
 
-    await userEvent.click(screen.getByRole('button', { name: 'Scan a crop' }));
-    await userEvent.click(screen.getByRole('button', { name: /Take a photo/ }));
-    await userEvent.click(screen.getByRole('button', { name: 'Next' }));
-    await userEvent.click(screen.getByRole('button', { name: 'Next' }));
-
-    const box = await screen.findByPlaceholderText('Ask a follow-up question', {}, READY);
+    const box = await openAssistant();
     await userEvent.type(box, 'Who will win the cricket match tonight?');
-    await userEvent.click(screen.getByRole('button', { name: 'Send question' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Send' }));
 
-    expect(await screen.findByText('Checking the approved knowledge…')).toBeInTheDocument();
+    // The thinking state says what it is doing, in words beside the dots.
+    expect((await screen.findAllByText('Looking that up…')).length).toBeGreaterThan(0);
     await act(async () => {
       rejectAsk?.(new Error('offline'));
     });
@@ -544,36 +581,51 @@ describe('scan', () => {
     expect(screen.getByText('I can only help with farming')).toBeInTheDocument();
   });
 
-  it('renders the assistant in Urdu with RTL direction', async () => {
+  /**
+   * A question and its answer are kept. This is the store working rather than the
+   * screen: the app is unmounted and opened again, and the conversation is still
+   * there because it went to the phone's own document.
+   */
+  it('keeps the conversation after the app is reopened', async () => {
+    const open = render(<App />);
+
+    const box = await openAssistant();
+    await userEvent.type(box, 'What is the weather like today?');
+    await userEvent.click(screen.getByRole('button', { name: 'Send' }));
+    expect(
+      await screen.findByText(/Right now it is|The weather could not be read/),
+    ).toBeInTheDocument();
+
+    open.unmount();
+    render(<App />);
+    await userEvent.click(screen.getByRole('button', { name: 'Assistant' }));
+
+    expect(screen.getByText('What is the weather like today?')).toBeInTheDocument();
+  });
+
+  it('answers in Urdu, right to left, when the app is in Urdu', async () => {
     localStorage.setItem('agri-shop.locale', 'ur');
     render(<App />);
 
     expect(document.documentElement.dir).toBe('rtl');
-    await userEvent.click(screen.getByRole('button', { name: 'فصل اسکین کریں' }));
-    await userEvent.click(await screen.findByRole('button', { name: /تصویر لیں/ }));
-    await userEvent.click(screen.getByRole('button', { name: 'آگے' }));
-    await userEvent.click(screen.getByRole('button', { name: 'آگے' }));
+    await userEvent.click(screen.getByRole('button', { name: 'معاون' }));
 
-    expect(await screen.findByText('فصل کا معاون', {}, READY)).toBeInTheDocument();
-    expect(screen.getByPlaceholderText('مزید سوال پوچھیں')).toBeInTheDocument();
+    expect(await screen.findByText('اپنی فصل کے بارے میں پوچھیں')).toBeInTheDocument();
+    expect(screen.getByPlaceholderText('اپنی فصل کے بارے میں پوچھیں…')).toBeInTheDocument();
   });
 
+  /** Two refusals and one hand-off, on the screen the farmer actually sees. */
   it('refuses an off-topic question and hands an uncovered one to an expert', async () => {
     render(<App />);
 
-    await userEvent.click(screen.getByRole('button', { name: 'Scan a crop' }));
-    await userEvent.click(screen.getByRole('button', { name: /Take a photo/ }));
-    await userEvent.click(screen.getByRole('button', { name: 'Next' }));
-    await userEvent.click(screen.getByRole('button', { name: 'Next' }));
-
-    const box = await screen.findByPlaceholderText('Ask a follow-up question', {}, { timeout: 3000 });
+    const box = await openAssistant();
 
     await userEvent.type(box, 'Who will win the cricket match tonight?');
-    await userEvent.click(screen.getByRole('button', { name: 'Send question' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Send' }));
     expect(await screen.findByText('I can only help with farming')).toBeInTheDocument();
 
     await userEvent.type(box, 'Can I grow saffron on my roof?');
-    await userEvent.click(screen.getByRole('button', { name: 'Send question' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Send' }));
     expect(await screen.findByText('Not in the knowledge base')).toBeInTheDocument();
 
     // Asking a person is an accountable action, so it is gated like the others.

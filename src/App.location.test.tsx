@@ -40,9 +40,16 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+/** Opens the Shop tab and waits for the two sections to be on screen. */
 async function openDealers() {
   await userEvent.click(screen.getByRole('button', { name: 'Shop' }));
-  return screen.findByRole('region', { name: 'Current location' }, READY);
+  return screen.findByRole('tablist', { name: 'Shop sections' }, READY);
+}
+
+/** The sheet the header opens: where the area is stated, and changed. */
+async function openSettings() {
+  await userEvent.click(screen.getByRole('button', { name: 'Search settings' }));
+  return screen.findByRole('dialog', {}, READY);
 }
 
 /** Opens the location page from the filter and picks a place. */
@@ -58,18 +65,26 @@ async function chooseArea(name: string) {
 async function saveArea(name: string) {
   await chooseArea(name);
   await userEvent.click(screen.getByRole('button', { name: 'Save location' }));
-  expect(await screen.findByText('Saved on this phone only.', {}, READY)).toBeInTheDocument();
+
+  const sheet = await openSettings();
+  expect(within(sheet).getByText('Saved on this phone only.')).toBeInTheDocument();
+  await userEvent.click(screen.getByRole('button', { name: 'Close' }));
 }
 
 describe('a guest and their location', () => {
   it('says plainly that nothing is saved yet, and searches the default area anyway', async () => {
     render(<App />);
-    const bar = await openDealers();
+    await openDealers();
 
-    expect(within(bar).getByText('Not set')).toBeInTheDocument();
+    /* The card that used to sit above the list is gone, and what it said lives in
+       the sheet the header opens — the place being changed is where the place is
+       described. */
+    const sheet = await openSettings();
+    expect(within(sheet).getByText('Not set')).toBeInTheDocument();
     expect(
-      within(bar).getByText('Set your location to see dealers and weather near you.'),
+      within(sheet).getByText('Set your location to see dealers and weather near you.'),
     ).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Close' }));
 
     // A guest is not blocked from the passive experience: the search still answers.
     expect(screen.getByText(/dealers within 10 km/)).toBeInTheDocument();
@@ -86,7 +101,10 @@ describe('a guest and their location', () => {
 
     const kept = JSON.parse(localStorage.getItem('agri-shop.location') ?? '{}');
     expect(kept.label).toBe(PLACE.display_name);
-    expect(await screen.findByText(PLACE.display_name, {}, READY)).toBeInTheDocument();
+
+    const sheet = await openSettings();
+    expect(within(sheet).getByText(PLACE.display_name)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Close' }));
   });
 
   it('does not write the place merely because the farmer looked at it', async () => {

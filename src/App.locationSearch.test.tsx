@@ -88,13 +88,19 @@ const signIn = completeSignIn;
 /** The filter on the dealer list, and the location bar inside it. */
 async function openLocationBar() {
   await userEvent.click(screen.getByRole('button', { name: 'Shop' }));
-  await screen.findByRole('region', { name: 'Current location' }, READY);
+  await screen.findByRole('tablist', { name: 'Shop sections' }, READY);
   await userEvent.click(screen.getByRole('button', { name: 'Search settings' }));
 
   const sheet = await screen.findByRole('dialog', {}, READY);
   const bar = within(sheet).getByRole('button', { name: 'Change' });
   expect(within(sheet).getByText('Not set')).toBeInTheDocument();
   return bar;
+}
+
+/** The sheet on the dealer list: where the saved place is stated after a save. */
+async function openDealersSettings() {
+  await userEvent.click(screen.getByRole('button', { name: 'Search settings' }));
+  return screen.findByRole('dialog', {}, READY);
 }
 
 const placeField = () => screen.getByRole('searchbox', { name: /Search village or town/ });
@@ -174,12 +180,17 @@ describe('finding your area by name', () => {
     expect(screen.queryByText('Create your account')).not.toBeInTheDocument();
 
     await userEvent.click(screen.getByRole('button', { name: 'Save location' }));
-    expect(await screen.findByText('Saved on this phone only.', {}, READY)).toBeInTheDocument();
+
+    /* The place, and whose it is, are stated where it is changed: the card that
+       used to repeat them above the list is gone. */
+    const saved = await openDealersSettings();
+    expect(within(saved).getByText('Saved on this phone only.')).toBeInTheDocument();
+    expect(within(saved).getByText(PLACE.display_name)).toBeInTheDocument();
 
     // The place is kept on the phone, and the app is back on the list it came from.
     const kept = JSON.parse(localStorage.getItem('agri-shop.location') ?? '{}');
     expect(kept).toMatchObject({ label: PLACE.display_name, lat: 32.4601, lon: 74.0923 });
-    expect(await screen.findByText(PLACE.display_name, {}, READY)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Close' }));
 
     // And there was no account to write to, so nothing was written to one.
     expect(writeSavedLocation).not.toHaveBeenCalled();
@@ -198,7 +209,10 @@ describe('finding your area by name', () => {
      * saving at all.
      */
     await userEvent.click(screen.getByRole('button', { name: 'Save location' }));
-    expect(await screen.findByText('Saved on this phone only.', {}, READY)).toBeInTheDocument();
+
+    const saved = await openDealersSettings();
+    expect(within(saved).getByText('Saved on this phone only.')).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Close' }));
   });
 
   it('writes to the account instead when there is one, and leaves nothing on the phone', async () => {

@@ -4,6 +4,18 @@ Three environments, three databases, three branches, three site URLs, three
 update channels. A farmer installs one build and it stays on its own environment
 for the rest of its life.
 
+**This page is the explanation. The table is `release/environments.json`** — the
+one machine-readable list of which branch, site id, site URL, update channel and
+project belong to each environment. `scripts/release-site.mjs`,
+`scripts/verify-release.mjs` and the release workflow read that file; nothing
+restates it in code. If a value here ever disagrees with it, the file is right and
+this page is out of date.
+
+One distinction the file makes and this page used to blur: the **dev site is a
+mirror**, not a fourth test environment. It is a static copy of the dev branch for
+looking at layout, built against whatever `.env.local` held, so it is never
+evidence that data works. Staging is where a build is proven.
+
 | | Branch | Site | OTA channel | App | Database |
 |---|---|---|---|---|---|
 | **Development** | `development` | https://farmer-app-dev-97xtwn.freebuff.site | `ota-dev` | Farmer Dev (`pk.agrishop.farmer.dev`) | this machine (Docker) |
@@ -254,9 +266,14 @@ no-op instead of an attempt to create 92 tables that already exist.
 
 ## What is not automatic
 
-- **Site deploys.** The three site URLs are built and published by hand
-  (`VITE_APP_ENV=<env> npx vite build --outDir dist-<env>`, then the manifest in
-  `web/`). Automating it needs a hosting deploy token as a repository secret.
+- **The website upload.** Building and packaging are automated:
+  `npm run release:site -- --env <env>` produces `deploy-site/` and records exactly
+  what it contains in `release/<env>.json`. The upload is one `sites_deploy` call
+  with that manifest, because hosting credentials are deliberately not in this
+  repository. `npm run verify:release -- --env <env>` then proves the live site
+  serves the recorded bundle; `--strict` makes a missed upload fail a production
+  gate. There is no second build path and no `dist-<env>` / `web/` manifest any
+  more — those were two ways to do one thing.
 - **iOS.** The project exists and builds the same web assets, but it needs macOS,
   Xcode and an Apple Developer account. Until then the iOS path is the PWA.
 - **Production chat.** The production AgriShop project has not published the

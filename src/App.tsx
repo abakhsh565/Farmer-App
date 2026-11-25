@@ -26,7 +26,8 @@ import { InterestsScreen } from '@/screens/InterestsScreen';
 import { LocationSearchScreen } from '@/screens/LocationSearchScreen';
 import { SearchScreen } from '@/screens/SearchScreen';
 import { ProfileScreen } from '@/screens/ProfileScreen';
-import { AiScreen } from '@/screens/AiScreen';
+import { AssistantScreen } from '@/screens/AssistantScreen';
+import { ScanScreen } from '@/screens/ScanScreen';
 import { DealerDetailScreen } from '@/screens/DealerDetailScreen';
 import { ProductDetailScreen } from '@/screens/ProductDetailScreen';
 import { WeatherScreen } from '@/screens/WeatherScreen';
@@ -61,7 +62,17 @@ type View =
   | 'review'
   | 'locationSearch'
   | 'search'
-  | 'weather';
+  | 'weather'
+  /*
+   * The camera flow, pushed rather than tabbed.
+   *
+   * It was the middle tab until the assistant took that slot. Scanning is now
+   * reached from the one place a farmer already goes when a plant looks wrong —
+   * the Home card's *Crop check* row — and from a photo attached to a question.
+   * Pushed means the tab bar is out of the way while a photo is being taken, which
+   * is also why Profile and Weather are pushed.
+   */
+  | 'scan';
 
 /**
  * The two detail pages.
@@ -355,6 +366,19 @@ function Shell() {
             the tab bar is out of the way while the sky has the room. */}
         {view === 'weather' ? <WeatherScreen onBack={() => setView('tabs')} /> : null}
 
+        {/* The camera flow, pushed from the Home card's *Crop check* row. Its own
+            Back leaves the flow; *View dealers* leaves it too, and lands on the
+            tab the treatment points at rather than on Home. */}
+        {view === 'scan' ? (
+          <ScanScreen
+            onBack={() => setView('tabs')}
+            onOpenDealers={() => {
+              setView('tabs');
+              setTab('dealers');
+            }}
+          />
+        ) : null}
+
         {/* Whatever is on top of the detail trail: a shop in full, or one
             product with its catalogue entry above and the shops that list it
             below. Both read the services rather than a list held in a screen. */}
@@ -379,7 +403,7 @@ function Shell() {
 
         {view === 'tabs' && detail === null && tab === 'home' ? (
           <HomeScreen
-            onScan={() => setTab('scan')}
+            onScan={() => setView('scan')}
             onOpenProfile={() => setView('profile')}
             onOpenWeather={() => setView('weather')}
             onOpenLocationSearch={() => {
@@ -403,8 +427,8 @@ function Shell() {
             }}
           />
         ) : null}
-        {view === 'tabs' && detail === null && tab === 'scan' ? (
-          <AiScreen onOpenDealers={() => setTab('dealers')} />
+        {view === 'tabs' && detail === null && tab === 'assistant' ? (
+          <AssistantScreen onBack={() => setTab('home')} />
         ) : null}
         {view === 'tabs' && detail === null && tab === 'chat' ? (
           <ChatScreen onBrowseDealers={() => setTab('dealers')} />
@@ -423,7 +447,10 @@ function Shell() {
         }}
       />
 
-      {view === 'tabs' && detail === null ? (
+      {/* The assistant is the one tab that takes the whole screen: a conversation
+          with a tab bar under the composer reads as a form. Back returns to the
+          tab it was opened from, so nothing needs the bar to be escapable. */}
+      {view === 'tabs' && detail === null && tab !== 'assistant' ? (
         <AppTabBar
           value={tab}
           onChange={(next) => {

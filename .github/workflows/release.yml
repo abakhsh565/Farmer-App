@@ -1,0 +1,140 @@
+# The release gate: what runs when a promotion lands on `staging` or `main`.
+#
+# The OTA workflow replaces the web bundle inside installed apps. That is only one
+# of the three surfaces a promotion has to reach — the website and, where a
+# migration is involved, the database are the others. Until now nothing tied them
+# together, so a merge could reach a phone while the website still served the
+# previous build, and nothing said so.
+#
+# This workflow does the parts CI can do honestly:
+#
+#   1. gates        the same checks a developer runs, so a release cannot be built
+#                   from a commit that fails them
+#   2. package      build this environment's website payload and record exactly
+#                   what it contains (commit, entry bundle, SHA-256 of every file)
+#   3. verify       ask the live site, the update channel, auth and the dealer
+#                   contract whether they are serving that release
+#
+# It does not upload the website: the Sites deploy needs credentials that do not
+# belong in a repository, and a workflow cannot hold them. The payload is uploaded
+# as an artifact, and the deploy is one step with `sites_deploy` followed by the
+# same verification. A site that lags its branch is reported loudly here; on a
+# production promotion, require_site makes it a failure.
+name: Release gate
+
+on:
+  push:
+    branches: [staging, main]
+  workflow_dispatch:
+    inputs:
+      env:
+        description: Environment to build and verify
+        type: choice
+        options: [dev, staging, production]
+        default: staging
+      require_site:
+        description: Fail when the live website does not match the release
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  environment:
+    runs-on: ubuntu-latest
+    outputs:
+      env: ${{ steps.pick.outputs.env }}
+      require_site: ${{ steps.pick.outputs.require_site }}
+    steps:
+      - id: pick
+        run: |
+          case "${{ github.event_name }}" in
+            workflow_dispatch) ENV="${{ github.event.inputs.env }}"; REQUIRE="${{ github.event.inputs.require_site }}" ;;
+            *) case "${{ github.ref_name }}" in
+                 staging) ENV=staging ;;
+                 main) ENV=production ;;
+                 *) ENV=dev ;;
+               esac
+               REQUIRE=false ;;
+          esac
+          echo "env=$ENV" >> "$GITHUB_OUTPUT"
+          echo "require_site=$REQUIRE" >> "$GITHUB_OUTPUT"
+
+  gates:
+    needs: environment
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - name: Type check
+        run: npm run typecheck
+      - name: Migration chain
+        run: npm run lint:migrations
+      - name: Edge Function contracts
+        run: npm run lint:functions
+      - name: Tests
+        run: npm test
+
+  package:
+    needs: [environment, gates]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      # The release script owns the branch/clean-tree/approval rules. In CI the tree
+      # is always clean and the branch always matches, so those gates are satisfied
+      # by construction here — and still enforced when a human runs it.
+      - name: Build and record the payload
+        run: npm run release:site -- --env "${{ needs.environment.outputs.env }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: site-${{ needs.environment.outputs.env }}-${{ github.sha }}
+          path: |
+            deploy-site/
+            release/${{ needs.environment.outputs.env }}.json
+          retention-days: 14
+
+  verify:
+    needs: [environment, package]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - uses: actions/download-artifact@v4
+        with:
+          name: site-${{ needs.environment.outputs.env }}-${{ github.sha }}
+      - name: Prove the live surfaces match this release
+        run: |
+          if [ "${{ needs.environment.outputs.require_site }}" = "true" ]; then
+            npm run verify:release -- --env "${{ needs.environment.outputs.env }}" --commit "$(git rev-parse --short HEAD)" --strict
+          else
+            npm run verify:release -- --env "${{ needs.environment.outputs.env }}" --commit "$(git rev-parse --short HEAD)"
+          fi
+      - name: What is still manual
+        if: always()
+        run: |
+          echo "### Deployment status" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "The OTA channel for this environment is published by the OTA workflow." >> "$GITHUB_STEP_SUMMARY"
+          echo "The website payload is in the \`site-${{ needs.environment.outputs.env }}-${{ github.sha }}\` artifact." >> "$GITHUB_STEP_SUMMARY"
+          echo "It still has to be deployed with \`sites_deploy\` (Sites credentials are not in this repository)." >> "$GITHUB_STEP_SUMMARY"
+          echo "A WARN about the site means exactly that: the branch moved and the site has not." >> "$GITHUB_STEP_SUMMARY"
