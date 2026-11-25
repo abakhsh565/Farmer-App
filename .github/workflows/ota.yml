@@ -64,24 +64,24 @@ jobs:
           esac
 
       #
-      # Fail here, not at the upload. This workflow runs as `abakhsh565`, which has
-      # no write access to `abakhsh56` — the repository that owns the dev and
-      # production channels — so those two publishes are refused 403. Checking up
-      # front turns that into one sentence naming the missing secret instead of a
-      # red build and a raw API error.
-      - name: Check the channel can be written
+      # Publishing ota-dev or ota-production needs write access to
+      # `abakhsh56/Farmer-App`, which this account does not have: the upload is
+      # refused 403. `OTA_TOKEN` is read when it exists (a PAT with Contents: write
+      # on that repository) and the workflow token is used otherwise, which is all
+      # the staging channel needs because it lives in this repository.
+      #
+      # An earlier version pre-checked `repos/:owner/:repo .permissions.push` and
+      # refused to run — it returned nothing for the workflow token even on its own
+      # repository, so it blocked a publish that would have worked. The note is
+      # printed instead; the upload is the authority.
+      - name: Note which channel this push publishes
+        if: github.ref_name != 'staging'
         env:
-          GH_TOKEN: ${{ secrets.OTA_TOKEN || secrets.GITHUB_TOKEN }}
-          TARGET_REPO: ${{ github.ref_name == 'staging' && 'abakhsh565/Farmer-App' || 'abakhsh56/Farmer-App' }}
+          OTA_TOKEN: ${{ secrets.OTA_TOKEN }}
         run: |
-          if gh api "repos/$TARGET_REPO" --jq '.permissions.push // false' 2>/dev/null | grep -qx true; then
-            echo "$TARGET_REPO is writable with this token."
-            exit 0
+          if [ -z "$OTA_TOKEN" ]; then
+            echo "::warning::Publishing ${{ github.ref_name }} needs write access to abakhsh56/Farmer-App. Add OTA_TOKEN (Contents: write there) or this publish will be refused."
           fi
-          echo "::error::This token cannot write $TARGET_REPO, so the OTA channel for ${{ github.ref_name }} cannot be published."
-          echo "Add a repository secret OTA_TOKEN: a fine-grained PAT with Contents: write on $TARGET_REPO."
-          echo "Until then, only the staging channel can publish from this repository. See docs/RELEASE-SOP.md."
-          exit 1
 
       - name: Build, pack and publish
         env:
