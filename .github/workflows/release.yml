@@ -56,11 +56,14 @@ jobs:
           case "${{ github.event_name }}" in
             workflow_dispatch) ENV="${{ github.event.inputs.env }}"; REQUIRE="${{ github.event.inputs.require_site }}" ;;
             *) case "${{ github.ref_name }}" in
-                 staging) ENV=staging ;;
-                 main) ENV=production ;;
-                 *) ENV=dev ;;
-               esac
-               REQUIRE=false ;;
+                 staging) ENV=staging; REQUIRE=false ;;
+                 # A production promotion is a release: the site has to be serving
+                 # that commit before the run is allowed to be green. The upload is
+                 # the `deploy` job below; this makes a missing one a failure rather
+                 # than a footnote.
+                 main) ENV=production; REQUIRE=true ;;
+                 *) ENV=dev; REQUIRE=false ;;
+               esac ;;
           esac
           echo "env=$ENV" >> "$GITHUB_OUTPUT"
           echo "require_site=$REQUIRE" >> "$GITHUB_OUTPUT"
@@ -107,8 +110,45 @@ jobs:
             release/${{ needs.environment.outputs.env }}.json
           retention-days: 14
 
-  verify:
+  deploy:
+    # The upload the pipeline used to leave to a human. It needs one credential
+    # (CLOUDFLARE_API_TOKEN) that a repository cannot invent; until it is set the
+    # job says so out loud instead of silently skipping, and the strict verification
+    # below still fails a production promotion whose site is stale.
     needs: [environment, package]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - uses: actions/download-artifact@v4
+        with:
+          name: site-${{ needs.environment.outputs.env }}-${{ github.sha }}
+      - name: Upload this release to its website
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          SITE_DEPLOY_ENABLED: ${{ vars.SITE_DEPLOY_ENABLED }}
+          ENV_NAME: ${{ needs.environment.outputs.env }}
+        run: |
+          if [ "$SITE_DEPLOY_ENABLED" != "true" ]; then
+            echo "::warning::SITE_DEPLOY_ENABLED is not 'true', so the website upload was skipped for $ENV_NAME."
+            echo "::warning::Set the repository variable SITE_DEPLOY_ENABLED=true and the secret CLOUDFLARE_API_TOKEN to make this step automatic."
+            exit 0
+          fi
+          # Reaching this job means the promotion was merged, which is the approval
+          # for that environment — the same meaning `--approved` has when a human runs it.
+          if [ "$ENV_NAME" = "production" ]; then
+            npm run publish:site -- --env production --approved
+          else
+            npm run publish:site -- --env "$ENV_NAME"
+          fi
+
+  verify:
+    needs: [environment, package, deploy]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -135,6 +175,5 @@ jobs:
           echo "### Deployment status" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "The OTA channel for this environment is published by the OTA workflow." >> "$GITHUB_STEP_SUMMARY"
-          echo "The website payload is in the \`site-${{ needs.environment.outputs.env }}-${{ github.sha }}\` artifact." >> "$GITHUB_STEP_SUMMARY"
-          echo "It still has to be deployed with \`sites_deploy\` (Sites credentials are not in this repository)." >> "$GITHUB_STEP_SUMMARY"
+          echo "The website payload is uploaded by the \`deploy\` job when SITE_DEPLOY_ENABLED=true; otherwise it is in the \`site-${{ needs.environment.outputs.env }}-${{ github.sha }}\` artifact." >> "$GITHUB_STEP_SUMMARY"
           echo "A WARN about the site means exactly that: the branch moved and the site has not." >> "$GITHUB_STEP_SUMMARY"

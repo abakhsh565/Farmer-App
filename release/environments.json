@@ -24,6 +24,8 @@
       "site": {
         "id": "3a7f2b41-6c8d-4e59-9b3a-1d2f4c6e8a01",
         "url": "https://farmer-app-dev-97xtwn.freebuff.site",
+        "worker": "site-889ef993cf8047498592dcae0f6ef25f",
+        "accountId": "6e5a40dd9362fb315de7ecbaad2ca12b",
         "role": "mirror",
         "note": "A static copy of the dev branch for looking at. Its backend was whatever .env.local held when it was built, so it proves layout, never data."
       },
@@ -48,6 +50,8 @@
       "site": {
         "id": "5c2e9d73-1b4a-4f86-8d27-3e5a7c9b1f02",
         "url": "https://farmer-app-staging-i1iih6.freebuff.site",
+        "worker": "site-84b8e8f6ff184cdab4eaa895ef29ecbe",
+        "accountId": "6e5a40dd9362fb315de7ecbaad2ca12b",
         "role": "delivered"
       },
       "ota": {
@@ -66,6 +70,8 @@
       "site": {
         "id": "9e4b1c85-7d3f-4a29-bc56-2f8d3a5c7e03",
         "url": "https://farmer-app-production-8sc6a2.freebuff.site",
+        "worker": "site-a2524705d31d451da3b35dbb803e20cd",
+        "accountId": "6e5a40dd9362fb315de7ecbaad2ca12b",
         "role": "delivered"
       },
       "ota": {
