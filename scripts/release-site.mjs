@@ -28,6 +28,7 @@ import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join, relative, resolve } from 'node:path';
+import { buildEnvFor } from './lib/build-environment.mjs';
 
 const ROOT = resolve(process.cwd());
 const PAYLOAD = join(ROOT, 'deploy-site');
@@ -121,7 +122,9 @@ const commit = git('rev-parse', '--short', 'HEAD');
 
 if (!skipBuild) {
   console.log(`release-site: building ${env} from ${branch}@${commit}`);
-  const buildEnv = { ...process.env, VITE_APP_ENV: env };
+  /* Not `{ ...process.env }`: see `scripts/lib/build-environment.mjs` — a
+     developer's `.env.local` must not become the shop backend of a staging site. */
+  const buildEnv = buildEnvFor(env);
 
   const typecheck = spawnSync(process.execPath, [join(ROOT, 'node_modules', 'typescript', 'bin', 'tsc'), '--noEmit'], {
     cwd: ROOT,
