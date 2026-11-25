@@ -74,3 +74,10 @@ supabase/.branches/
 
 # Built site payload staged for a Freebuff Sites deploy.
 deploy-site/
+
+# Per-build release records. They name the commit and hashes of one build, so they
+# change on every release and would re-dirty the tree after each one; the copy that
+# matters travels with the deployment as `/release.json`, and CI keeps the rest as
+# an artifact. `release/environments.json` is the registry and stays tracked.
+release/*.json
+!release/environments.json

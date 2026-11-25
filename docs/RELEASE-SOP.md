@@ -67,8 +67,9 @@ Nothing is deployed by this. Development is the developer's own machine.
 git checkout staging
 git merge --no-ff development
 git push origin staging            # publishes ota-staging via .github/workflows/ota.yml
-npm run release:site -- --env staging     # builds + writes release/staging.json
-# deploy deploy-site/manifest.json with sites_deploy, then:
+# CI: gates → package → deploy (website) → verify, in .github/workflows/release.yml
+npm run release:site -- --env staging     # or locally: builds + writes release/staging.json
+npm run publish:site -- --env staging     # and uploads it to the staging site
 npm run verify:release -- --env staging
 ```
 
@@ -83,7 +84,7 @@ git merge --no-ff staging
 git push origin main               # publishes ota-production
 # apply any pending migration to swmbmtvwgksicfnfsehg FIRST, with approval
 npm run release:site -- --env production --approved
-# deploy deploy-site/manifest.json to site 9e4b1c85-…
+npm run publish:site -- --env production --approved   # or let the `deploy` job do it
 npm run verify:release -- --env production --strict
 ```
 
@@ -101,12 +102,17 @@ while the website still serves a previous bundle.
 3. **verify** — asks the live site, the update channel, auth and the dealer
    contract whether they serve that commit.
 
-**The website upload is the one step CI cannot do.** Sites deploys need
-credentials that must not live in a repository, and the workflow has no way to
-hold them. That step is therefore: download the artifact (or run `release:site`
-locally) and deploy `deploy-site/manifest.json`. `verify:release` is what proves
-it happened. On a production run with `require_site`, a site that lags the branch
-fails the gate.
+4. **deploy** — uploads the packaged payload to that environment's worker with
+   `npm run publish:site`. It refuses a payload that was not built from this
+   branch, or whose `/release.json` names another commit.
+
+**The upload needs one credential:** `CLOUDFLARE_API_TOKEN` (Workers Scripts:
+Edit on the account holding the sites), plus the repository variable
+`SITE_DEPLOY_ENABLED=true` to turn the job on. Until both exist the job warns and
+the step stays manual — run `npm run publish:site -- --env <env>` locally, or
+deploy `deploy-site/manifest.json` with `sites_deploy`. Either way `verify:release`
+proves it happened, and on `main` the run requires the site to match
+(`require_site`), so a promotion whose site lags the branch fails the gate.
 
 ## 4. Verification: what each check proves
 
@@ -149,7 +155,7 @@ git checkout staging
 git revert --no-edit <bad-commit>
 git push origin staging                  # republishes ota-staging
 npm run release:site -- --env staging
-# deploy the payload, then
+npm run publish:site -- --env staging
 npm run verify:release -- --env staging
 ```
 
@@ -172,11 +178,18 @@ a last resort and needs explicit approval; it discards everything written since.
 
 ## 7. Known blockers (honest list)
 
-1. **Website deployment is not automated end to end.** No Sites credentials in CI.
-   Mitigation: artifact + `verify:release`, and `--strict` on production.
-2. **Applied migrations cannot be read with the anon key.** The check needs a
-   service-role key in the release environment. Until then, migration state is
-   verified by running the migration against the environment deliberately.
+1. **Website deployment waits on one credential.** `deploy` in
+   `.github/workflows/release.yml` runs `npm run publish:site`, which needs the
+   repository secret **`CLOUDFLARE_API_TOKEN`** (Workers Scripts: Edit) and the
+   variable **`SITE_DEPLOY_ENABLED=true`**. Until both are set the job warns, the
+   upload is one local command (`npm run publish:site -- --env <env>`), and a
+   production promotion whose site lags still fails the run (`require_site`).
+2. **Applied migrations cannot be read with the anon key.** `verify:release`
+   warns instead of proving it. Two ways to close it: set the repository secret
+   **`SUPABASE_ACCESS_TOKEN`** so the release environment can read
+   `supabase_migrations` (the verifier already accepts the key), or apply and stamp
+   the migration deliberately and record the tip — which is what was done for
+   staging (`20261123000100`).
 3. **Two OTA repositories, and only one is writable from here.** Deliberate —
    installed APKs poll `abakhsh56` — but the canonical account (`abakhsh565`) has no
    write access to it, so pushes that should publish `ota-dev` and `ota-production`
