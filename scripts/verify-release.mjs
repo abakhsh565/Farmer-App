@@ -140,13 +140,40 @@ try {
     check('site serves an app entry bundle', false, 'no assets/index-*.js in the page');
   } else {
     const entry = await sha256Of(`${target.site.url}/${served}`);
-    if (record) {
-      check('site serves the recorded bundle', served === record.entry, `${served}${served === record.entry ? '' : ` (record: ${record.entry})`}`);
-      if (served === record.entry) {
-        check('its bytes match the build', entry.sha === record.entrySha256, entry.sha ? entry.sha.slice(0, 16) : 'unreadable');
-      }
+    /*
+     * The site is asked which commit it is, rather than compared to a hash built
+     * on this machine. Those hashes legitimately differ (untracked `.env.local` is
+     * compiled in locally), so the only cross-machine truth is the manifest the
+     * deployment carries.
+     */
+    const deployedResponse = await fetch(`${target.site.url}/release.json`, { cache: 'no-store' }).catch(() => null);
+    const deployed = deployedResponse?.ok ? await deployedResponse.json() : null;
+
+    if (!deployed) {
+      check(
+        'the site carries its release manifest',
+        false,
+        'no /release.json — deployed before this pipeline existed, or an incomplete upload',
+      );
     } else {
-      check('site serves an app entry bundle', true, served);
+      check(
+        'the deployment names the commit this release is',
+        deployed.commit === expected,
+        `${deployed.commit}${deployed.commit === expected ? '' : ` (expected ${expected})`}`,
+      );
+      check('the deployment is for this environment', deployed.env === env, String(deployed.env));
+      check(
+        'the served bundle is the one the deployment names',
+        served === deployed.entry,
+        `${served}${served === deployed.entry ? '' : ` (deployment: ${deployed.entry})`}`,
+      );
+      if (served === deployed.entry) {
+        check(
+          'its bytes match the deployment manifest',
+          entry.sha === deployed.entrySha256,
+          entry.sha ? entry.sha.slice(0, 16) : 'unreadable',
+        );
+      }
     }
 
     /* A worker precaching a different entry is how a deployed site keeps showing
