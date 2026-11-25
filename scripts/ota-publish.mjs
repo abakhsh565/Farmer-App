@@ -27,6 +27,7 @@ import { createHash } from 'node:crypto';
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { zipDirectory } from './lib/zip.mjs';
+import { buildEnvFor } from './lib/build-environment.mjs';
 
 const ROOT = resolve(process.cwd());
 const DIST = join(ROOT, 'dist');
@@ -116,7 +117,10 @@ console.log(`ota-publish: building the ${env} web bundle…`);
 // The tools are run through `node` and their own entry scripts rather than through
 // npm: this project has an `npm` package in node_modules, so a shell resolves
 // `npm` to that shim and dies with "Cannot find module …/node_modules/npm/bin".
-const buildEnv = { ...process.env, VITE_APP_ENV: env };
+/* CI has no `.env.local`, but this is also run by hand on a developer's machine,
+   where it does — and a bundle that points at localhost reaches every phone on
+   the channel. See `scripts/lib/build-environment.mjs`. */
+const buildEnv = buildEnvFor(env);
 const run = (script, args) => {
   const result = spawnSync(process.execPath, [join(ROOT, 'node_modules', ...script), ...args], {
     cwd: ROOT,
