@@ -45,12 +45,13 @@ const value = (name) => {
   return index >= 0 ? args[index + 1] : undefined;
 };
 const env = value('--env');
+const rollbackOf = value('--rollback');
 const approved = args.includes('--approved');
 const allowDirty = args.includes('--allow-dirty');
 const skipBuild = args.includes('--skip-build');
 
 if (!env || !ENVIRONMENTS[env]) {
-  console.error('usage: npm run release:site -- --env dev|staging|production [--approved] [--allow-dirty]');
+  console.error('usage: npm run release:site -- --env dev|staging|production [--approved] [--allow-dirty] [--rollback <sha>]');
   process.exit(2);
 }
 
@@ -71,10 +72,26 @@ function git(...gitArgs) {
 /* ---- gate 1: the branch this environment is built from -------------------- */
 
 const branch = git('rev-parse', '--abbrev-ref', 'HEAD');
-if (branch !== target.branch) {
+if (rollbackOf) {
+  /*
+   * Re-releasing an earlier commit is the rollback path (SOP §6), and it arrives
+   * detached: a branch cannot be "at" a commit it has moved past. Requiring the
+   * branch name here made the documented rollback impossible to run, which is how
+   * a procedure becomes folklore. The guard that survives is the one that matters:
+   * HEAD must be exactly the commit being re-released.
+   */
+  const wanted = git('rev-parse', rollbackOf);
+  if (git('rev-parse', 'HEAD') !== wanted) {
+    fail(
+      `--rollback ${rollbackOf} was asked for, but HEAD is ${git('rev-parse', '--short', 'HEAD')}.`,
+      `  Check out that commit first:\n    git checkout --detach ${rollbackOf}`,
+    );
+  }
+  console.log(`release-site: re-releasing ${git('rev-parse', '--short', rollbackOf)} into ${env}`);
+} else if (branch !== target.branch) {
   fail(
     `"${env}" is built from "${target.branch}", but this checkout is on "${branch}".`,
-    `  Promote the change first (development → staging → main); do not build an\n  environment from another environment's branch.`,
+    `  Promote the change first (development → staging → main); do not build an\n  environment from another environment's branch.\n  Re-releasing an earlier commit is \`--rollback <sha>\` on that commit.`,
   );
 }
 
@@ -204,7 +221,8 @@ if (!entry) {
 const builtAt = new Date().toISOString();
 const deployedManifest = {
   env,
-  branch,
+  branch: rollbackOf ? target.branch : branch,
+  ...(rollbackOf ? { rollback: true } : {}),
   commit,
   commitFull: git('rev-parse', 'HEAD'),
   builtAt,
