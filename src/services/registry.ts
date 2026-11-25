@@ -41,6 +41,7 @@ import {
   LocalRepository,
 } from './providers/develop';
 import { MarketplaceDealerProvider } from './providers/marketplace';
+import { ChainedDealerProvider } from './providers/fallback';
 import { OpenMeteoWeatherProvider } from './providers/openMeteo';
 import { SupabaseOtpProvider } from './providers/supabaseAuth';
 import { DemoOtpProvider } from './providers/demoAuth';
@@ -111,9 +112,19 @@ export function createServices(
   const market: MarketProvider = backendLive
     ? new SupabaseMarketProvider()
     : new DevelopmentMarketProvider();
+  /*
+   * With a backend there are two shop systems, and the list asks the app's own
+   * dealer projection first: it is the one the rest of the app reads, so the Shop
+   * tab, the scan screen and a shop's own page cannot disagree about where the
+   * farmer can buy something. The marketplace answers only when the dealer system
+   * has no shop in range — see `providers/fallback` for why an empty answer does
+   * not end the question.
+   */
   const dealer: DealerProvider =
     resolved.dealer === 'marketplace'
-      ? new MarketplaceDealerProvider()
+      ? backendLive
+        ? new ChainedDealerProvider([new SupabaseDealerProvider(), new MarketplaceDealerProvider()])
+        : new MarketplaceDealerProvider()
       : resolved.dealer === 'supabase'
         ? new SupabaseDealerProvider()
         : new DevelopmentDealerProvider();

@@ -28,7 +28,7 @@ beforeEach(() => {
 /** Reaches the search page the way a farmer does: through the dealer list. */
 async function openSearch() {
   await userEvent.click(screen.getByRole('button', { name: 'Shop' }));
-  await screen.findByRole('region', { name: 'Current location' }, READY);
+  await screen.findByRole('tablist', { name: 'Shop sections' }, READY);
   await userEvent.click(screen.getByRole('button', { name: 'Search dealers or products' }));
   await screen.findByRole('heading', { name: 'Search' }, READY);
 }

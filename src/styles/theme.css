@@ -192,7 +192,16 @@
    component from every registry follows at once.
    -------------------------------------------------------------------------- */
 :root {
-  --background: var(--color-cream-100);
+  /*
+   * The light canvas sits one step darker than it used to (cream-200, not
+   * cream-100) and the muted/edge steps are a step deeper too. On a phone in
+   * daylight the old cream-100 canvas, the white cards and the cream-150 chips
+   * measured within a couple of points of each other, so a card did not read as
+   * a card and a chip did not read as a control. This is deliberately a *light*
+   * separation — enough for the edge to exist, nothing like the dark theme's
+   * contrast — and every text step keeps its AA ratio on the darker canvas.
+   */
+  --background: var(--color-cream-200);
   --foreground: var(--color-ink-950);
 
   --card: #ffffff;
@@ -203,21 +212,32 @@
   --primary: var(--color-ink-950);
   --primary-foreground: var(--color-cream-50);
 
-  --secondary: var(--color-cream-200);
+  /*
+   * One step deeper than the canvas, not one half-step: the chips, the tab track
+   * and the muted reply bubbles all read their fill from here, and at cream-300 on
+   * a cream-200 canvas they measured 1.06:1 against it — a chip you cannot see is
+   * a chip nobody taps. Hover goes one step further again, so a press is visible
+   * on the chip and not only on the thing under it.
+   */
+  --secondary: var(--color-cream-400);
   --secondary-foreground: var(--color-ink-900);
 
-  --muted: var(--color-cream-150);
+  --muted: var(--color-cream-400);
   --muted-foreground: var(--color-ink-600);
 
   /* `accent` is the hover surface in shadcn's vocabulary, not the brand colour. */
-  --accent: var(--color-cream-200);
+  --accent: var(--color-cream-500);
   --accent-foreground: var(--color-ink-900);
 
   --destructive: var(--color-red-600);
   --destructive-foreground: #ffffff;
 
-  --border: var(--color-ink-200);
-  --input: var(--color-ink-200);
+  /* Warm edges rather than neutral grey: on a warm canvas a grey hairline reads
+     as a printing artefact, and cream-500 is the step that makes a field edge
+     visible without drawing a box around everything. Inputs get the deeper step
+     because a control has to look touchable before it is tapped. */
+  --border: var(--color-cream-500);
+  --input: var(--color-cream-600);
   --ring: var(--color-clay-500);
 
   /* Brand accent, for text that sits on the canvas rather than on a solid.
@@ -416,5 +436,113 @@
 @media (prefers-reduced-motion: reduce) {
   .weather-sky {
     animation: none;
+  }
+}
+
+/* -----------------------------------------------------------------------------
+   5 · MOTION
+
+   Four animations, and they are the whole vocabulary: a message arriving, a
+   panel arriving, three dots saying "working", and one pulse saying "the phone is
+   listening to you now". Everything else in the product moves by transition on
+   press alone.
+
+   The rule they exist to satisfy is restraint. A chat that bounces, springs and
+   shimmers is a chat a farmer reads slower, and the colour budget here is 5–8%:
+   motion carries the liveliness so the palette does not have to. Durations stay
+   at or under a quarter second, because anything longer makes a reply feel late
+   rather than smooth, and every one of them is switched off for a person who has
+   asked their phone for less motion.
+   -------------------------------------------------------------------------- */
+@theme {
+  /* One easing curve for the whole product — decelerating, never bouncy. */
+  --ease-soft: cubic-bezier(0.22, 0.61, 0.36, 1);
+
+  --animate-rise: rise 240ms var(--ease-soft) both;
+  --animate-fade: fade 180ms ease-out both;
+  --animate-typing: typing 1s var(--ease-soft) infinite;
+  --animate-mic-pulse: mic-pulse 1.6s ease-out infinite;
+}
+
+/* A message arriving: it rises into place instead of appearing, which is what
+   makes a reply feel like an answer rather than a repaint. */
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* Three dots, staggered by a delay per dot in the markup. The dot rises a
+   little and brightens, so "thinking" is legible at a glance and at 11px. */
+@keyframes typing {
+  0%,
+  60%,
+  100% {
+    opacity: 0.3;
+    transform: translateY(0);
+  }
+  30% {
+    opacity: 1;
+    transform: translateY(-2px);
+  }
+}
+
+/* The microphone while it is recording: a ring that leaves, not a colour that
+   blinks — a blink reads as an error, and this is the one state where the phone
+   is doing exactly what was asked. */
+@keyframes mic-pulse {
+  0% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--brand) 45%, transparent);
+  }
+  70% {
+    box-shadow: 0 0 0 8px transparent;
+  }
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+  }
+}
+
+@layer base {
+  /*
+   * Press feedback on every control in the app, not one screen at a time.
+   *
+   * It is a scale of 0.975 and 120ms — felt rather than seen — because the
+   * product's other surfaces (a card, a tab, a pill) are tilted towards reading,
+   * and a control that answers a finger is the smallest honest form of liveliness.
+   */
+  @media (prefers-reduced-motion: no-preference) {
+    button:not(:disabled) {
+      transition:
+        transform 120ms var(--ease-soft),
+        background-color 120ms ease,
+        color 120ms ease;
+    }
+
+    button:not(:disabled):active {
+      transform: scale(0.975);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .animate-rise,
+    .animate-fade,
+    .animate-typing,
+    .animate-mic-pulse {
+      animation: none;
+    }
   }
 }

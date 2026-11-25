@@ -1,10 +1,10 @@
 import {
   BookmarkPlus,
   Check,
+  Map,
   MessageCircle,
   Search,
   ShieldCheck,
-  SlidersHorizontal,
   TriangleAlert,
 } from 'lucide-react';
 import { useState } from 'react';
@@ -149,50 +149,6 @@ export function DealersScreen({
     query: '',
   });
 
-  /**
-   * The explicit save.
-   *
-   * Gated on identity, which is the PRD's rule rather than a convenience: reading
-   * is free, and keeping something is the accountable act. The point survives the
-   * gate because the pending action *is* the save — a farmer who picks a place,
-   * taps Save and is asked to sign in does not have to pick it again.
-   */
-  const saveLocation = () => {
-    const point = location.temporary;
-    if (!point) return;
-
-    /*
-     * No identity gate. Choosing where you are is not said *to* anyone — see
-     * LocationProvider — so it is written to the account when there is one and to
-     * the phone when there is not, and neither path needs the farmer to sign up
-     * first.
-     */
-    void (async () => {
-      try {
-        await location.save({
-          label: point.label,
-          lat: point.lat,
-          lon: point.lon,
-          source: point.source,
-          radiusKm: location.radiusKm,
-        });
-        /*
-         * The temporary area is released once it is the saved location: keeping
-         * it would leave the app reporting "temporary" about the very place it now
-         * owns, and the two labels would contradict each other.
-         */
-        location.clearTemporary();
-        toast.success(t('location.savedToast'));
-      } catch (failure) {
-        toast.error(
-          t('location.saveFailed', {
-            reason: failure instanceof Error ? failure.message : '',
-          }),
-        );
-      }
-    })();
-  };
-
   const rows =
     filter === 'open'
       ? search.data.filter((dealer) => dealer.openNow === true)
@@ -223,10 +179,12 @@ export function DealersScreen({
         <h1 className="text-title">{t('dealers.title')}</h1>
         <div className="flex shrink-0 items-center gap-2">
           {/*
-            One control, not two. The map button is gone: a farmer who can name
-            their area needs a field to type it in, not a basemap to pan — and
-            where they are is a filter on this list, so it is reached from the
-            filter rather than from a second button beside it.
+            One control, not two. A farmer who can name their area needs a field
+            to type it in, not a basemap to pan — and where they are is a filter
+            on this list, so it is reached from this control rather than from a
+            second button beside it. The glyph is the map with a verified badge
+            because the sheet answers exactly two questions: which area, and how
+            far around it.
           */}
           <SearchSettingsSheet
             radius={location.radiusKm}
@@ -237,56 +195,12 @@ export function DealersScreen({
       </header>
 
       {/*
-        The farmer's location, and the only control that may change what the
-        account says. A temporary area is labelled as temporary in the same
-        breath as the saved place it is *not* replacing, because the forbidden
-        behaviour is a search that quietly becomes the profile.
+        The location card that used to sit here is gone. It repeated, above every
+        list, a place the farmer had just chosen, and it pushed the two things the
+        screen is for — the shelf and the shops — below the fold on a phone. The
+        same facts live in the sheet this header opens, where the area is actually
+        changed; nothing was removed from what the app can do.
       */}
-      <section
-        aria-label={t('location.current')}
-        className="mt-3 flex items-start justify-between gap-3 rounded-lg border border-border bg-card p-3"
-      >
-        <div className="min-w-0">
-          <p className="text-label text-muted-foreground">{t('location.current')}</p>
-          <p className="truncate text-body font-medium">
-            {location.placeLabel || t('location.none')}
-          </p>
-          <p className="mt-0.5 text-caption text-muted-foreground">
-            {location.isTemporary
-              ? t('location.temporaryHint', {
-                  place: location.placeLabel,
-                  saved: location.saved?.label ?? t('location.none'),
-                })
-            : location.hasSaved
-              ? t(location.savedOnDevice ? 'location.savedHintDevice' : 'location.savedHint')
-              : t('location.defaultHint')}
-          </p>
-        </div>
-
-        <div className="flex shrink-0 flex-col items-end gap-1">
-          {location.isTemporary ? (
-            <Button
-              size="sm"
-              className="h-9 rounded-full"
-              disabled={location.saving}
-              onClick={saveLocation}
-            >
-              <BookmarkPlus className="size-4" aria-hidden />
-              {location.saving ? t('location.saving') : t('location.save')}
-            </Button>
-          ) : null}
-          {location.isTemporary && location.hasSaved ? (
-            <button
-              type="button"
-              onClick={location.clearTemporary}
-              className="rounded-full py-1 text-caption text-muted-foreground"
-            >
-              {t('location.useSaved')}
-            </button>
-          ) : null}
-        </div>
-      </section>
-
       {/*
         The shop's two halves, directly under the place they are measured from.
         The shelf is what a farmer came to price; the list is where they walk to.
@@ -632,6 +546,41 @@ function SearchSettingsSheet({
   const { t } = useLocale();
   const location = useLocation();
 
+  /**
+   * The explicit save, moved here with the card it used to live in.
+   *
+   * No identity gate: choosing where you are is not said *to* anyone — see
+   * LocationProvider — so it is written to the account when there is one and to
+   * the phone when there is not, and neither path needs the farmer to sign up
+   * first. The temporary area is released once it is the saved location, because
+   * keeping it would leave the app reporting "temporary" about the very place it
+   * now owns.
+   */
+  const saveLocation = () => {
+    const point = location.temporary;
+    if (!point) return;
+
+    void (async () => {
+      try {
+        await location.save({
+          label: point.label,
+          lat: point.lat,
+          lon: point.lon,
+          source: point.source,
+          radiusKm: location.radiusKm,
+        });
+        location.clearTemporary();
+        toast.success(t('location.savedToast'));
+      } catch (failure) {
+        toast.error(
+          t('location.saveFailed', {
+            reason: failure instanceof Error ? failure.message : '',
+          }),
+        );
+      }
+    })();
+  };
+
   /*
    * Two facts, in the order a farmer thinks about them: where the app is reading
    * from, then the circle drawn around it.
@@ -650,7 +599,17 @@ function SearchSettingsSheet({
           aria-label={t('dealer.search.settings')}
           className="grid size-10 place-items-center rounded-full bg-muted"
         >
-          <SlidersHorizontal className="size-5" aria-hidden />
+          {/* The farm-map glyph, with the verified badge from the same art: the
+              two facts this sheet owns are the area and the shops confirmed in
+              it. Composed from two icons rather than shipped as an image, so it
+              inherits the theme's colour in both themes. */}
+          <span className="relative grid size-5 place-items-center">
+            <Map className="size-5" aria-hidden />
+            <ShieldCheck
+              className="absolute -bottom-1 -end-1 size-3.5 rounded-full bg-muted"
+              aria-hidden
+            />
+          </span>
         </button>
       </SheetTrigger>
       <SheetContent side="bottom" className="mx-auto w-full max-w-[430px]">
@@ -673,6 +632,46 @@ function SearchSettingsSheet({
                 {t('location.changePlace')}
               </button>
             </div>
+
+            {/*
+              The sentence the shop header used to carry, kept where the place is
+              changed. It is the app being honest about whose the place is: a guest's
+              is on the phone, a signed-in farmer's is on the account, and a search
+              in a temporary area is not either of those until it is saved.
+            */}
+            <p className="mt-1.5 text-caption text-muted-foreground">
+              {location.isTemporary
+                ? t('location.temporaryHint', {
+                    place: location.placeLabel,
+                    saved: location.saved?.label ?? t('location.none'),
+                  })
+                : location.hasSaved
+                  ? t(location.savedOnDevice ? 'location.savedHintDevice' : 'location.savedHint')
+                  : t('location.defaultHint')}
+            </p>
+
+            {location.isTemporary ? (
+              <div className="mt-2 flex items-center gap-3">
+                <Button
+                  size="sm"
+                  className="h-9 rounded-full"
+                  disabled={location.saving}
+                  onClick={saveLocation}
+                >
+                  <BookmarkPlus className="size-4" aria-hidden />
+                  {location.saving ? t('location.saving') : t('location.save')}
+                </Button>
+                {location.hasSaved ? (
+                  <button
+                    type="button"
+                    onClick={location.clearTemporary}
+                    className="rounded-full py-1 text-caption text-muted-foreground"
+                  >
+                    {t('location.useSaved')}
+                  </button>
+                ) : null}
+              </div>
+            ) : null}
           </section>
 
           <section>

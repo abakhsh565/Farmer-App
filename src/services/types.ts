@@ -558,7 +558,17 @@ export type Collection =
      another one, because it is the one record that must survive every other
      store being cleared: a farmer who deletes their chat history must not be
      handed a fresh 100 credits by doing so. */
-  | 'ai';
+  | 'ai'
+  /*
+   * What a farmer asked the assistant, and what it answered.
+   *
+   * A collection of its own rather than a corner of `chat`: that document is the
+   * conversation with a shop, with a person on the other end, and mixing a
+   * private correspondence with questions about the weather would make both
+   * harder to reason about — and would send an assistant turn to a shop's thread
+   * the moment the two shared a store.
+   */
+  | 'assistant';
 
 export interface Repository {
   readonly name: string;

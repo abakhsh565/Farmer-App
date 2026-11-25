@@ -71,3 +71,6 @@ dist-production/
 
 # The local stack writes its own branch/port bookkeeping here.
 supabase/.branches/
+
+# Built site payload staged for a Freebuff Sites deploy.
+deploy-site/
