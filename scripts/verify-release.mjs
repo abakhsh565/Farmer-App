@@ -24,7 +24,7 @@
  * (a site that has not been deployed yet). `--strict` turns them into failures,
  * which is what a production release gate uses.
  */
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { join, resolve } from 'node:path';
@@ -285,12 +285,66 @@ if (!shop?.shopApi.url) {
   }
 }
 
-/* ---- 6. what this cannot see --------------------------------------------- */
+/* ---- 6. the migration the database is actually on ------------------------- */
 
-warn(
-  'database migrations were not proven',
-  'the applied set lives in `supabase_migrations`, which the anon key cannot read; run it with a service-role key before a production release',
-);
+/*
+ * The applied set lives in `supabase_migrations`, which the anon key cannot read,
+ * so this used to be a permanent warning — the one drift a release could not see.
+ * A Supabase personal access token can read it, so when one is available the check
+ * is real: the newest applied version must be the newest migration in the repo. The
+ * token is never in the repository; it is read from the environment (CI secret) or
+ * from the developer's own untracked file.
+ */
+function managementToken() {
+  if (process.env.SUPABASE_ACCESS_TOKEN) return process.env.SUPABASE_ACCESS_TOKEN.trim();
+  const file = join(ROOT, '.secrets', 'supabase-access-token.txt');
+  return existsSync(file) ? readFileSync(file, 'utf8').trim() : null;
+}
+
+const migrationsDir = join(ROOT, 'supabase', 'migrations');
+const newestLocalMigration = existsSync(migrationsDir)
+  ? readdirSync(migrationsDir)
+      .filter((file) => /^\d{8,}_/.test(file))
+      .sort()
+      .at(-1)
+      ?.split('_')[0]
+  : null;
+
+const projectRef = target.backend?.projectRef;
+const token = managementToken();
+
+if (!projectRef) {
+  warn('database migrations were not proven', `${env} resolves no cloud project`);
+} else if (!token) {
+  warn(
+    'database migrations were not proven',
+    'set SUPABASE_ACCESS_TOKEN (a Supabase personal access token) to read `supabase_migrations`',
+  );
+} else {
+  try {
+    const response = await fetch(`https://api.supabase.com/v1/projects/${projectRef}/database/query`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        query: 'select version from supabase_migrations.schema_migrations order by version desc limit 1',
+      }),
+      cache: 'no-store',
+    });
+    if (!response.ok) {
+      check('the applied migrations can be read', false, `${response.status} ${projectRef}`);
+    } else {
+      const rows = await response.json();
+      const applied = Array.isArray(rows) ? rows[0]?.version : undefined;
+      check(
+        'the database is on the newest migration in this commit',
+        Boolean(applied) && applied === newestLocalMigration,
+        `${applied ?? 'none'}${applied === newestLocalMigration ? '' : ` (repo: ${newestLocalMigration})`}`,
+      );
+    }
+  } catch (error) {
+    check('the applied migrations can be read', false, String(error).slice(0, 100));
+  }
+}
 
 /* ---- summary -------------------------------------------------------------- */
 

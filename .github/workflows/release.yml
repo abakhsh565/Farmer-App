@@ -163,6 +163,11 @@ jobs:
         with:
           name: site-${{ needs.environment.outputs.env }}-${{ github.sha }}
       - name: Prove the live surfaces match this release
+        env:
+          # Lets the verifier read `supabase_migrations`, so "the database is on this
+          # commit's newest migration" is a check and not a warning. Without it the
+          # same check degrades to a WARN rather than failing the release.
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
         run: |
           if [ "${{ needs.environment.outputs.require_site }}" = "true" ]; then
             npm run verify:release -- --env "${{ needs.environment.outputs.env }}" --commit "$(git rev-parse --short HEAD)" --strict

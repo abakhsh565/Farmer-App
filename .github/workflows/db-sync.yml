@@ -85,3 +85,25 @@ jobs:
           supabase link --project-ref "$SUPABASE_PROJECT_REF"
           supabase db push --dry-run
           supabase db push
+
+      # `db push` can exit 0 having applied less than the repo contains (a stamped
+      # but missing file, a version clash). Asking the database what it is on is the
+      # only honest confirmation, and it is the same comparison verify:release makes
+      # against a live release.
+      - name: Prove the database is on this commit's newest migration
+        if: env.SUPABASE_ACCESS_TOKEN != '' && steps.target.outputs.project_ref != ''
+        env:
+          PROJECT_REF: ${{ steps.target.outputs.project_ref }}
+        run: |
+          newest=$(ls supabase/migrations | grep -E '^[0-9]{8,}_' | sort | tail -1 | cut -d_ -f1)
+          applied=$(curl -sS -X POST "https://api.supabase.com/v1/projects/$PROJECT_REF/database/query" \
+            -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+            -H 'Content-Type: application/json' \
+            -d '{"query":"select version from supabase_migrations.schema_migrations order by version desc limit 1"}' \
+            | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{const r=JSON.parse(d);console.log(Array.isArray(r)?(r[0]?.version??'none'):'unreadable')})")
+          echo "newest in repo: $newest"
+          echo "applied in project: $applied"
+          if [ "$newest" != "$applied" ]; then
+            echo "::error::the ${{ steps.target.outputs.env_name }} database is not on the newest migration (applied $applied, repo $newest)"
+            exit 1
+          fi
