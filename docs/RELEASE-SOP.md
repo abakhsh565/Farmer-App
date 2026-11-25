@@ -177,8 +177,24 @@ a last resort and needs explicit approval; it discards everything written since.
 2. **Applied migrations cannot be read with the anon key.** The check needs a
    service-role key in the release environment. Until then, migration state is
    verified by running the migration against the environment deliberately.
-3. **Two OTA repositories.** Deliberate (installed APKs), but every new APK must be
-   built with `npm run apk:<env>` so its baked channel matches the repository that
-   publishes it. An APK built before that rule polls `abakhsh56` even for staging.
+3. **Two OTA repositories, and only one is writable from here.** Deliberate —
+   installed APKs poll `abakhsh56` — but the canonical account (`abakhsh565`) has no
+   write access to it, so pushes that should publish `ota-dev` and `ota-production`
+   are refused 403 (`Resource not accessible by integration`). The gate in
+   `.github/workflows/ota.yml` now reports this before building, naming the fix.
+   
+   To unblock, one of these:
+   - add a repository secret **`OTA_TOKEN`** in `abakhsh565/Farmer-App`: a fine-grained
+     PAT with *Contents: write* on `abakhsh56/Farmer-App`. The workflow already reads
+     it (`secrets.OTA_TOKEN || secrets.GITHUB_TOKEN`), so nothing else changes;
+   - or push `development` / `main` from the `abakhsh56` account itself, whose own
+     workflow publishes those channels;
+   - or move the channels to `abakhsh565`. Until the first two are done, this is why
+     dev and production OTA stay at their last published commits (`6a329c1` and
+     `f84ab96` at the time of writing) while their branches move on.
+   
+   Every new APK must also be built with `npm run apk:<env>` so its baked channel
+   matches the repository that publishes it: an APK built before that rule polls
+   `abakhsh56` even for staging.
 4. **Production's website is behind `main`.** Deploying it needs approval and is
    prepared with `release:site --env production --approved`.
