@@ -132,6 +132,13 @@ export default defineConfig(({ mode }) => {
       : [
           VitePWA({
             registerType: 'autoUpdate',
+            /*
+             * Registered by `src/services/serviceWorker.ts`, not by the generated
+             * snippet: the native shell must run no worker at all, and the only way
+             * to make that decision at runtime is to own the registration. The
+             * generated `registerSW.js` cannot tell a phone from a browser.
+             */
+            injectRegister: false,
             includeAssets: ['icons/apple-touch-icon.png', 'icons/mark.svg'],
             manifest: {
               name: 'Farmer — apni dukan',
