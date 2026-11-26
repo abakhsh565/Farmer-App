@@ -333,6 +333,8 @@ export type SendAttachmentInput = {
   sizeBytes: number;
   durationMs?: number;
   caption?: string | null;
+  /** The shop whose conversation this file belongs to; null means the credential's. */
+  shopId?: string | null;
   config?: ShopApiConfig;
 };
 
@@ -345,6 +347,7 @@ export async function sendAttachment({
   sizeBytes,
   durationMs,
   caption,
+  shopId = null,
   config = serviceConfig.shopApi,
 }: SendAttachmentInput): Promise<ShopApiResult<{ messageId: string | null }>> {
   const result = await callShopRpc<unknown>(
@@ -358,6 +361,10 @@ export async function sendAttachment({
       /* An image carries no duration at all — the shop's own check refuses one. */
       p_duration_ms: kind === 'voice' ? Math.max(1, Math.round(durationMs ?? 0)) : null,
       p_body: caption && caption.trim() ? caption.trim() : null,
+      /* Which counter this file was sent to. The shop checks that the object is in
+         *this* conversation, so a photo taken while reading one shop's thread can
+         never surface in another's. */
+      p_shop_id: shopId,
     },
     config,
   );

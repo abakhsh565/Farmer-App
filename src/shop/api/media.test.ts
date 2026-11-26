@@ -213,7 +213,24 @@ describe('recording the message row', () => {
       p_size_bytes: 2048,
       p_duration_ms: 7300,
       p_body: null,
+      p_shop_id: null,
     });
+  });
+
+  it('files a file under the shop whose thread it was sent in', async () => {
+    const calls = stubShop([{ status: 200, body: { id: 'message-3' } }]);
+
+    await sendAttachment({
+      token: 'tok',
+      kind: 'image',
+      storagePath: 'shop/farmer/uuid.jpg',
+      mimeType: 'image/jpeg',
+      sizeBytes: 5000,
+      shopId: 'shop-alipur',
+      config,
+    });
+
+    expect(calls[0]?.body).toMatchObject({ p_shop_id: 'shop-alipur' });
   });
 
   it('sends null duration and the caption for a photo', async () => {

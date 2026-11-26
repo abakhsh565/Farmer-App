@@ -8,7 +8,7 @@ import {
   ShieldCheck,
   TriangleAlert,
 } from 'lucide-react';
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { toast } from 'sonner';
 import { SectionLabel } from '@/components/SectionLabel';
 import { EmptyState, ErrorState, LoadingState } from '@/components/States';
@@ -31,6 +31,7 @@ import { formatHour, formatMoney, formatNumber, formatRelativeTime } from '@/i18
 import { initialsOf } from '@/lib/initials';
 import { useDealerSearch, useProductSearch } from '@/services/hooks';
 import { useShopApi } from '@/shop/ShopApiProvider';
+import { distanceKmBetween } from '@/shop/geo';
 import { ShopConnectSheet } from '@/shop/ShopRequestSheet';
 import type { DealerSummary } from '@/services/types';
 
@@ -121,6 +122,28 @@ export function DealersScreen({
   const shopApi = useShopApi();
   /* The shop being opened, so its row can say so while the platform answers. */
   const [shopBusy, setShopBusy] = useState<string | null>(null);
+
+  /*
+   * The dealer platform's shops, each with how far it is from the farmer.
+   *
+   * The coordinates come from the shop's own record, so this list works from the
+   * shop's position rather than from a product listing: a counter two kilometres
+   * away is at the top even when it has published nothing for sale.
+   */
+  const shopRows = useMemo(() => {
+    const origin = location.activePoint;
+    return shopApi.shops
+      .map((shop) => ({
+        ...shop,
+        km:
+          shop.latitude !== null && shop.longitude !== null
+            ? Number(
+                distanceKmBetween(origin, { lat: shop.latitude, lon: shop.longitude }).toFixed(1),
+              )
+            : null,
+      }))
+      .sort((a, b) => (a.km ?? Number.POSITIVE_INFINITY) - (b.km ?? Number.POSITIVE_INFINITY));
+  }, [shopApi.shops, location.activePoint]);
 
   const openShop = async (shopId: string) => {
     setShopBusy(shopId);
@@ -313,11 +336,11 @@ export function DealersScreen({
         answers, and showing them here is the difference between "no shop exists"
         and "no shop has priced anything yet".
       */}
-      {shopApi.shops.length > 0 ? (
+      {shopRows.length > 0 ? (
         <section className="mt-4" aria-label={t('dealers.network')}>
           <SectionLabel>{t('dealers.network')}</SectionLabel>
           <ul className="mt-2 space-y-2">
-            {shopApi.shops.map((shop) => (
+            {shopRows.map((shop) => (
               <li key={shop.shopId}>
                 {/*
                   The whole row opens the conversation with *that* shop, and the
@@ -337,9 +360,14 @@ export function DealersScreen({
                     <p className="mt-0.5 truncate text-caption text-muted-foreground">
                       {shopBusy === shop.shopId
                         ? t('chat.loading')
-                        : shop.isLinked
-                          ? t('dealers.network.connected')
-                          : (shop.locationLabel ?? shop.city ?? t('dealers.network.listed'))}
+                        : [
+                            shop.km !== null ? t('common.km', { km: shop.km }) : null,
+                            shop.isLinked
+                              ? t('dealers.network.connected')
+                              : (shop.locationLabel ?? shop.city ?? t('dealers.network.listed')),
+                          ]
+                            .filter(Boolean)
+                            .join(' · ')}
                     </p>
                   </div>
                   <span className="grid size-9 shrink-0 place-items-center rounded-full bg-muted">
