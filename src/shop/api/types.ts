@@ -55,6 +55,8 @@ export type ShopSummary = {
   locationLabel: string | null;
   phone: string | null;
   logoUrl: string | null;
+  latitude: number | null;
+  longitude: number | null;
   /** True when this farmer already has a credential for it. */
   isLinked: boolean;
 };
@@ -79,6 +81,8 @@ export function normaliseShops(value: unknown): ShopSummary[] {
       locationLabel: text(firstOf(item, ['location_label', 'locationLabel', 'address'])),
       phone: text(firstOf(item, ['phone', 'shop_phone', 'shopPhone'])),
       logoUrl: text(firstOf(item, ['logo_url', 'logoUrl'])),
+      latitude: numberOrNull(item.latitude),
+      longitude: numberOrNull(item.longitude),
       isLinked: item.is_linked === true,
     });
   }
@@ -102,6 +106,11 @@ function text(value: unknown): string | null {
   if (typeof value === 'string' && value.trim()) return value;
   if (typeof value === 'number' && Number.isFinite(value)) return String(value);
   return null;
+}
+
+function numberOrNull(value: unknown): number | null {
+  const n = typeof value === 'string' ? Number(value) : value;
+  return typeof n === 'number' && Number.isFinite(n) ? n : null;
 }
 
 function firstOf(source: Record<string, unknown>, keys: string[]): unknown {

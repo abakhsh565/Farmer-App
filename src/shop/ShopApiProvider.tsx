@@ -450,6 +450,40 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
     };
   }, [configured, credential?.token, status]);
 
+  /**
+   * A reply arrives while the farmer is looking at the conversation.
+   *
+   * The dealer platform offers no channel this build subscribes to, so the open
+   * app re-reads the thread on a timer — a few seconds, the way a chat app feels,
+   * rather than "close and reopen to see the answer". It costs nothing while the
+   * app is in the background: a hidden page does not tick.
+   */
+  useEffect(() => {
+    if (!configured || status !== 'ready' || !credential?.token) return;
+    const token = credential.token;
+    let stopped = false;
+
+    const tick = () => {
+      if (stopped) return;
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+      void load(token);
+    };
+
+    const timer = window.setInterval(tick, 5000);
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') tick();
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    window.addEventListener('focus', onVisible);
+
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('focus', onVisible);
+    };
+  }, [configured, credential?.token, load, status]);
+
   const patchOutbox = useCallback((localId: string, patch: Partial<MediaOutboxItem>) => {
     setMediaOutbox((current) =>
       current.map((item) => (item.localId === localId ? { ...item, ...patch } : item)),
@@ -508,6 +542,7 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
         mimeType: stored.mimeType,
         sizeBytes: stored.sizeBytes,
         durationMs: item.kind === 'voice' ? item.durationMs : undefined,
+        shopId: activeShop.current,
       });
 
       if (!sent.ok) {

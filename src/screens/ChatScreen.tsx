@@ -1,4 +1,4 @@
-import { Camera, CheckCheck, ChevronLeft, MessageCircle, Mic, Search, Send, ShieldCheck } from 'lucide-react';
+import { Camera, CheckCheck, ChevronLeft, ChevronRight, MessageCircle, Mic, Search, Send, ShieldCheck } from 'lucide-react';
 import { useMemo, useRef, useState } from 'react';
 import { EmptyState, LoadingState } from '@/components/States';
 import { Button } from '@/components/ui/button';
@@ -207,6 +207,8 @@ export function ChatScreen({ onBrowseDealers }: Props) {
             <span className="block truncate text-subheading">{nameFor(dealerId)}</span>
             <span className="block text-caption text-muted-foreground">{t('chat.repliesIn')}</span>
           </button>
+          {/* The chevron is the affordance: the name opens the shop's page. */}
+          <ChevronRight className="size-5 shrink-0 text-muted-foreground rtl:rotate-180" aria-hidden />
         </header>
 
         {shopInfo ? (
