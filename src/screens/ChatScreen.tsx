@@ -63,11 +63,25 @@ export function ChatScreen({ onBrowseDealers }: Props) {
   const [photoError, setPhotoError] = useState<string | null>(null);
   const photoInput = useRef<HTMLInputElement | null>(null);
 
-  /** The shop's name, which on the live source comes from the shop, not a catalogue. */
-  const nameFor = (dealerId: string) =>
-    shop.configured && dealerId === liveDealerId
-      ? shop.thread?.shopName || shop.credential?.shopName || lineText(dealerId, t)
-      : lineText(dealerId, t);
+  /**
+   * The shop's name, which on the live source comes from the shop, not a catalogue.
+   *
+   * The credential names only the shop it was minted for, so using it for every
+   * conversation labelled the second shop with the first one's name — or, when the
+   * thread had not answered yet, with the raw shop id. The platform's own list is
+   * asked first; the credential is the fallback for its own shop alone.
+   */
+  const nameFor = (dealerId: string) => {
+    if (!shop.configured) return lineText(dealerId, t);
+    const listed = shop.shops.find((row) => row.shopId === dealerId)?.name;
+    if (dealerId !== liveDealerId) return listed ?? lineText(dealerId, t);
+    return (
+      shop.thread?.shopName ||
+      listed ||
+      (dealerId === shop.credential?.shopId ? shop.credential?.shopName : null) ||
+      lineText(dealerId, t)
+    );
+  };
 
   /* The data the dealer's own list holds for the shop being read, which is what the
      header's page shows. A shop the list did not describe still opens, with only
