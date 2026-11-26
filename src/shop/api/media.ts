@@ -410,8 +410,13 @@ export function validateMedia(
 export async function fetchShopMedia(
   token: string,
   config: ShopApiConfig = serviceConfig.shopApi,
+  shopId: string | null = null,
 ): Promise<ShopApiResult<ShopMediaRow[]>> {
-  const result = await callShopRpc<unknown>('farmer_api_media', { p_token: token, p_shop_id: null }, config);
+  /* The shop id is not optional for a farmer linked to more than one shop: that
+     backend answers "this farmer deals with more than one shop — name the shop",
+     which used to read here as "media is not supported" and hid the microphone and
+     the camera for everyone with two counters. */
+  const result = await callShopRpc<unknown>('farmer_api_media', { p_token: token, p_shop_id: shopId }, config);
   if (!result.ok) return result;
   return { ok: true, data: readMediaRows(result.data) };
 }
@@ -497,9 +502,10 @@ export async function mediaLink(
 export async function mediaCapability(
   token: string,
   config: ShopApiConfig = serviceConfig.shopApi,
+  shopId: string | null = null,
 ): Promise<boolean> {
   const [metadata, door] = await Promise.all([
-    fetchShopMedia(token, config),
+    fetchShopMedia(token, config, shopId),
     (async () => {
       const endpoint = mediaFunctionUrl(config);
       if (!endpoint || !config.key) return false;
