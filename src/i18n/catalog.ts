@@ -275,6 +275,7 @@ export const en = {
   // ── dealers ──────────────────────────────────────────────────────────────
   'dealers.title': 'Shop',
   'dealers.network': 'On the dealer app',
+  'dealers.network.open': 'Open conversation',
   'dealers.network.connected': 'Connected shop',
   'dealers.network.listed': 'Listed by your dealer',
   'shop.tabsAria': 'Shop sections',
@@ -1802,6 +1803,7 @@ export const ur: Record<MessageKey, string> = {
 
   'dealers.title': 'دکان',
   'dealers.network': 'ڈیلر ایپ اُتے',
+  'dealers.network.open': 'گل بات کھولو',
   'dealers.network.connected': 'جُڑی ہوئی دکان',
   'dealers.network.listed': 'تہاڈے ڈیلر نے درج کیتی',
   'shop.tabsAria': 'دکان کے حصے',

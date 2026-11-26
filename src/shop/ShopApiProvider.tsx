@@ -27,6 +27,7 @@ import {
   farmerJoinShop,
   farmerMe,
   farmerNotifications,
+  farmerContactShop,
   farmerRequestVisit,
   farmerSendMessage,
   farmerShops,
@@ -122,6 +123,10 @@ type ShopApiValue = {
   thread: ShopThread | null;
   /** The shops the dealer platform lists for this farmer, connected or not. */
   shops: ShopSummary[];
+  /** The shop whose conversation `thread` holds; null means the credential's shop. */
+  activeShopId: string | null;
+  /** Opens (and reads) the conversation with one shop from the dealer's list. */
+  openShopConversation: (shopId: string) => Promise<boolean>;
   notifications: ShopNotification[];
   unread: number;
   busy: boolean;
@@ -198,6 +203,12 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
   const [me, setMe] = useState<ShopMe | null>(null);
   const [thread, setThread] = useState<ShopThread | null>(null);
   const [shops, setShops] = useState<ShopSummary[]>([]);
+  /**
+   * Which shop's conversation the thread holds. `null` means the shop the
+   * credential belongs to, which is every farmer connected to one counter.
+   */
+  const [activeShopId, setActiveShopId] = useState<string | null>(null);
+  const activeShop = useRef<string | null>(null);
   const [notifications, setNotifications] = useState<ShopNotification[]>([]);
   const [failure, setFailure] = useState<ShopFailure>(null);
   const [busy, setBusy] = useState(false);
@@ -211,6 +222,8 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
 
   const expire = useCallback(() => {
     clearShopCredential();
+    activeShop.current = null;
+    setActiveShopId(null);
     setCredential(null);
     setMe(null);
     setThread(null);
@@ -223,7 +236,7 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
     async (token: string): Promise<boolean> => {
       const [meResult, threadResult, notificationsResult, mediaResult, shopsResult] = await Promise.all([
         farmerMe(token),
-        farmerThread(token),
+        farmerThread(token, activeShop.current),
         farmerNotifications(token),
         fetchShopMedia(token),
         farmerShops(token),
@@ -358,6 +371,10 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
           joinedAt: Date.now(),
         };
         saveShopCredential(next);
+        /* A new credential is a new set of shops, so the reading goes back to the
+           shop the invitation names. */
+        activeShop.current = null;
+        setActiveShopId(null);
         setCredential(next);
         return await load(token);
       } finally {
@@ -637,6 +654,38 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
     [expire, load],
   );
 
+  /**
+   * Opens the conversation with one shop from the dealer's list.
+   *
+   * `farmer_api_contact_shop` is what creates the thread at the shop's side — the
+   * farmer picking a shop that is already on the platform is the introduction, so
+   * no code changes hands. The thread is then re-read for that shop, which is why
+   * the screen afterwards shows the shop's own messages rather than this phone's.
+   */
+  const openShopConversation = useCallback(
+    async (shopId: string): Promise<boolean> => {
+      const token = current.current?.token;
+      if (!token) return false;
+      activeShop.current = shopId;
+      setActiveShopId(shopId);
+      setBusy(true);
+      try {
+        const opened = await farmerContactShop(token, shopId);
+        if (!opened.ok) {
+          if (isTerminal(opened.error)) {
+            expire();
+            return false;
+          }
+          setFailure({ kind: opened.error, message: opened.message });
+        }
+        return await load(token);
+      } finally {
+        setBusy(false);
+      }
+    },
+    [expire, load],
+  );
+
   const value = useMemo<ShopApiValue>(() => {
     const unread = notifications.filter(
       (entry) => entry.kind === 'message' && !seen.includes(entry.id),
@@ -659,15 +708,19 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
         clearShopCredential();
         expire();
       },
-      send: (text) => run((token) => farmerSendMessage(token, text)),
+      activeShopId,
+      openShopConversation,
+      send: (text) => run((token) => farmerSendMessage(token, text, activeShop.current)),
       mediaSupported,
       mediaOutbox,
       sendMedia,
       retryMedia,
       discardMedia,
       resolveMediaUrl,
-      askCredit: (amount, note) => run((token) => farmerCreateCreditRequest(token, amount, note)),
-      askVisit: (purpose, window) => run((token) => farmerRequestVisit(token, purpose, window)),
+      askCredit: (amount, note) =>
+        run((token) => farmerCreateCreditRequest(token, amount, note, activeShop.current)),
+      askVisit: (purpose, window) =>
+        run((token) => farmerRequestVisit(token, purpose, window, activeShop.current)),
       answerOffer: (requestId, accept, note) =>
         run((token) => farmerAnswerOffer(token, requestId, accept, note)),
       refresh,
@@ -679,6 +732,8 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
       seenNotificationIds: seen,
     };
   }, [
+    activeShopId,
+    openShopConversation,
     credential,
     configured,
     failure,

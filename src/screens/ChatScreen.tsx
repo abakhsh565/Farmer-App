@@ -3,6 +3,7 @@ import { useMemo, useRef, useState } from 'react';
 import { EmptyState, LoadingState } from '@/components/States';
 import { Button } from '@/components/ui/button';
 import { useChat } from '@/chat/ChatProvider';
+import { ShopDetailSheet, type ShopDetail } from '@/shop/ShopDetailSheet';
 import { THREAD_META, type ChatMessage } from '@/data/chat';
 import { dealerNameKey } from '@/data/dealers';
 import { useLocale } from '@/i18n/LocaleProvider';
@@ -51,8 +52,10 @@ export function ChatScreen({ onBrowseDealers }: Props) {
    */
   const shop = useShopApi();
   const [sheet, setSheet] = useState<null | 'credit' | 'visit'>(null);
+  /* The shop page behind the name in the header. */
+  const [shopInfo, setShopInfo] = useState(false);
   const [connecting, setConnecting] = useState(false);
-  const liveDealerId = shop.credential?.shopId ?? null;
+  const liveDealerId = shop.activeShopId ?? shop.credential?.shopId ?? null;
   /* The microphone lives on this screen rather than in the provider: it is a
      transient control, and a recording must not survive navigating away. */
   const recorder = useVoiceRecorder();
@@ -65,6 +68,20 @@ export function ChatScreen({ onBrowseDealers }: Props) {
     shop.configured && dealerId === liveDealerId
       ? shop.thread?.shopName || shop.credential?.shopName || lineText(dealerId, t)
       : lineText(dealerId, t);
+
+  /* The data the dealer's own list holds for the shop being read, which is what the
+     header's page shows. A shop the list did not describe still opens, with only
+     what the conversation itself knows. */
+  const activeShopDetail: ShopDetail = shop.shops.find(
+    (row) => row.shopId === liveDealerId,
+  ) ?? {
+    name: nameFor(liveDealerId ?? ''),
+    city: null,
+    locationLabel: null,
+    phone: shop.thread?.shopPhone ?? null,
+    logoUrl: null,
+    isLinked: true,
+  };
 
   const list = useMemo(
     () =>
@@ -176,11 +193,25 @@ export function ChatScreen({ onBrowseDealers }: Props) {
           >
             <ChevronLeft className="size-5 rtl:rotate-180" aria-hidden />
           </button>
-          <span className="min-w-0">
+          {/*
+            The name is the way into the shop's page: a farmer who wants to know
+            where the counter is, or which number to ring, should not have to leave
+            the conversation to find out.
+          */}
+          <button
+            type="button"
+            onClick={() => setShopInfo(true)}
+            className="min-w-0 flex-1 text-start"
+            aria-label={t('dealers.network.open')}
+          >
             <span className="block truncate text-subheading">{nameFor(dealerId)}</span>
             <span className="block text-caption text-muted-foreground">{t('chat.repliesIn')}</span>
-          </span>
+          </button>
         </header>
+
+        {shopInfo ? (
+          <ShopDetailSheet shop={activeShopDetail} onClose={() => setShopInfo(false)} onChat={() => {}} />
+        ) : null}
 
         {chat.live ? (
           <div className="space-y-3 border-b border-border px-4 py-3">
