@@ -274,6 +274,9 @@ export const en = {
 
   // ── dealers ──────────────────────────────────────────────────────────────
   'dealers.title': 'Shop',
+  'dealers.network': 'On the dealer app',
+  'dealers.network.connected': 'Connected shop',
+  'dealers.network.listed': 'Listed by your dealer',
   'shop.tabsAria': 'Shop sections',
   'shop.tabProducts': 'Products',
   'shop.tabDealers': 'Dealers',
@@ -1798,6 +1801,9 @@ export const ur: Record<MessageKey, string> = {
   'crop.onion': 'پیاز',
 
   'dealers.title': 'دکان',
+  'dealers.network': 'ڈیلر ایپ اُتے',
+  'dealers.network.connected': 'جُڑی ہوئی دکان',
+  'dealers.network.listed': 'تہاڈے ڈیلر نے درج کیتی',
   'shop.tabsAria': 'دکان کے حصے',
   'shop.tabProducts': 'مصنوعات',
   'shop.tabDealers': 'دکاندار',

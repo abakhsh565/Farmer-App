@@ -418,6 +418,7 @@ function Shell() {
             section={shopSection}
             onSectionChange={setShopSection}
             onOpenChat={openThread}
+            onOpenShopChat={() => setTab('chat')}
             onOpenSearch={() => setView('search')}
             onOpenDealer={openDealer}
             onOpenProduct={openProduct}
