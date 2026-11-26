@@ -30,9 +30,28 @@ export type PushRegistration =
   | { status: 'denied' }
   | { status: 'unavailable' };
 
+/**
+ * Whether this build can actually receive push.
+ *
+ * The native plugin asks Firebase for a token on its own background thread, and
+ * when the app carries no `google-services.json` that call throws
+ * `IllegalStateException: Default FirebaseApp is not initialized` — on a thread no
+ * JavaScript can catch. The process dies, at launch, every launch: on 2026-11 the
+ * staging APK crash-looped the moment a farmer connected to a shop, because a shop
+ * credential is what starts registration.
+ *
+ * So the plugin is not called at all in a build without Firebase config. The APK
+ * build sets `VITE_PUSH_ENABLED=1` once the file is present; until then, a phone
+ * without push reads the app, which is the documented fallback rather than a
+ * crash.
+ */
+function pushConfigured(): boolean {
+  return import.meta.env.VITE_PUSH_ENABLED === '1';
+}
+
 /** True when the app is the installed build rather than the browser tab. */
 export function pushSupported(): boolean {
-  return Capacitor.isNativePlatform();
+  return Capacitor.isNativePlatform() && pushConfigured();
 }
 
 /**
@@ -52,6 +71,7 @@ export function pushSupported(): boolean {
 export const SHOP_CHANNEL_ID = 'agrishop';
 
 export async function ensureShopChannel(): Promise<void> {
+  if (!pushConfigured()) return;
   if (Capacitor.getPlatform() !== 'android') return;
   try {
     const { PushNotifications } = await import('@capacitor/push-notifications');
@@ -97,6 +117,7 @@ async function deviceToken(
  * forever. A phone that has not granted it is simply not registered yet.
  */
 export async function registerShopDevice(shopToken: string): Promise<boolean> {
+  if (!pushConfigured()) return false;
   if (!Capacitor.isNativePlatform()) return false;
   if (!shopToken) return false;
 
@@ -129,6 +150,7 @@ export async function registerShopDevice(shopToken: string): Promise<boolean> {
  * send a farmer to a screen that does not exist.
  */
 export async function onPushTap(handler: (route: string | null) => void): Promise<() => void> {
+  if (!pushConfigured()) return () => undefined;
   try {
     const { PushNotifications } = await import('@capacitor/push-notifications');
     await ensureShopChannel();
@@ -150,6 +172,7 @@ export async function onPushTap(handler: (route: string | null) => void): Promis
 }
 
 export async function requestShopOwnerPush(): Promise<PushRegistration> {
+  if (!pushConfigured()) return { status: 'unavailable' };
   if (!Capacitor.isNativePlatform()) return { status: 'unsupported' };
   if (!serviceConfig.supabase.configured) return { status: 'unavailable' };
 
