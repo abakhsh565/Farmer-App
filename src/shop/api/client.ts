@@ -187,34 +187,64 @@ export function farmerShops(token: string) {
  * conversation, and the shop backend resolves it. Sending an id the app guessed
  * would let a stale id open a thread that is not his.
  */
-export function farmerThread(token: string) {
-  return callShopRpc<unknown>('farmer_api_thread', { p_token: token, p_shop_id: null });
+/**
+ * Names one shop's conversation, or every shop's when null.
+ *
+ * The dealer platform now lists more than one shop to the same farmer, and each
+ * shop has its own thread: a message about a price at one counter must not appear
+ * at another. `null` still means "the shop this credential belongs to", which is
+ * what a farmer connected to exactly one shop has.
+ */
+export function farmerThread(token: string, shopId: string | null = null) {
+  return callShopRpc<unknown>('farmer_api_thread', { p_token: token, p_shop_id: shopId });
 }
 
-export function farmerSendMessage(token: string, body: string) {
+export function farmerSendMessage(token: string, body: string, shopId: string | null = null) {
   return callShopRpc<unknown>('farmer_api_send_message', {
     p_token: token,
     p_body: body,
-    p_shop_id: null,
+    p_shop_id: shopId,
   });
 }
 
-export function farmerCreateCreditRequest(token: string, amount: number, note: string | null) {
+/**
+ * Opens a conversation with a shop the farmer found, with no code involved.
+ *
+ * This is the call that turns a shop in the dealer's list into a thread this
+ * farmer can write in: the shop is already on the platform, so the farmer choosing
+ * it *is* the introduction. Idempotent — opening the same shop twice keeps one
+ * conversation.
+ */
+export function farmerContactShop(token: string, shopId: string) {
+  return callShopRpc<unknown>('farmer_api_contact_shop', { p_token: token, p_shop_id: shopId });
+}
+
+export function farmerCreateCreditRequest(
+  token: string,
+  amount: number,
+  note: string | null,
+  shopId: string | null = null,
+) {
   return callShopRpc<unknown>('farmer_api_create_credit_request', {
     p_token: token,
     p_amount: amount,
     p_note: note,
-    p_shop_id: null,
+    p_shop_id: shopId,
     p_branch_id: null,
   });
 }
 
-export function farmerRequestVisit(token: string, purpose: string | null, window: string | null) {
+export function farmerRequestVisit(
+  token: string,
+  purpose: string | null,
+  window: string | null,
+  shopId: string | null = null,
+) {
   return callShopRpc<unknown>('farmer_api_request_visit', {
     p_token: token,
     p_purpose: purpose,
     p_window: window,
-    p_shop_id: null,
+    p_shop_id: shopId,
     p_branch_id: null,
   });
 }

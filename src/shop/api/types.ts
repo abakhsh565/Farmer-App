@@ -53,6 +53,8 @@ export type ShopSummary = {
   name: string;
   city: string | null;
   locationLabel: string | null;
+  phone: string | null;
+  logoUrl: string | null;
   /** True when this farmer already has a credential for it. */
   isLinked: boolean;
 };
@@ -75,6 +77,8 @@ export function normaliseShops(value: unknown): ShopSummary[] {
       name,
       city: text(item.city),
       locationLabel: text(firstOf(item, ['location_label', 'locationLabel', 'address'])),
+      phone: text(firstOf(item, ['phone', 'shop_phone', 'shopPhone'])),
+      logoUrl: text(firstOf(item, ['logo_url', 'logoUrl'])),
       isLinked: item.is_linked === true,
     });
   }

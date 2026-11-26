@@ -74,8 +74,8 @@ export function DealersScreen({
   onSectionChange,
 }: {
   onOpenChat: (dealerKey: string) => void;
-  /** Opens the conversation with the shop on the dealer's own platform. */
-  onOpenShopChat: () => void;
+  /** Opens the conversation with one shop on the dealer's own platform. */
+  onOpenShopChat: (shopId: string) => void;
   /** Opens the search page — shops and stock, one keyword. */
   onOpenSearch: () => void;
   /** Opens the page where the farmer finds their area by name. */
@@ -119,6 +119,18 @@ export function DealersScreen({
   const location = useLocation();
   /* The dealer's own platform, which is where a shop actually exists. */
   const shopApi = useShopApi();
+  /* The shop being opened, so its row can say so while the platform answers. */
+  const [shopBusy, setShopBusy] = useState<string | null>(null);
+
+  const openShop = async (shopId: string) => {
+    setShopBusy(shopId);
+    try {
+      await shopApi.openShopConversation(shopId);
+      onOpenShopChat(shopId);
+    } finally {
+      setShopBusy(null);
+    }
+  };
 
   const searchedArea = PROFILE_AREA;
   /*
@@ -306,22 +318,33 @@ export function DealersScreen({
           <SectionLabel>{t('dealers.network')}</SectionLabel>
           <ul className="mt-2 space-y-2">
             {shopApi.shops.map((shop) => (
-              <li key={shop.shopId} className="flex items-center gap-3 rounded-xl bg-card p-3.5">
-                <div className="min-w-0 flex-1">
-                  <p className="truncate text-body font-medium">{shop.name}</p>
-                  <p className="mt-0.5 truncate text-caption text-muted-foreground">
-                    {shop.isLinked
-                      ? t('dealers.network.connected')
-                      : (shop.locationLabel ?? shop.city ?? t('dealers.network.listed'))}
-                  </p>
-                </div>
+              <li key={shop.shopId}>
+                {/*
+                  The whole row opens the conversation with *that* shop, and the
+                  opening is a call to the dealer's platform rather than a jump into
+                  this phone's own chat store — otherwise a shop the farmer just
+                  found would receive nothing they typed.
+                */}
                 <button
                   type="button"
-                  onClick={onOpenShopChat}
-                  aria-label={t('dealers.chatAria', { name: shop.name })}
-                  className="grid size-9 shrink-0 place-items-center rounded-full bg-muted"
+                  disabled={shopBusy !== null}
+                  onClick={() => void openShop(shop.shopId)}
+                  aria-label={t('dealers.network.open')}
+                  className="flex w-full items-center gap-3 rounded-xl bg-card p-3.5 text-start disabled:opacity-60"
                 >
-                  <MessageCircle className="size-4" aria-hidden />
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-body font-medium">{shop.name}</p>
+                    <p className="mt-0.5 truncate text-caption text-muted-foreground">
+                      {shopBusy === shop.shopId
+                        ? t('chat.loading')
+                        : shop.isLinked
+                          ? t('dealers.network.connected')
+                          : (shop.locationLabel ?? shop.city ?? t('dealers.network.listed'))}
+                    </p>
+                  </div>
+                  <span className="grid size-9 shrink-0 place-items-center rounded-full bg-muted">
+                    <MessageCircle className="size-4" aria-hidden />
+                  </span>
                 </button>
               </li>
             ))}

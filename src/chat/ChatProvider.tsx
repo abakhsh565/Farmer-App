@@ -83,7 +83,9 @@ export function ChatProvider({ children }: { children: ReactNode }) {
    * conversation with no name.
    */
   const live = shop.configured;
-  const liveDealerId = live ? (shop.credential?.shopId ?? null) : null;
+  /* The shop the thread belongs to: whichever shop the farmer opened from the
+     dealer's list, or the one the invitation named. */
+  const liveDealerId = live ? (shop.activeShopId ?? shop.credential?.shopId ?? null) : null;
 
   const value = useMemo<ChatValue>(() => {
     const openThread = (dealerId: string) => {
