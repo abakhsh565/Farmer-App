@@ -52,4 +52,10 @@
     <!-- Permissions -->
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Voice notes: the WebView records through MediaRecorder, which needs the
+         microphone permission declared here before Android will even ask. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <!-- Dealer replies as phone notifications, Android 13 and later. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 </manifest>

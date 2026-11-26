@@ -47,6 +47,7 @@ import {
   loadAccountCredential,
   saveAccountCredential,
 } from './api/credentialSync';
+import { alertDealerReply } from '@/services/dealerAlerts';
 import { parseShopLink } from './api/deepLink';
 import {
   firstRow,
@@ -161,6 +162,35 @@ type ShopApiValue = {
 const ShopApiContext = createContext<ShopApiValue | null>(null);
 
 const SEEN_KEY = 'farmer.shop.notifications.seen';
+/**
+ * The shop list as it was last seen, so the Shop tab paints shops before the
+ * network answers.
+ *
+ * The dealer platform's `farmer_api_shops` is a cold call over a slow path, and a
+ * farmer opening the tab waited for it every time even though the shops change
+ * rarely. Reading the last answer first — then replacing it when the fresh one
+ * arrives — is the difference between a screen that fills and a screen that
+ * spins.
+ */
+const SHOPS_KEY = 'farmer.shop.cached.shops';
+
+function loadCachedShops(): ShopSummary[] {
+  try {
+    const raw = localStorage.getItem(SHOPS_KEY);
+    const parsed = raw ? (JSON.parse(raw) as unknown) : null;
+    return Array.isArray(parsed) ? (parsed as ShopSummary[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveCachedShops(shops: ShopSummary[]): void {
+  try {
+    localStorage.setItem(SHOPS_KEY, JSON.stringify(shops.slice(0, 50)));
+  } catch {
+    // Storage refused: the list is still correct for this session.
+  }
+}
 
 function loadSeen(): string[] {
   try {
@@ -211,7 +241,11 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
   );
   const [me, setMe] = useState<ShopMe | null>(null);
   const [thread, setThread] = useState<ShopThread | null>(null);
-  const [shops, setShops] = useState<ShopSummary[]>([]);
+  const [shops, setShops] = useState<ShopSummary[]>(() => (configured ? loadCachedShops() : []));
+  /* Which dealer messages this session has already shown. A ref, because the
+     comparison happens inside a callback that outlives the render. */
+  const knownMessages = useRef<Set<number>>(new Set());
+  const baselineSeen = useRef(false);
   /**
    * Which shop's conversation the thread holds. `null` means the shop the
    * credential belongs to, which is every farmer connected to one counter.
@@ -247,13 +281,9 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
   /** Reads the thread and the outbox for a credential that is already trusted. */
   const load = useCallback(
     async (token: string): Promise<boolean> => {
-      const [meResult, threadResult, notificationsResult, mediaResult, shopsResult] = await Promise.all([
-        farmerMe(token),
-        farmerThread(token, activeShop.current),
-        farmerNotifications(token),
-        fetchShopMedia(token),
-        farmerShops(token),
-      ]);
+      /* The identity first: it names the shop the credential belongs to, which the
+         shop-scoped calls below need before they can run. */
+      const meResult = await farmerMe(token);
 
       if (!meResult.ok) {
         if (isTerminal(meResult.error)) {
@@ -273,21 +303,81 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
       }
 
       setMe(identity);
+
+      /*
+       * Name one shop before reading anything shop-scoped.
+       *
+       * `farmer_api_thread` and `farmer_api_media` answer
+       * "VALIDATION: this farmer deals with more than one shop — name the shop"
+       * when a farmer is linked to several shops and the call carries no id. A
+       * farmer with two counters is not an edge case here, and that refusal used to
+       * leave the conversation empty and the microphone hidden — the app looked
+       * broken while the backend was answering correctly.
+       *
+       * The credential's own shop is the natural first conversation; when it is not
+       * in the list, the first linked shop is. Nothing is invented: a shop id that
+       * the platform did not list is never used.
+       */
+      const shopsResult = await farmerShops(token);
+      const listed = shopsResult.ok ? normaliseShops(shopsResult.data) : [];
+      /* A failed listing keeps the shops already on screen, and the cache: a bad
+         minute on the platform does not delete a shop that exists. */
+      if (shopsResult.ok) {
+        setShops(listed);
+        saveCachedShops(listed);
+      }
+
+      let shopId = activeShop.current;
+      if (!shopId && listed.length > 1) {
+        const preferred =
+          listed.find((shop) => shop.shopId === identity.shopId) ??
+          listed.find((shop) => shop.isLinked) ??
+          listed[0];
+        shopId = preferred?.shopId ?? null;
+        activeShop.current = shopId;
+        setActiveShopId(shopId);
+      }
+
+      const [threadResult, notificationsResult, mediaResult] = await Promise.all([
+        farmerThread(token, shopId),
+        farmerNotifications(token),
+        fetchShopMedia(token, serviceConfig.shopApi, shopId),
+      ]);
+
       /* A thread that failed on its own is not a reason to blank the screen the
          farmer just opened: an empty conversation with the shop named above it is
          the honest rendering, and the next refresh fills it. */
       /* The thread says who said what; the media call says which of those messages
          carry a file and how long it runs. A conversation of plain text answers `[]`,
          and a backend without the call at all is not a reason to blank the messages. */
-      setThread(
-        threadResult.ok
-          ? normaliseThread(threadResult.data, mediaResult.ok ? mediaResult.data : [])
-          : null,
-      );
+      const nextThread = threadResult.ok
+        ? normaliseThread(threadResult.data, mediaResult.ok ? mediaResult.data : [])
+        : null;
+      setThread(nextThread);
       setNotifications(notificationsResult.ok ? normaliseNotifications(notificationsResult.data) : []);
-      /* The shop that exists on the dealer's platform is a fact about the shop, not
-         about its catalogue: it is listed even with nothing for sale yet. */
-      setShops(shopsResult.ok ? normaliseShops(shopsResult.data) : []);
+
+      /*
+       * A dealer reply that arrived while the farmer was elsewhere.
+       *
+       * The first successful read is the baseline — a farmer opening the app must
+       * not be notified about every message already in the thread. After that, any
+       * dealer message this session has not seen is announced through the phone
+       * when the page is hidden, which is exactly the case the farmer asked about.
+       */
+      const dealerMessages = nextThread ? nextThread.messages.filter((message) => message.from === 'dealer') : [];
+      const unseen = dealerMessages.filter((message) => !knownMessages.current.has(message.id));
+      for (const message of dealerMessages) knownMessages.current.add(message.id);
+      const wasBaseline = baselineSeen.current;
+      baselineSeen.current = true;
+      const newest = unseen[unseen.length - 1];
+      if (
+        wasBaseline &&
+        newest &&
+        typeof document !== 'undefined' &&
+        document.visibilityState === 'hidden'
+      ) {
+        void alertDealerReply(identity.shopName || 'Your dealer', newest);
+      }
 
       /* The shop's own name wins over the one stored at join time — a shop may
          rename itself, and the credential is not the place that fact lives. */
@@ -489,13 +579,13 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (!configured || status !== 'ready' || !credential?.token) return;
     let cancelled = false;
-    void mediaCapability(credential.token).then((supported) => {
+    void mediaCapability(credential.token, serviceConfig.shopApi, activeShopId).then((supported) => {
       if (!cancelled) setMediaSupported(supported);
     });
     return () => {
       cancelled = true;
     };
-  }, [configured, credential?.token, status]);
+  }, [activeShopId, configured, credential?.token, status]);
 
   /**
    * A reply arrives while the farmer is looking at the conversation.
