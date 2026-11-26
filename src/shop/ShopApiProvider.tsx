@@ -29,6 +29,7 @@ import {
   farmerNotifications,
   farmerRequestVisit,
   farmerSendMessage,
+  farmerShops,
   farmerThread,
   isTerminal,
   type FarmerIdentity,
@@ -45,9 +46,11 @@ import {
   firstRow,
   normaliseMe,
   normaliseNotifications,
+  normaliseShops,
   normaliseThread,
   type ShopMe,
   type ShopNotification,
+  type ShopSummary,
   type ShopThread,
 } from './api/types';
 
@@ -117,6 +120,8 @@ type ShopApiValue = {
   credential: ShopCredential | null;
   me: ShopMe | null;
   thread: ShopThread | null;
+  /** The shops the dealer platform lists for this farmer, connected or not. */
+  shops: ShopSummary[];
   notifications: ShopNotification[];
   unread: number;
   busy: boolean;
@@ -192,6 +197,7 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
   );
   const [me, setMe] = useState<ShopMe | null>(null);
   const [thread, setThread] = useState<ShopThread | null>(null);
+  const [shops, setShops] = useState<ShopSummary[]>([]);
   const [notifications, setNotifications] = useState<ShopNotification[]>([]);
   const [failure, setFailure] = useState<ShopFailure>(null);
   const [busy, setBusy] = useState(false);
@@ -215,11 +221,12 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
   /** Reads the thread and the outbox for a credential that is already trusted. */
   const load = useCallback(
     async (token: string): Promise<boolean> => {
-      const [meResult, threadResult, notificationsResult, mediaResult] = await Promise.all([
+      const [meResult, threadResult, notificationsResult, mediaResult, shopsResult] = await Promise.all([
         farmerMe(token),
         farmerThread(token),
         farmerNotifications(token),
         fetchShopMedia(token),
+        farmerShops(token),
       ]);
 
       if (!meResult.ok) {
@@ -252,6 +259,9 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
           : null,
       );
       setNotifications(notificationsResult.ok ? normaliseNotifications(notificationsResult.data) : []);
+      /* The shop that exists on the dealer's platform is a fact about the shop, not
+         about its catalogue: it is listed even with nothing for sale yet. */
+      setShops(shopsResult.ok ? normaliseShops(shopsResult.data) : []);
 
       /* The shop's own name wins over the one stored at join time — a shop may
          rename itself, and the credential is not the place that fact lives. */
@@ -638,6 +648,7 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
       credential,
       me,
       thread,
+      shops,
       notifications,
       unread,
       busy,
@@ -685,6 +696,7 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
     run,
     seen,
     status,
+    shops,
     thread,
     busy,
   ]);

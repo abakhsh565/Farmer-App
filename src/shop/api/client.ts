@@ -168,6 +168,19 @@ export function farmerJoinShop(
 }
 
 /**
+ * The shops this farmer can deal with.
+ *
+ * The dealer platform is the only place a shop's existence is recorded, and it
+ * answers this call for a connected farmer: name, city and whether this farmer is
+ * linked. It is what the Shop tab lists, so a shop that exists on the dealer app
+ * appears in this app even when it has published no products yet — a product
+ * listing is what answers "what does it sell", not "is it there".
+ */
+export function farmerShops(token: string) {
+  return callShopRpc<unknown>('farmer_api_shops', { p_token: token });
+}
+
+/**
  * The conversation with the shop.
  *
  * `shop_id` is null on purpose: a farmer joined to one shop has exactly one

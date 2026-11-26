@@ -30,6 +30,7 @@ import type { MessageKey } from '@/i18n/catalog';
 import { formatHour, formatMoney, formatNumber, formatRelativeTime } from '@/i18n/format';
 import { initialsOf } from '@/lib/initials';
 import { useDealerSearch, useProductSearch } from '@/services/hooks';
+import { useShopApi } from '@/shop/ShopApiProvider';
 import { ShopConnectSheet } from '@/shop/ShopRequestSheet';
 import type { DealerSummary } from '@/services/types';
 
@@ -64,6 +65,7 @@ const FILTERS: ReadonlyArray<{ id: FilterId; labelKey: MessageKey }> = [
 
 export function DealersScreen({
   onOpenChat,
+  onOpenShopChat,
   onOpenSearch,
   onOpenLocationSearch,
   onOpenDealer,
@@ -72,6 +74,8 @@ export function DealersScreen({
   onSectionChange,
 }: {
   onOpenChat: (dealerKey: string) => void;
+  /** Opens the conversation with the shop on the dealer's own platform. */
+  onOpenShopChat: () => void;
   /** Opens the search page — shops and stock, one keyword. */
   onOpenSearch: () => void;
   /** Opens the page where the farmer finds their area by name. */
@@ -113,6 +117,8 @@ export function DealersScreen({
    * local variable that then looks like the farmer's location.
    */
   const location = useLocation();
+  /* The dealer's own platform, which is where a shop actually exists. */
+  const shopApi = useShopApi();
 
   const searchedArea = PROFILE_AREA;
   /*
@@ -285,6 +291,43 @@ export function DealersScreen({
           );
         })}
       </ul>
+
+      {/*
+        The shops the dealer platform itself lists, above the radius result.
+
+        The list below is built from *listings*, so a shop that has joined the
+        dealer app but has published no product is invisible there even though it
+        exists and can be messaged. Those shops are exactly what `farmer_api_shops`
+        answers, and showing them here is the difference between "no shop exists"
+        and "no shop has priced anything yet".
+      */}
+      {shopApi.shops.length > 0 ? (
+        <section className="mt-4" aria-label={t('dealers.network')}>
+          <SectionLabel>{t('dealers.network')}</SectionLabel>
+          <ul className="mt-2 space-y-2">
+            {shopApi.shops.map((shop) => (
+              <li key={shop.shopId} className="flex items-center gap-3 rounded-xl bg-card p-3.5">
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-body font-medium">{shop.name}</p>
+                  <p className="mt-0.5 truncate text-caption text-muted-foreground">
+                    {shop.isLinked
+                      ? t('dealers.network.connected')
+                      : (shop.locationLabel ?? shop.city ?? t('dealers.network.listed'))}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={onOpenShopChat}
+                  aria-label={t('dealers.chatAria', { name: shop.name })}
+                  className="grid size-9 shrink-0 place-items-center rounded-full bg-muted"
+                >
+                  <MessageCircle className="size-4" aria-hidden />
+                </button>
+              </li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
 
       {search.status === 'loading' ? <LoadingState label={t('rates.loading')} /> : null}
 

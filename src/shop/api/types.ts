@@ -47,6 +47,41 @@ export type ShopThread = {
   visits: ShopVisit[];
 };
 
+/** One shop as the dealer platform lists it to a connected farmer. */
+export type ShopSummary = {
+  shopId: string;
+  name: string;
+  city: string | null;
+  locationLabel: string | null;
+  /** True when this farmer already has a credential for it. */
+  isLinked: boolean;
+};
+
+/** `farmer_api_shops` — `{ shops: [...] }`, tolerant of a bare array. */
+export function normaliseShops(value: unknown): ShopSummary[] {
+  const row = record(value);
+  const list = Array.isArray(row.shops) ? row.shops : Array.isArray(value) ? value : [];
+  const shops: ShopSummary[] = [];
+
+  for (const entry of list) {
+    const item = record(entry);
+    const shopId = text(firstOf(item, ['shop_id', 'shopId', 'id']));
+    const name = text(firstOf(item, ['name', 'shop_name', 'shopName']));
+    /* A shop with no id cannot be opened or messaged, so it is not listed. */
+    if (!shopId || !name) continue;
+
+    shops.push({
+      shopId,
+      name,
+      city: text(item.city),
+      locationLabel: text(firstOf(item, ['location_label', 'locationLabel', 'address'])),
+      isLinked: item.is_linked === true,
+    });
+  }
+
+  return shops;
+}
+
 export type ShopNotification = {
   id: string;
   kind: string;
