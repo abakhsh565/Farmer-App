@@ -42,6 +42,11 @@ import {
   saveShopCredential,
   type ShopCredential,
 } from './api/credential';
+import {
+  clearAccountCredential,
+  loadAccountCredential,
+  saveAccountCredential,
+} from './api/credentialSync';
 import { parseShopLink } from './api/deepLink';
 import {
   firstRow,
@@ -187,6 +192,10 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
    * shop normalises its own `0300…` and `+92300…` to the same key.
    */
   const { account } = useSession();
+  /* The signed-in account this connection belongs to. A ref, because the calls
+     that save a credential outlive the render they were started in. */
+  const accountId = useRef<string | null>(null);
+  accountId.current = account?.id ?? null;
   const identity = useMemo<FarmerIdentity | null>(() => {
     if (!account?.phone) return null;
     const phone = toE164(account.phone).replace(/^\+/, '');
@@ -222,6 +231,10 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
 
   const expire = useCallback(() => {
     clearShopCredential();
+    /* The shop ended the connection, so the account's copy of it must go too —
+       otherwise the next device would adopt a credential that no longer opens
+       anything. */
+    void clearAccountCredential(accountId.current);
     activeShop.current = null;
     setActiveShopId(null);
     setCredential(null);
@@ -286,6 +299,9 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
         joinedAt: current.current?.joinedAt ?? Date.now(),
       };
       saveShopCredential(refreshed);
+      /* And on the account, so a phone, a browser and a replacement phone all
+         open the same shops without the code being typed again. */
+      void saveAccountCredential(accountId.current, refreshed);
       setCredential(refreshed);
       setFailure(null);
       setStatus('ready');
@@ -304,13 +320,43 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
      is the truth. */
   useEffect(() => {
     if (!configured) return;
-    const token = loadShopCredential()?.token;
-    if (!token) {
+
+    const local = loadShopCredential();
+    if (local) {
+      void load(local.token);
+      return;
+    }
+
+    /*
+     * Nothing on this device. The connection may still belong to the account —
+     * a farmer who connected in the app on his phone opens the site on a laptop
+     * and expects the same shops, not a code prompt. So the account's copy is
+     * read once, and only then is the farmer told he is not connected.
+     */
+    const owner = account?.id;
+    if (!owner) {
       setStatus('no-credential');
       return;
     }
-    void load(token);
-  }, [configured, load]);
+
+    let cancelled = false;
+    setStatus('loading');
+    void (async () => {
+      const saved = await loadAccountCredential(owner);
+      if (cancelled || current.current) return;
+      if (!saved) {
+        setStatus('no-credential');
+        return;
+      }
+      saveShopCredential(saved);
+      setCredential(saved);
+      await load(saved.token);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [account?.id, configured, load]);
 
   useEffect(() => {
     if (!configured || !Capacitor.isNativePlatform()) return;
@@ -371,6 +417,7 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
           joinedAt: Date.now(),
         };
         saveShopCredential(next);
+        void saveAccountCredential(accountId.current, next);
         /* A new credential is a new set of shops, so the reading goes back to the
            shop the invitation names. */
         activeShop.current = null;
@@ -741,6 +788,7 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
       joinWithLink,
       forget: () => {
         clearShopCredential();
+        void clearAccountCredential(accountId.current);
         expire();
       },
       activeShopId,
