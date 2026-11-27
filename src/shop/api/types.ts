@@ -90,7 +90,14 @@ export function normaliseShops(value: unknown): ShopSummary[] {
          and a "contact the shop" row with no number is the one thing this card
          cannot leave out. The shop's own profile supplies both fields. */
       phone: text(
-        firstOf(item, ['phone', 'shop_phone', 'shopPhone', 'whatsapp_phone', 'whatsappPhone']),
+        firstOf(item, [
+          'phone',
+          'contact_phone',
+          'shop_phone',
+          'shopPhone',
+          'whatsapp_phone',
+          'whatsappPhone',
+        ]),
       ),
       logoUrl: text(firstOf(item, ['logo_url', 'logoUrl'])),
       latitude: numberOrNull(item.latitude),
