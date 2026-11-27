@@ -495,7 +495,7 @@ export type StockistQuery = {
 export interface DealerProvider {
   readonly name: string;
   /** Hard ceiling, applied by the provider as well as by the UI. */
-  readonly maxRadiusKm: 100;
+  readonly maxRadiusKm: 150;
   search(query: DealerSearchQuery): Promise<Sourced<DealerSummary[]>>;
   products(dealerId: string): Promise<Sourced<DealerProduct[]>>;
   /** Where one canonical product can be bought right now, nearest first. */

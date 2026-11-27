@@ -332,11 +332,11 @@ describe('local repository', () => {
 describe('dealer provider', () => {
   const dealer = new DevelopmentDealerProvider();
 
-  it('applies its own 100 km ceiling regardless of what the caller asks for', async () => {
+  it('applies its own 150 km ceiling regardless of what the caller asks for', async () => {
     const { data } = await dealer.search({ radiusKm: 5000 });
-    expect(dealer.maxRadiusKm).toBe(100);
+    expect(dealer.maxRadiusKm).toBe(150);
     for (const row of data) {
-      expect(row.distanceKm).toBeLessThanOrEqual(100);
+      expect(row.distanceKm).toBeLessThanOrEqual(150);
     }
   });
 
@@ -369,7 +369,7 @@ describe('dealer provider', () => {
   it('never returns the shop that sits beyond the ceiling, even at the maximum radius', async () => {
     const { data } = await dealer.search({ radiusKm: dealer.maxRadiusKm });
     expect(data.some((d) => d.id === 'dealer.farMandi')).toBe(false);
-    for (const row of data) expect(row.distanceKm).toBeLessThanOrEqual(100);
+    for (const row of data) expect(row.distanceKm).toBeLessThanOrEqual(150);
   });
 
   it('reports dealer freshness rather than assuming it', async () => {

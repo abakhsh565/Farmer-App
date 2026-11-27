@@ -41,7 +41,7 @@ import type {
  * the shop's own system and are not this class's business.
  */
 export class ChainedDealerProvider implements DealerProvider {
-  readonly maxRadiusKm = 100 as const;
+  readonly maxRadiusKm = 150 as const;
 
   /** Names every source it consulted, so a report can say what was tried. */
   readonly name: string;

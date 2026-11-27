@@ -28,6 +28,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { PROFILE_POINT } from '@/data/dealers';
+import { onCatalogChange } from './catalogRealtime';
 import { useServices, type Services } from './registry';
 import type {
   DealerProduct,
@@ -62,15 +63,54 @@ const EMPTY: readonly never[] = [];
 /**
  * How soon a live read asks again.
  *
- * The dealer's catalogue lives in the dealer platform, a different project that the
- * Farmer App cannot make emit events; every read of it is a live request. So "a
- * dealer approved something" reaches the farmer by asking again, and the only
- * question is how often. Five seconds is the cadence the connected-shop thread
- * already uses: fast enough that a change looks automatic, slow enough that a phone
- * on mobile data is not doing a request a second. It never runs while the page is
- * hidden or the phone is offline.
+ * Two mechanisms, in this order.
+ *
+ * 1. Realtime (`catalogRealtime`) hears the app's own catalogue tables change and
+ *    re-reads at once — measured end to end at well under a second.
+ * 2. The dealer platform is a different project this app cannot make emit events,
+ *    so its live network is re-read on this timer while the screen is visible.
+ *    One second is the fallback that keeps a change from ever being more than a
+ *    second stale without a socket, and it is skipped entirely while the page is
+ *    hidden or the phone is offline.
  */
-const LIVE_REFRESH_MS = 5000;
+const LIVE_REFRESH_MS = 1000;
+
+/**
+ * One timer for the whole app.
+ *
+ * Every live read used to own an interval, so three screens' worth of reads fired
+ * in three drifting streams — measured at 3.6 requests a second instead of one
+ * pass a second — and each one paid its own visibility listeners. They all join
+ * this instead: a single tick wakes every mounted live read together, and the
+ * timer exists only while something is listening.
+ */
+const liveReads = new Set<() => void>();
+let liveTimer: number | null = null;
+
+function wakeLiveReads() {
+  if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+  for (const revalidate of liveReads) void revalidate();
+}
+
+function joinLiveReads(revalidate: () => void): () => void {
+  liveReads.add(revalidate);
+  if (liveTimer === null) {
+    liveTimer = window.setInterval(wakeLiveReads, LIVE_REFRESH_MS);
+    document.addEventListener('visibilitychange', wakeLiveReads);
+    window.addEventListener('focus', wakeLiveReads);
+    window.addEventListener('online', wakeLiveReads);
+  }
+  return () => {
+    liveReads.delete(revalidate);
+    if (liveReads.size === 0 && liveTimer !== null) {
+      window.clearInterval(liveTimer);
+      liveTimer = null;
+      document.removeEventListener('visibilitychange', wakeLiveReads);
+      window.removeEventListener('focus', wakeLiveReads);
+      window.removeEventListener('online', wakeLiveReads);
+    }
+  };
+}
 
 function useResource<T>(
   key: string,
@@ -154,9 +194,17 @@ function useResource<T>(
     if (!enabled || !live) return;
     let stopped = false;
     let inFlight = false;
+    /* A failing source is not asked again on the next tick: a refused key or a
+       dropped network would otherwise be hammered once a second. Two ticks off is
+       long enough for the connection to come back, short enough not to feel stuck. */
+    let cooldown = 0;
 
     const revalidate = async () => {
       if (stopped || inFlight) return;
+      if (cooldown > 0) {
+        cooldown -= 1;
+        return;
+      }
       if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
       if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
 
@@ -169,6 +217,7 @@ function useResource<T>(
         setError(null);
         setLoadedAt(Date.now());
       } catch {
+        cooldown = 2;
         /* A failed background read leaves the last answer alone: a shop the farmer
            could still walk to is better than an empty screen, and the next tick — or
            the reconnect — tries again. The first read is what reports a failure. */
@@ -177,23 +226,15 @@ function useResource<T>(
       }
     };
 
-    const timer = window.setInterval(() => void revalidate(), LIVE_REFRESH_MS);
-    const onVisible = () => {
-      if (document.visibilityState === 'visible') void revalidate();
-    };
-    /* Coming back to the app, and coming back onto the network, are the two moments
-       the answer is certainly stale — so neither waits for the next tick. */
-    const onOnline = () => void revalidate();
-    document.addEventListener('visibilitychange', onVisible);
-    window.addEventListener('focus', onVisible);
-    window.addEventListener('online', onOnline);
+    /* The socket makes a synced shop, branch or listing change instant; the timer
+       above stays as the fallback for everything it cannot hear. */
+    const stopRealtime = onCatalogChange(() => void revalidate());
+    const leaveLive = joinLiveReads(revalidate);
 
     return () => {
       stopped = true;
-      window.clearInterval(timer);
-      document.removeEventListener('visibilitychange', onVisible);
-      window.removeEventListener('focus', onVisible);
-      window.removeEventListener('online', onOnline);
+      stopRealtime();
+      leaveLive();
     };
   }, [enabled, live, services]);
 
