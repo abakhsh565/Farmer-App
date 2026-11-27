@@ -14,6 +14,9 @@ import { useMemo, useRef, useState } from 'react';
 import { EmptyState, LoadingState } from '@/components/States';
 import { Button } from '@/components/ui/button';
 import { useChat } from '@/chat/ChatProvider';
+import { useDealerSearch } from '@/services/hooks';
+import { useLocation } from '@/location/LocationProvider';
+import { MAX_RADIUS_KM } from '@/data/dealers';
 import { ShopDetailSheet, type ShopDetail } from '@/shop/ShopDetailSheet';
 import { THREAD_META, type ChatMessage } from '@/data/chat';
 import { dealerNameKey } from '@/data/dealers';
@@ -62,6 +65,32 @@ export function ChatScreen({ onBrowseDealers }: Props) {
    * the offers waiting on an answer, and the notices the shop has sent.
    */
   const shop = useShopApi();
+  /*
+   * The name behind a conversation.
+   *
+   * A shop the farmer started talking to from the Shop tab is a branch of the live
+   * dealer network, and its id is the branch id — not a row in the connected-shop
+   * list. The header used to fall straight through to the raw id, so the screen read
+   * `3564c1a5-12a3-453b-bec9-739a89eb7d3c` where the shop's name belongs. Asking the
+   * same directory the Shop tab uses is what makes the heading, the bubbles and the
+   * shop page all say the same thing about the same record.
+   */
+  const location = useLocation();
+  const directory = useDealerSearch(
+    /* The active point, not `searchOrigin`: the latter is deliberately absent when
+       the saved location is the account's, which is the normal signed-in case — and
+       a directory read with no origin is refused, which left the heading showing the
+       branch id. The active point is always the place the app is reading from. */
+    { radiusKm: MAX_RADIUS_KM, origin: location.activePoint },
+    /* An opened thread counts even before its first message: `threadKeys` only lists
+       conversations that already have one, and the heading needs the name the moment
+       the screen opens — that empty state is exactly where the raw id used to show. */
+    chat.threadKeys.length > 0 || chat.openThreadKey !== null,
+  );
+  const directoryNames = useMemo(
+    () => new Map(directory.data.map((row) => [row.id, row.name])),
+    [directory.data],
+  );
   const [sheet, setSheet] = useState<null | 'credit' | 'visit'>(null);
   /* The shop page behind the name in the header. */
   const [shopInfo, setShopInfo] = useState(false);
@@ -86,12 +115,14 @@ export function ChatScreen({ onBrowseDealers }: Props) {
    * asked first; the credential is the fallback for its own shop alone.
    */
   const nameFor = (dealerId: string) => {
-    if (!shop.configured) return lineText(dealerId, t);
+    const fromDirectory = directoryNames.get(dealerId);
+    if (!shop.configured) return fromDirectory ?? lineText(dealerId, t);
     const listed = shop.shops.find((row) => row.shopId === dealerId)?.name;
-    if (dealerId !== liveDealerId) return listed ?? lineText(dealerId, t);
+    if (dealerId !== liveDealerId) return listed ?? fromDirectory ?? lineText(dealerId, t);
     return (
       shop.thread?.shopName ||
       listed ||
+      fromDirectory ||
       (dealerId === shop.credential?.shopId ? shop.credential?.shopName : null) ||
       lineText(dealerId, t)
     );
@@ -447,8 +478,17 @@ export function ChatScreen({ onBrowseDealers }: Props) {
               {t('chat.placeholder')}
             </label>
 
-            {chat.live && shop.mediaSupported ? (
-              <>
+            {/*
+              The media doors are always here.
+
+              They used to be hidden until a connected shop's own capability answer
+              came back — so a conversation opened from the Shop tab, which is not a
+              connected shop, showed a bare text box: not the composer the farmer
+              uses everywhere else in the app. The shape is now the assistant's, in
+              every conversation; whether this shop can take a photo is checked when
+              one is actually sent, and said then.
+            */}
+            <>
                 <input
                   ref={photoInput}
                   type="file"
@@ -492,8 +532,7 @@ export function ChatScreen({ onBrowseDealers }: Props) {
                 >
                   <ImageIcon className="size-5" aria-hidden />
                 </button>
-              </>
-            ) : null}
+            </>
 
             <textarea
               id="chat-composer"
@@ -510,7 +549,7 @@ export function ChatScreen({ onBrowseDealers }: Props) {
               className="max-h-28 min-h-9 flex-1 resize-none bg-transparent px-1.5 py-1.5 text-body placeholder:text-muted-foreground focus-visible:outline-none"
             />
 
-            {chat.live && shop.mediaSupported && voiceRecordingSupported() ? (
+            {voiceRecordingSupported() ? (
               <button
                 type="button"
                 onClick={() => void recorder.start()}
