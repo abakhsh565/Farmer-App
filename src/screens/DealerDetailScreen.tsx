@@ -21,6 +21,7 @@ import { useSession } from '@/session/SessionProvider';
 import { useVisits } from '@/visits/VisitProvider';
 import { ShopQrCard } from '@/shop/ShopQrCard';
 import { useShopApi } from '@/shop/ShopApiProvider';
+import { distanceKmBetween } from '@/shop/geo';
 
 type Props = {
   dealerId: string;
@@ -64,6 +65,13 @@ export function DealerDetailScreen({ dealerId, onBack, onOpenChat, onOpenProduct
    * One conversation, one record: the owner reads it in the app he already uses.
    */
   const shop = useShopApi();
+  /*
+   * The same shop as the dealer platform lists it. The marketplace projection is
+   * built from listings, so a shop that has published nothing has no row there —
+   * and the conversation's header can still name it. This is the record behind
+   * that page, and it is what makes the page open instead of saying "not found".
+   */
+  const connectedShop = shop.shops.find((row) => row.shopId === dealerId) ?? null;
 
   const back = (
     <header className="flex items-center gap-2 px-4 pt-4">
@@ -104,13 +112,99 @@ export function DealerDetailScreen({ dealerId, onBack, onOpenChat, onOpenProduct
 
   const entry = dealer.data;
   if (!entry) {
+    if (!connectedShop) {
+      return (
+        <div className="flex flex-col">
+          {back}
+          <EmptyState
+            title={t('dealer.detail.missingTitle')}
+            body={t('dealer.detail.missingBody')}
+          />
+        </div>
+      );
+    }
+
+    /*
+     * A shop the dealer platform knows but the marketplace has no listing for.
+     * The page still has to be a page: who it is, where it is, the number to ring
+     * and the way into its conversation. It says nothing about stock, because the
+     * shop has not published any — an invented shelf would be worse than a blank
+     * one.
+     */
+    const km =
+      connectedShop.latitude !== null && connectedShop.longitude !== null
+        ? Number(
+            distanceKmBetween(location.activePoint, {
+              lat: connectedShop.latitude,
+              lon: connectedShop.longitude,
+            }).toFixed(1),
+          )
+        : null;
+    const place = [connectedShop.locationLabel, connectedShop.city].filter(Boolean).join(' · ');
+
     return (
-      <div className="flex flex-col">
+      <div className="flex flex-col pb-6">
         {back}
-        <EmptyState
-          title={t('dealer.detail.missingTitle')}
-          body={t('dealer.detail.missingBody')}
-        />
+        <section className="mt-3 px-4">
+          <div className="flex items-center gap-3">
+            {connectedShop.logoUrl ? (
+              <img
+                src={connectedShop.logoUrl}
+                alt=""
+                className="size-12 shrink-0 rounded-full object-cover"
+              />
+            ) : (
+              <span className="grid size-12 shrink-0 place-items-center rounded-full bg-brand-soft text-subheading text-brand">
+                {connectedShop.name.slice(0, 2).toUpperCase()}
+              </span>
+            )}
+            <div className="min-w-0 flex-1">
+              <h2 className="truncate text-subheading">{connectedShop.name}</h2>
+              <p className="mt-0.5 flex items-center gap-1 text-caption text-brand">
+                <ShieldCheck className="size-3.5" aria-hidden />
+                {t('dealers.network.connected')}
+              </p>
+            </div>
+          </div>
+
+          <div className="mt-3 space-y-2">
+            {place ? (
+              <p className="flex items-start gap-2 text-body-sm text-muted-foreground">
+                <MapPin className="mt-0.5 size-4 shrink-0" aria-hidden />
+                <span>{place}</span>
+              </p>
+            ) : null}
+            {connectedShop.phone ? (
+              <a
+                href={`tel:${connectedShop.phone.replace(/\s/g, '')}`}
+                className="flex items-center gap-2 text-body-sm font-medium text-brand"
+              >
+                <Phone className="size-4 shrink-0" aria-hidden />
+                <span dir="ltr">{connectedShop.phone}</span>
+              </a>
+            ) : null}
+            {km !== null ? (
+              <p className="flex items-center gap-2 text-body-sm text-muted-foreground">
+                <MapPin className="size-4 shrink-0" aria-hidden />
+                <span>{t('common.km', { km: formatNumber(km, locale) })}</span>
+              </p>
+            ) : null}
+          </div>
+
+          <p className="mt-2.5 rounded-md bg-muted px-3.5 py-3 text-body-sm text-muted-foreground">
+            {t('dealer.products.none')}
+          </p>
+        </section>
+
+        <div className="mt-3 px-4">
+          <Button
+            className="h-11 w-full rounded-full"
+            onClick={() => onOpenChat(connectedShop.shopId)}
+          >
+            <MessageCircle className="size-4" aria-hidden />
+            {t('dealers.chatAria', { name: connectedShop.name })}
+          </Button>
+        </div>
       </div>
     );
   }
@@ -119,6 +213,9 @@ export function DealerDetailScreen({ dealerId, onBack, onOpenChat, onOpenProduct
   const name = nameKey ? t(nameKey) : entry.name;
   const verified = entry.verifiedAt !== null;
   const hour = closingHour(entry.id);
+  /* The directory's projection has no number in it, so the shop platform's own
+     record fills the line when this page was reached from a conversation. */
+  const phone = entry.phone ?? connectedShop?.phone ?? null;
 
   const reasons: MessageKey[] = [];
   if (verified) reasons.push('dealer.reason.verified');
@@ -204,7 +301,7 @@ export function DealerDetailScreen({ dealerId, onBack, onOpenChat, onOpenProduct
 
       {/* The business itself: what it says about its own shop, where it is and
           how to reach it. Each line is omitted when the source did not supply it. */}
-      {entry.about || entry.address || entry.phone ? (
+      {entry.about || entry.address || phone ? (
         <section className="mt-4 px-4">
           {/*
             The shop's own join code. It renders only for the shop that owns the
@@ -225,13 +322,13 @@ export function DealerDetailScreen({ dealerId, onBack, onOpenChat, onOpenProduct
                 <span>{entry.address}</span>
               </p>
             ) : null}
-            {entry.phone ? (
+            {phone ? (
               <a
-                href={`tel:${entry.phone.replace(/\s/g, '')}`}
+                href={`tel:${phone.replace(/\s/g, '')}`}
                 className="flex items-center gap-2 text-body-sm font-medium text-brand"
               >
                 <Phone className="size-4 shrink-0" aria-hidden />
-                <span dir="ltr">{entry.phone}</span>
+                <span dir="ltr">{phone}</span>
               </a>
             ) : null}
             {entry.openingHours ? (
