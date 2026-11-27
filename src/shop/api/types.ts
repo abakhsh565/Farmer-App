@@ -86,7 +86,12 @@ export function normaliseShops(value: unknown): ShopSummary[] {
       name,
       city: text(item.city),
       locationLabel: text(firstOf(item, ['location_label', 'locationLabel', 'address'])),
-      phone: text(firstOf(item, ['phone', 'shop_phone', 'shopPhone'])),
+      /* A branch that publishes a WhatsApp line but no landline is still reachable,
+         and a "contact the shop" row with no number is the one thing this card
+         cannot leave out. The shop's own profile supplies both fields. */
+      phone: text(
+        firstOf(item, ['phone', 'shop_phone', 'shopPhone', 'whatsapp_phone', 'whatsappPhone']),
+      ),
       logoUrl: text(firstOf(item, ['logo_url', 'logoUrl'])),
       latitude: numberOrNull(item.latitude),
       longitude: numberOrNull(item.longitude),
