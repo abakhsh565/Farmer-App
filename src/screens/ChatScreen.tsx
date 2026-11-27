@@ -40,7 +40,11 @@ import {
   voiceRecordingSupported,
 } from '@/shop/api/media';
 
-type Props = { onBrowseDealers: () => void };
+type Props = {
+  onBrowseDealers: () => void;
+  /** Opens a shop's own page, which is what its name in the thread header means. */
+  onOpenDealer?: (dealerId: string) => void;
+};
 
 /**
  * The farmer's side of the dealer conversations.
@@ -54,7 +58,7 @@ type Props = { onBrowseDealers: () => void };
  * *and* the clearing of the box, so a farmer who signs in mid-message does not
  * come back to the same words still sitting there.
  */
-export function ChatScreen({ onBrowseDealers }: Props) {
+export function ChatScreen({ onBrowseDealers, onOpenDealer }: Props) {
   const { t } = useLocale();
   const { requestIdentity } = useSession();
   const chat = useChat();
@@ -358,14 +362,37 @@ export function ChatScreen({ onBrowseDealers }: Props) {
             aria-label={t('dealers.network.open')}
           >
             <span className="block truncate text-subheading">{nameFor(dealerId)}</span>
-            <span className="block text-caption text-muted-foreground">{t('chat.repliesIn')}</span>
+            {activeShopDetail.phone ? (
+              <span
+                dir="ltr"
+                className="block truncate text-caption tabular-nums text-muted-foreground"
+              >
+                {activeShopDetail.phone}
+              </span>
+            ) : (
+              <span className="block truncate text-caption text-muted-foreground">
+                {t('chat.repliesIn')}
+              </span>
+            )}
           </button>
           {/* The chevron is the affordance: the name opens the shop's page. */}
           <ChevronRight className="size-5 shrink-0 text-muted-foreground rtl:rotate-180" aria-hidden />
         </header>
 
         {shopInfo ? (
-          <ShopDetailSheet shop={activeShopDetail} onClose={() => setShopInfo(false)} onChat={() => {}} />
+          <ShopDetailSheet
+            shop={activeShopDetail}
+            onClose={() => setShopInfo(false)}
+            onChat={() => {}}
+            onOpenDealer={
+              onOpenDealer
+                ? () => {
+                    setShopInfo(false);
+                    onOpenDealer(dealerId);
+                  }
+                : undefined
+            }
+          />
         ) : null}
 
         {chat.live ? (

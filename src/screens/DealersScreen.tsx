@@ -185,15 +185,25 @@ export function DealersScreen({
         store — otherwise a shop the farmer just found would receive nothing they
         typed.
       */}
-      <button
-        type="button"
-        disabled={shopBusy !== null}
-        onClick={() => void openShop(shop.shopId)}
-        aria-label={t('dealers.network.open')}
-        className="flex w-full items-center gap-3 rounded-xl bg-card p-3.5 text-start disabled:opacity-60"
-      >
-        <div className="min-w-0 flex-1">
+      <div className="flex w-full items-center gap-2 rounded-xl bg-card p-3.5">
+        {/*
+          The row opens the shop's page, the way a dealer row above it does. The
+          conversation is the round button beside it. The row used to jump straight
+          into the thread, so a shop found by area had no page at all — and the
+          page, with the listings, the hours and the visit request, is what a
+          farmer weighing a trip actually needs.
+        */}
+        <button
+          type="button"
+          onClick={() => onOpenDealer(shop.shopId)}
+          className="min-w-0 flex-1 text-start"
+        >
           <p className="truncate text-body font-medium">{shop.name}</p>
+          {shop.phone ? (
+            <p dir="ltr" className="mt-0.5 truncate text-caption tabular-nums text-muted-foreground">
+              {shop.phone}
+            </p>
+          ) : null}
           <p className="mt-0.5 truncate text-caption text-muted-foreground">
             {shopBusy === shop.shopId
               ? t('chat.loading')
@@ -206,11 +216,17 @@ export function DealersScreen({
                   .filter(Boolean)
                   .join(' · ')}
           </p>
-        </div>
-        <span className="grid size-9 shrink-0 place-items-center rounded-full bg-muted">
+        </button>
+        <button
+          type="button"
+          disabled={shopBusy !== null}
+          onClick={() => void openShop(shop.shopId)}
+          aria-label={t('dealers.network.open')}
+          className="grid size-10 shrink-0 place-items-center rounded-full bg-muted disabled:opacity-60"
+        >
           <MessageCircle className="size-4" aria-hidden />
-        </span>
-      </button>
+        </button>
+      </div>
     </li>
   );
 

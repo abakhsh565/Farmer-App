@@ -458,7 +458,7 @@ function Shell() {
           <AssistantScreen onBack={() => setTab('home')} />
         ) : null}
         {view === 'tabs' && detail === null && tab === 'chat' ? (
-          <ChatScreen onBrowseDealers={() => setTab('dealers')} />
+          <ChatScreen onBrowseDealers={() => setTab('dealers')} onOpenDealer={openDealer} />
         ) : null}
         {view === 'tabs' && detail === null && tab === 'community' ? <CommunityScreen /> : null}
       </main>
