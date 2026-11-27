@@ -16,9 +16,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { EmptyState, LoadingState } from '@/components/States';
 import { Button } from '@/components/ui/button';
 import { useChat } from '@/chat/ChatProvider';
-import { useDealerSearch } from '@/services/hooks';
-import { useLocation } from '@/location/LocationProvider';
-import { MAX_RADIUS_KM } from '@/data/dealers';
 import { ShopDetailSheet, type ShopDetail } from '@/shop/ShopDetailSheet';
 import { THREAD_META, type ChatMessage } from '@/data/chat';
 import { dealerNameKey } from '@/data/dealers';
@@ -72,29 +69,13 @@ export function ChatScreen({ onBrowseDealers }: Props) {
   /*
    * The name behind a conversation.
    *
-   * A shop the farmer started talking to from the Shop tab is a branch of the live
-   * dealer network, and its id is the branch id — not a row in the connected-shop
-   * list. The header used to fall straight through to the raw id, so the screen read
-   * `3564c1a5-12a3-453b-bec9-739a89eb7d3c` where the shop's name belongs. Asking the
-   * same directory the Shop tab uses is what makes the heading, the bubbles and the
-   * shop page all say the same thing about the same record.
+   * A conversation is a shop the dealer network knows, and the network is the only
+   * source that answers for every one of them. The header used to fall through to
+   * the raw id, and then to the nearby-dealer directory — which is scoped to where
+   * the farmer is standing, so a conversation with a dealer in another city lost
+   * its name when the farmer moved. The thread, the platform's own shop list and
+   * the credential are all account facts and all available anywhere.
    */
-  const location = useLocation();
-  const directory = useDealerSearch(
-    /* The active point, not `searchOrigin`: the latter is deliberately absent when
-       the saved location is the account's, which is the normal signed-in case — and
-       a directory read with no origin is refused, which left the heading showing the
-       branch id. The active point is always the place the app is reading from. */
-    { radiusKm: MAX_RADIUS_KM, origin: location.activePoint },
-    /* An opened thread counts even before its first message: `threadKeys` only lists
-       conversations that already have one, and the heading needs the name the moment
-       the screen opens — that empty state is exactly where the raw id used to show. */
-    chat.threadKeys.length > 0 || chat.openThreadKey !== null,
-  );
-  const directoryNames = useMemo(
-    () => new Map(directory.data.map((row) => [row.id, row.name])),
-    [directory.data],
-  );
   const [sheet, setSheet] = useState<null | 'credit' | 'visit'>(null);
   /* The shop page behind the name in the header. */
   const [shopInfo, setShopInfo] = useState(false);
@@ -172,58 +153,107 @@ export function ChatScreen({ onBrowseDealers }: Props) {
    * asked first; the credential is the fallback for its own shop alone.
    */
   const nameFor = (dealerId: string) => {
-    const fromDirectory = directoryNames.get(dealerId);
-    if (!shop.configured) return fromDirectory ?? lineText(dealerId, t);
+    const fromConversation = chat.conversations.find((row) => row.dealerId === dealerId)?.name;
+    if (fromConversation) return fromConversation;
     const listed = shop.shops.find((row) => row.shopId === dealerId)?.name;
-    if (dealerId !== liveDealerId) return listed ?? fromDirectory ?? lineText(dealerId, t);
-    return (
-      shop.thread?.shopName ||
-      listed ||
-      fromDirectory ||
-      (dealerId === shop.credential?.shopId ? shop.credential?.shopName : null) ||
-      lineText(dealerId, t)
-    );
+    if (listed) return listed;
+    if (dealerId === liveDealerId) {
+      const fromThread = shop.threads[dealerId]?.shopName ?? shop.thread?.shopName;
+      if (fromThread) return fromThread;
+    }
+    if (dealerId === shop.credential?.shopId && shop.credential?.shopName) {
+      return shop.credential.shopName;
+    }
+    return lineText(dealerId, t);
   };
 
   /* The data the dealer's own list holds for the shop being read, which is what the
      header's page shows. A shop the list did not describe still opens, with only
      what the conversation itself knows. */
+  /*
+   * A reply that arrives while its conversation is open is already read.
+   *
+   * Opening a thread marks its notices read once, but the shop's reply arrives
+   * afterwards, and a badge counting a message the farmer is looking at would be
+   * wrong. This runs whenever the outbox changes, and clears only the open
+   * conversation.
+   */
+  const pendingNotices = shop.notifications.length;
+  useEffect(() => {
+    if (!chat.live || chat.openThreadKey === null) return;
+    shop.markNotificationsRead(chat.openThreadKey);
+    /* Keyed on the count, not on the shop object or the array: those are replaced on
+       every refresh, and an effect that ran on each one would keep asking to mark
+       the same notices read. */
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chat.live, chat.openThreadKey, pendingNotices]);
+
+  const activeConversation = chat.conversations.find((row) => row.dealerId === liveDealerId);
   const activeShopDetail: ShopDetail = shop.shops.find(
     (row) => row.shopId === liveDealerId,
   ) ?? {
-    name: nameFor(liveDealerId ?? ''),
+    name: activeConversation?.name ?? nameFor(liveDealerId ?? ''),
     city: null,
     locationLabel: null,
-    phone: shop.thread?.shopPhone ?? null,
+    phone: activeConversation?.phone ?? shop.thread?.shopPhone ?? null,
     logoUrl: null,
     isLinked: true,
   };
 
-  const list = useMemo(
-    () =>
-      chat.threadKeys.map((dealerId) => {
-        const messages = chat.messages(dealerId);
-        return { dealerId, messages, last: messages[messages.length - 1] };
-      }),
-    [chat],
-  );
+  const list = chat.conversations;
 
   /*
-   * The search box filters on what the list actually shows — the shop's name and
-   * the last line of the conversation. A search field that accepts typing and
-   * ignores it is worse than no field at all, because the farmer concludes the
-   * conversation they are looking for is gone.
+   * The search box filters on what the list actually shows — the shop's name, its
+   * number and the last line of the conversation. A search field that accepts
+   * typing and ignores it is worse than no field at all, because the farmer
+   * concludes the conversation they are looking for is gone.
    */
   const matches = useMemo(() => {
     const needle = query.trim().toLowerCase();
     if (!needle) return list;
-    return list.filter(({ dealerId, last }) => {
-      const name = nameFor(dealerId).toLowerCase();
-      const preview = previewOf(last, t).toLowerCase();
-      return name.includes(needle) || preview.includes(needle);
+    return list.filter(({ dealerId, name, phone, lastMessage }) => {
+      const label = (name || nameFor(dealerId)).toLowerCase();
+      const preview = previewOf(lastMessage, t).toLowerCase();
+      const number = (phone ?? '').replace(/\s+/g, '');
+      return (
+        label.includes(needle) ||
+        preview.includes(needle) ||
+        (number.length > 0 && number.includes(needle.replace(/\s+/g, '')))
+      );
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [list, query, t, shop.configured, shop.thread?.shopName, shop.credential?.shopName]);
+  }, [list, query, t, shop.configured, shop.shops, shop.credential?.shopName]);
+
+  /*
+   * The thread follows its newest line.
+   *
+   * Opening a conversation and receiving a reply should both leave the farmer at
+   * the bottom of it — the place a message arrives. Without this the view stayed
+   * where the previous conversation was scrolled, so a new message could land
+   * above the fold and the thread looked like it had lost its content.
+   */
+  const threadScroll = useRef<HTMLDivElement | null>(null);
+  const openMessageCount = chat.openThreadKey ? chat.messages(chat.openThreadKey).length : 0;
+  useEffect(() => {
+    const node = threadScroll.current;
+    if (!node) return;
+    node.scrollTop = node.scrollHeight;
+  }, [chat.openThreadKey, openMessageCount]);
+
+  /**
+   * Opens one conversation, at the shop network first.
+   *
+   * The list is a list of shops, and the shop backend keeps one thread per shop. A
+   * row that only changed the screen would show the previous dealer's history and
+   * send the next line to the previous dealer — the failure this screen used to
+   * have when its rows bypassed `App.openThread`.
+   */
+  const openConversation = (dealerId: string) => {
+    if (chat.live && dealerId !== liveDealerId) {
+      void shop.openShopConversation(dealerId);
+    }
+    chat.openThread(dealerId);
+  };
 
   if (chat.status === 'loading') {
     return (
@@ -306,8 +336,8 @@ export function ChatScreen({ onBrowseDealers }: Props) {
     };
 
     return (
-      <div className="flex h-full flex-col">
-        <header className="flex items-center gap-2 border-b border-border px-4 py-3">
+      <div className="flex h-full min-h-0 flex-col">
+        <header className="flex shrink-0 items-center gap-2 border-b border-border px-4 py-3">
           <button
             type="button"
             aria-label={t('common.back')}
@@ -415,7 +445,7 @@ export function ChatScreen({ onBrowseDealers }: Props) {
           </div>
         ) : null}
 
-        <div className="flex-1 space-y-2 overflow-y-auto px-4 py-4">
+        <div ref={threadScroll} className="min-h-0 flex-1 space-y-2 overflow-y-auto px-4 py-4">
           {openMessages && openMessages.length > 0 ? (
             openMessages.map((message: ChatMessage) => {
               const mine = message.from === 'me';
@@ -546,7 +576,7 @@ export function ChatScreen({ onBrowseDealers }: Props) {
           />
         ) : (
         <form
-          className="border-t border-border p-3"
+          className="shrink-0 border-t border-border p-3"
           onSubmit={(event) => {
             event.preventDefault();
             send();
@@ -740,18 +770,20 @@ export function ChatScreen({ onBrowseDealers }: Props) {
         /* Rows divided by a hairline rather than boxed into cards: the design
            reads as one list of conversations, not four unrelated objects. */
         <ul className="mt-2">
-          {matches.map(({ dealerId, last }, index) => {
+          {matches.map((conversation, index) => {
+            const { dealerId, phone, lastMessage, unread: unreadCount, lastAt } = conversation;
             const meta = THREAD_META[dealerId];
-            const unreadCount = chat.unread(dealerId);
-            const name = nameFor(dealerId);
-            const preview = previewOf(last, t);
+            const name = conversation.name || nameFor(dealerId);
+            const preview = previewOf(lastMessage, t);
+            const stamp = listStamp(lastAt, t) ?? (meta ? t(meta.timeKey) : null);
+            const state = lastMessage ? deliveryOf(lastMessage) : null;
             const first = index === 0;
 
             return (
               <li key={dealerId} className={first ? '' : 'border-t border-border'}>
                 <button
                   type="button"
-                  onClick={() => chat.openThread(dealerId)}
+                  onClick={() => openConversation(dealerId)}
                   aria-label={
                     unreadCount > 0
                       ? `${t('chat.thread.open', { name })} — ${t('chat.unread', { count: unreadCount })}`
@@ -772,6 +804,14 @@ export function ChatScreen({ onBrowseDealers }: Props) {
                       <span className="truncate text-body font-medium">{name}</span>
                       <ShieldCheck className="size-3.5 shrink-0 text-brand" aria-hidden />
                     </span>
+                    {/* The number the counter is reached on, from the shop's own
+                        record. It is how a farmer tells two branches of one business
+                        apart in a list of conversations. */}
+                    {phone ? (
+                      <span className="mt-0.5 block truncate text-caption tabular-nums text-muted-foreground">
+                        {phone}
+                      </span>
+                    ) : null}
                     <span
                       className={`mt-0.5 block truncate text-body-sm ${
                         unreadCount > 0 ? 'text-foreground' : 'text-muted-foreground'
@@ -782,19 +822,18 @@ export function ChatScreen({ onBrowseDealers }: Props) {
                   </span>
 
                   <span className="flex shrink-0 flex-col items-end gap-1.5">
-                    {meta ? (
-                      <span className="text-caption text-muted-foreground">{t(meta.timeKey)}</span>
+                    {stamp ? (
+                      <span className="text-caption text-muted-foreground">{stamp}</span>
                     ) : null}
                     {unreadCount > 0 ? (
                       <span className="grid size-5 place-items-center rounded-full bg-brand text-caption font-semibold text-brand-foreground">
                         {unreadCount}
                       </span>
-                    ) : (
-                      <CheckCheck
-                        className="size-4 text-muted-foreground"
-                        aria-label={t('chat.read')}
-                      />
-                    )}
+                    ) : lastMessage?.from === 'me' ? (
+                      /* The tick belongs to the farmer's own last line; a
+                         conversation the shop spoke last has nothing to acknowledge. */
+                      <MessageTicks state={state} />
+                    ) : null}
                   </span>
                 </button>
               </li>
@@ -816,7 +855,7 @@ export function ChatScreen({ onBrowseDealers }: Props) {
  * says what it is and how long it runs, which is what the bubble says too.
  */
 function previewOf(
-  message: ChatMessage | undefined,
+  message: ChatMessage | null | undefined,
   t: (key: MessageKey, values?: Record<string, string | number>) => string,
 ): string {
   if (!message) return '';
@@ -825,6 +864,37 @@ function previewOf(
     return `${t('chat.voice.label')} · ${formatDuration(message.audio.durationMs)}`;
   }
   return message.text ?? (message.key ? t(message.key) : '');
+}
+
+/**
+ * The time a conversation shows in the list.
+ *
+ * The shop's `created_at`, not a typed placeholder: today shows a clock, yesterday
+ * says so, the last week shows the weekday and anything older shows the date. A
+ * conversation with no messages has no time to show, which is the truth.
+ */
+function listStamp(
+  value: string | null,
+  t: (key: MessageKey, values?: Record<string, string | number>) => string,
+): string | null {
+  if (!value) return null;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+
+  const now = new Date();
+  if (date.toDateString() === now.toDateString()) {
+    return date.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+  }
+
+  const yesterday = new Date(now);
+  yesterday.setDate(now.getDate() - 1);
+  if (date.toDateString() === yesterday.toDateString()) return t('chat.time.yesterday');
+
+  if (now.getTime() - date.getTime() < 7 * 24 * 60 * 60 * 1000) {
+    return date.toLocaleDateString(undefined, { weekday: 'short' });
+  }
+
+  return date.toLocaleDateString(undefined, { day: '2-digit', month: 'short' });
 }
 
 /** The shop's own clock for a message, or `null` when it did not send one. */

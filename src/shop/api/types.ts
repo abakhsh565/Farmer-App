@@ -103,6 +103,15 @@ export type ShopNotification = {
   title: string;
   body: string;
   createdAt: string | null;
+  /**
+   * The message this notice is about.
+   *
+   * The shop's outbox names a message id in `payload`, not a shop id. That is what
+   * lets the app count unread messages *per conversation*: the id is looked up in
+   * the threads already read, and the notice is credited to the shop that holds
+   * that message. No shop is invented when the id matches nothing.
+   */
+  messageId: string | null;
 };
 
 function record(value: unknown): Record<string, unknown> {
@@ -392,12 +401,14 @@ export function normaliseNotifications(value: unknown): ShopNotification[] {
       const row = record(entry);
       const id = text(row.id);
       if (!id) return null;
+      const payload = record(firstOf(row, ['payload', 'data']));
       return {
         id,
         kind: (text(row.kind) ?? 'message').toLowerCase(),
         title: text(row.title) ?? '',
         body: text(row.body) ?? '',
         createdAt: text(firstOf(row, ['created_at', 'createdAt'])),
+        messageId: text(firstOf(payload, ['message_id', 'messageId'])),
       } satisfies ShopNotification;
     })
     .filter((entry): entry is ShopNotification => entry !== null);

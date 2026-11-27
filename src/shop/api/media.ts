@@ -265,6 +265,15 @@ export type UploadMediaInput = {
   kind: MediaKind;
   blob: Blob;
   mimeType: string;
+  /**
+   * The conversation this file belongs to.
+   *
+   * A farmer with more than one dealer has more than one possible folder, and the
+   * shop resolves the folder from the token alone. Naming the shop here is what
+   * lets the shop pick the right one instead of refusing the upload with
+   * `NOT_AUTHORIZED` because the token does not name a single shop.
+   */
+  shopId?: string | null;
   /** Only for a voice note. The shop refuses a note without one. */
   durationMs?: number;
   onProgress?: (fraction: number) => void;
@@ -278,6 +287,7 @@ export async function uploadMedia({
   kind,
   blob,
   mimeType,
+  shopId = null,
   durationMs,
   onProgress,
   transport = xhrUpload,
@@ -290,6 +300,9 @@ export async function uploadMedia({
 
   const query = new URLSearchParams({ kind, mime: mimeType });
   if (kind === 'voice') query.set('duration_ms', String(Math.max(1, Math.round(durationMs ?? 0))));
+  /* Older shop backends ignore an unknown parameter; the current one needs it
+     whenever the farmer deals with more than one shop. */
+  if (shopId) query.set('shop_id', shopId);
 
   const result = await transport(
     `${endpoint}?${query.toString()}`,
@@ -430,6 +443,31 @@ export type MediaLink = {
 };
 
 /**
+ * A signed link the app can actually load.
+ *
+ * The shop signs against its internal base URL (`http://kong:8000` locally, and on a
+ * hosted project an `http://` origin behind the TLS proxy), so the URL it returns can
+ * name `http` while the app itself is served over `https`. A browser then refuses the
+ * audio as mixed content and the bubble plays nothing. The scheme is corrected to the
+ * shop project's own origin, keeping the signature query untouched.
+ */
+export function playableLink(
+  raw: string,
+  config: ShopApiConfig = serviceConfig.shopApi,
+): string {
+  try {
+    const signed = new URL(raw);
+    if (signed.protocol === 'http:' && config.url?.startsWith('https://')) {
+      const base = new URL(config.url);
+      return `${base.origin}${signed.pathname}${signed.search}`;
+    }
+    return raw;
+  } catch {
+    return raw;
+  }
+}
+
+/**
  * Step 4: a short-lived URL for one message, minted when it is needed.
  *
  * Cached until shortly before it expires, because tapping play twice on a song-length
@@ -481,7 +519,7 @@ export async function mediaLink(
   return {
     ok: true,
     data: {
-      url,
+      url: playableLink(url, config),
       expiresIn: asNumber(row.expires_in) ?? 60,
       mimeType: typeof row.mime_type === 'string' ? row.mime_type : null,
       durationMs: asNumber(row.duration_ms),

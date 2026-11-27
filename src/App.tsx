@@ -293,8 +293,18 @@ function Shell() {
   }
 
   return (
-    <div className="mx-auto flex h-dvh w-full max-w-[430px] flex-col bg-background text-foreground">
-      <main className="flex-1 overflow-y-auto">
+    /*
+     * The shell owns the viewport, so a screen can own its own scrolling.
+     *
+     * `h-dvh` alone is not enough on a phone: some WebViews report a viewport
+     * shorter than the window (measured on a device: the whole app drew in the top
+     * two-thirds, with blank page below the tab bar). Pinning the shell to the
+     * viewport fixes it to the actual window, and `overflow-hidden` keeps the page
+     * itself from scrolling — a chat that scrolls the page and the thread at the
+     * same time is what leaves the composer floating above empty space.
+     */
+    <div className="fixed inset-0 mx-auto flex w-full max-w-[430px] flex-col overflow-hidden bg-background text-foreground">
+      <main className="min-h-0 flex-1 overflow-y-auto">
         {view === 'profile' ? (
           <ProfileScreen
             onBack={() => setView('tabs')}

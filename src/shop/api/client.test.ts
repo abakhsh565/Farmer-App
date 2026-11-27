@@ -138,8 +138,13 @@ describe('classifyFailure', () => {
     expect(classifyFailure(404, {})).toBe('unavailable');
   });
 
-  it('treats a refused key as the credential being gone', () => {
-    expect(classifyFailure(401, {})).toBe('unauthorized');
-    expect(classifyFailure(403, {})).toBe('unauthorized');
+  it('does not read a bare 401 or 403 as a verdict on the credential', () => {
+    /*
+     * Only the shop's own NOT_AUTHORIZED message (above) ends a credential. A bare
+     * gateway 401/403 was measured while the same token still read and sent text;
+     * reading it as a verdict signed the farmer out in the middle of a conversation.
+     */
+    expect(classifyFailure(401, {})).toBe('unavailable');
+    expect(classifyFailure(403, {})).toBe('unavailable');
   });
 });
