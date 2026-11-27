@@ -65,6 +65,12 @@ export type ChatMessage = {
   audio?: ChatAudio;
   /** Present on a photo; `text` carries its caption when there is one. */
   image?: ChatImage;
+  /** The shop's own time for the message, when it returned one. */
+  sentAt?: string | null;
+  /** When the shop's system recorded the message as delivered, if it says. */
+  deliveredAt?: string | null;
+  /** When the shop says it read the message, if it says. Never inferred. */
+  readAt?: string | null;
 };
 
 export type Threads = Record<string, ChatMessage[]>;

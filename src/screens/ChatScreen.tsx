@@ -3,6 +3,8 @@ import {
   CheckCheck,
   ChevronLeft,
   ChevronRight,
+  CircleAlert,
+  Clock,
   Image as ImageIcon,
   MessageCircle,
   Mic,
@@ -10,7 +12,7 @@ import {
   Send,
   ShieldCheck,
 } from 'lucide-react';
-import { useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { EmptyState, LoadingState } from '@/components/States';
 import { Button } from '@/components/ui/button';
 import { useChat } from '@/chat/ChatProvider';
@@ -31,6 +33,8 @@ import { IMAGE_TARGET_BYTES, compressImage } from '@/chat/compressImage';
 import { VoiceBubble } from '@/chat/VoiceBubble';
 import { VoiceComposer, useRecorderFailureText } from '@/chat/VoiceComposer';
 import { useVoiceRecorder } from '@/chat/useVoiceRecorder';
+import type { PendingRecording } from '@/chat/useVoiceRecorder';
+import { deliveryOf, type MessageDelivery } from '@/chat/messageStatus';
 import {
   MEDIA_LIMITS,
   formatDuration,
@@ -101,10 +105,60 @@ export function ChatScreen({ onBrowseDealers }: Props) {
   const recorder = useVoiceRecorder();
   const recorderMessage = useRecorderFailureText(recorder.failure);
   const [photoError, setPhotoError] = useState<string | null>(null);
+  /* The message whose details are being looked at, if any. */
+  const [messageInfo, setMessageInfo] = useState<ChatMessage | null>(null);
   const photoInput = useRef<HTMLInputElement | null>(null);
   /* The gallery is a second door on purpose: `capture` forces the camera, and a
      farmer who already has the photo should not have to retake it. */
   const galleryInput = useRef<HTMLInputElement | null>(null);
+
+  /**
+   * One recording, handed to the shop.
+   *
+   * Kept above the thread's render for one reason: the send arrow on the recording
+   * bar has to be able to stop the microphone and upload in the same press, and the
+   * recording only exists once `MediaRecorder` fires `onstop`. The effect below is
+   * that hand-off; this function is what both paths (preview's send, and the arrow)
+   * call, so the two can never drift apart in container choice or duration.
+   */
+  const sendRecording = useCallback(
+    (recording: PendingRecording) => {
+      /* The container the shop accepts, not the codec string the recorder reports:
+         `audio/webm;codecs=opus` is answered with `400 unsupported mime type`. */
+      const mimeType = voiceMimeTypeFor(recording.mimeType);
+      requestIdentity(() => {
+        void shop.sendMedia({
+          kind: 'voice',
+          blob: recording.blob,
+          mimeType,
+          durationMs: recording.durationMs,
+        });
+      }, 'session.why.message');
+    },
+    [requestIdentity, shop],
+  );
+
+  /*
+   * A recording the farmer ended with the send arrow.
+   *
+   * The arrow stops the recorder; the blob is only complete when `onstop` has run.
+   * Waiting for `preview` here is that moment, and the flag makes sure a recording
+   * that merely reached the cap (or was played back) is never sent on its own.
+   *
+   * A failed or empty stop returns to `idle` instead, and the flag is cleared in the
+   * same breath so the next recording starts with a clean slate.
+   */
+  const sendAfterStop = useRef(false);
+  useEffect(() => {
+    if (!sendAfterStop.current) return;
+    if (recorder.status === 'preview' && recorder.recording) {
+      sendAfterStop.current = false;
+      const recording = recorder.take();
+      if (recording) sendRecording(recording);
+      return;
+    }
+    if (recorder.status === 'idle') sendAfterStop.current = false;
+  }, [recorder, sendRecording]);
 
   /**
    * The shop's name, which on the live source comes from the shop, not a catalogue.
@@ -195,17 +249,7 @@ export function ChatScreen({ onBrowseDealers }: Props) {
     const sendVoice = () => {
       const recording = recorder.take();
       if (!recording) return;
-      /* The container the shop accepts, not the codec string the recorder reports:
-         `audio/webm;codecs=opus` is answered with `400 unsupported mime type`. */
-      const mimeType = voiceMimeTypeFor(recording.mimeType);
-      requestIdentity(() => {
-        void shop.sendMedia({
-          kind: 'voice',
-          blob: recording.blob,
-          mimeType,
-          durationMs: recording.durationMs,
-        });
-      }, 'session.why.message');
+      sendRecording(recording);
     };
 
     /* A photo is prepared on this phone before it is offered to the shop: a farmer
@@ -357,9 +401,13 @@ export function ChatScreen({ onBrowseDealers }: Props) {
               const mine = message.from === 'me';
               return (
                 <div key={message.id} className={`flex ${mine ? 'justify-end' : 'justify-start'}`}>
+                  {/* The bubble and its line of time/status are one column, so a
+                      double tick sits under the message it belongs to rather than
+                      floating at the edge of the screen. */}
+                  <div className={`flex min-w-0 max-w-[78%] flex-col gap-1 ${mine ? 'items-end' : 'items-start'}`}>
                   {message.image ? (
                     <div
-                      className={`max-w-[78%] rounded-lg px-2 py-2 ${mine ? 'bg-brand text-brand-foreground' : 'bg-muted text-foreground'}`}
+                      className={`max-w-full rounded-lg px-2 py-2 ${mine ? 'bg-brand text-brand-foreground' : 'bg-muted text-foreground'}`}
                     >
                       <span className="sr-only">
                         {mine ? t('chat.you') : nameFor(dealerId)}: {t('chat.photo.label')}
@@ -389,7 +437,7 @@ export function ChatScreen({ onBrowseDealers }: Props) {
                     </div>
                   ) : message.audio ? (
                     <div
-                      className={`max-w-[78%] rounded-lg px-3 py-2 ${mine ? 'bg-brand text-brand-foreground' : 'bg-muted text-foreground'}`}
+                      className={`max-w-full rounded-lg px-3 py-2 ${mine ? 'bg-brand text-brand-foreground' : 'bg-muted text-foreground'}`}
                     >
                       <span className="sr-only">
                         {mine ? t('chat.you') : nameFor(dealerId)}: {t('chat.voice.label')}
@@ -416,7 +464,7 @@ export function ChatScreen({ onBrowseDealers }: Props) {
                     </div>
                   ) : (
                     <p
-                      className={`max-w-[78%] rounded-lg px-3 py-2 text-body-sm leading-relaxed ${
+                      className={`max-w-full rounded-lg px-3 py-2 text-body-sm leading-relaxed ${
                         mine ? 'bg-brand text-brand-foreground' : 'bg-muted text-foreground'
                       }`}
                     >
@@ -428,6 +476,12 @@ export function ChatScreen({ onBrowseDealers }: Props) {
                       {message.text ?? (message.key ? t(message.key) : '')}
                     </p>
                   )}
+                  <MessageMeta
+                    message={message}
+                    mine={mine}
+                    onOpen={() => setMessageInfo(message)}
+                  />
+                  </div>
                 </div>
               );
             })
@@ -457,7 +511,10 @@ export function ChatScreen({ onBrowseDealers }: Props) {
             status={recorder.status}
             durationMs={recorder.durationMs}
             recording={recorder.recording}
-            onStop={recorder.stop}
+            onSendNow={() => {
+              sendAfterStop.current = true;
+              recorder.stop();
+            }}
             onCancel={recorder.cancel}
             onSend={sendVoice}
           />
@@ -573,6 +630,14 @@ export function ChatScreen({ onBrowseDealers }: Props) {
           </div>
         </form>
         )}
+
+        {messageInfo ? (
+          <MessageInfoSheet
+            message={messageInfo}
+            shopName={nameFor(dealerId)}
+            onClose={() => setMessageInfo(null)}
+          />
+        ) : null}
 
         {sheet ? <ShopRequestSheet mode={sheet} onClose={() => setSheet(null)} /> : null}
       </div>
@@ -734,6 +799,147 @@ function previewOf(
     return `${t('chat.voice.label')} · ${formatDuration(message.audio.durationMs)}`;
   }
   return message.text ?? (message.key ? t(message.key) : '');
+}
+
+/** The shop's own clock for a message, or `null` when it did not send one. */
+function clockOf(value?: string | null): string | null {
+  if (!value) return null;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+}
+
+/**
+ * The tick beside an outgoing message.
+ *
+ * `delivered` is drawn as the double tick the farmer already knows, but it is not
+ * a guess: a bubble exists only because the shop's thread returned that row. Blue
+ * is reserved for a read receipt the shop actually published — this backend does
+ * not publish one for the farmer's messages, so blue is absent rather than faked.
+ */
+function MessageTicks({ state }: { state: MessageDelivery | null }) {
+  const { t } = useLocale();
+  if (!state) return null;
+  if (state === 'sending') {
+    return <Clock className="size-3.5 text-muted-foreground" aria-label={t('chat.message.sending')} />;
+  }
+  if (state === 'failed') {
+    return <CircleAlert className="size-3.5 text-destructive" aria-label={t('chat.message.failed')} />;
+  }
+  if (state === 'read') {
+    return <CheckCheck className="size-3.5 text-sky-500" aria-label={t('chat.message.read')} />;
+  }
+  return <CheckCheck className="size-3.5 text-muted-foreground" aria-label={t('chat.message.delivered')} />;
+}
+
+/**
+ * Time and delivery state under a bubble, and the door to the details.
+ *
+ * Pressing it is the app's version of WhatsApp's "message info": one panel that
+ * says what the shop's record actually contains, including the fact that it does
+ * not report reads, instead of a second legend the farmer has to learn.
+ */
+function MessageMeta({
+  message,
+  mine,
+  onOpen,
+}: {
+  message: ChatMessage;
+  mine: boolean;
+  onOpen: () => void;
+}) {
+  const { t } = useLocale();
+  const state = deliveryOf(message);
+  const time = clockOf(message.sentAt);
+  if (!mine && !time) return null;
+
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      aria-label={t('chat.message.info')}
+      className="flex items-center gap-1 rounded-full px-1 text-caption text-muted-foreground"
+    >
+      {time ? <span className="tabular-nums">{time}</span> : null}
+      {!time && state === 'sending' ? <span>{t('chat.message.sending')}</span> : null}
+      <MessageTicks state={state} />
+    </button>
+  );
+}
+
+/** What is known about one message, said plainly. */
+function MessageInfoSheet({
+  message,
+  shopName,
+  onClose,
+}: {
+  message: ChatMessage;
+  shopName: string;
+  onClose: () => void;
+}) {
+  const { t } = useLocale();
+  const state = deliveryOf(message);
+  const sent = clockOf(message.sentAt);
+  const delivered = clockOf(message.deliveredAt);
+  const read = clockOf(message.readAt);
+  const status =
+    state === 'read'
+      ? t('chat.message.read')
+      : state === 'failed'
+        ? t('chat.message.failed')
+        : state === 'sending'
+          ? t('chat.message.sending')
+          : state === 'delivered'
+            ? t('chat.message.delivered')
+            : t('chat.message.sent');
+
+  return (
+    <div
+      role="presentation"
+      onClick={onClose}
+      className="fixed inset-0 z-50 flex items-end justify-center bg-ink-900/40 px-4 pb-6"
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-label={t('chat.message.info')}
+        onClick={(event) => event.stopPropagation()}
+        className="w-full max-w-[430px] rounded-xl bg-card p-4 shadow-lg"
+      >
+        <p className="text-subheading">{t('chat.message.info')}</p>
+        <dl className="mt-3 space-y-2 text-body-sm">
+          <div className="flex items-baseline justify-between gap-4">
+            <dt className="text-muted-foreground">{t('chat.message.status')}</dt>
+            <dd className="text-end">{status}</dd>
+          </div>
+          <div className="flex items-baseline justify-between gap-4">
+            <dt className="text-muted-foreground">{t('chat.message.sentAt')}</dt>
+            <dd className="tabular-nums">{sent ?? '—'}</dd>
+          </div>
+          {message.from === 'me' ? (
+            <>
+              <div className="flex items-baseline justify-between gap-4">
+                <dt className="text-muted-foreground">{t('chat.message.deliveredAt')}</dt>
+                <dd className="text-end">
+                  {delivered ??
+                    (state === 'delivered' || state === 'read'
+                      ? t('chat.message.stored', { shop: shopName })
+                      : '—')}
+                </dd>
+              </div>
+              <div className="flex items-baseline justify-between gap-4">
+                <dt className="text-muted-foreground">{t('chat.message.readAt')}</dt>
+                <dd className="text-end">{read ?? t('chat.message.readUnknown')}</dd>
+              </div>
+            </>
+          ) : null}
+        </dl>
+        <Button variant="outline" className="mt-4 h-10 w-full rounded-full" onClick={onClose}>
+          {t('common.close')}
+        </Button>
+      </div>
+    </div>
+  );
 }
 
 /**

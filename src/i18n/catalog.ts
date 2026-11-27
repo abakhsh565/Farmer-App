@@ -325,6 +325,21 @@ export const en = {
      of sentences to a screen reader. */
   'chat.you': 'You',
   'chat.read': 'Read',
+  /* The line under a bubble, and the panel behind it. "Delivered" is what the
+     shop's own thread proves; a read receipt is named only when the shop sends
+     one, and the panel says so when it does not. */
+  'chat.message.info': 'Message info',
+  'chat.message.status': 'Status',
+  'chat.message.sent': 'Sent',
+  'chat.message.sentAt': 'Sent',
+  'chat.message.delivered': 'Delivered to the shop',
+  'chat.message.deliveredAt': 'Delivered',
+  'chat.message.read': 'Read by the shop',
+  'chat.message.readAt': 'Read',
+  'chat.message.sending': 'Sending…',
+  'chat.message.failed': 'Not sent',
+  'chat.message.stored': 'Stored by {shop}',
+  'chat.message.readUnknown': 'This shop does not report when it reads messages.',
   'chat.repliesIn': 'Usually replies within 10 minutes',
   /* Voice notes: the composer, the bubble, and the three things that can go wrong
      while recording one. Each is a sentence the farmer can act on — "something went
@@ -1853,6 +1868,18 @@ export const ur: Record<MessageKey, string> = {
   'chat.send': 'پیغام بھیجیں',
   'chat.you': 'آپ',
   'chat.read': 'پڑھ لیا',
+  'chat.message.info': 'پیغام کی تفصیل',
+  'chat.message.status': 'حالت',
+  'chat.message.sent': 'بھیجا گیا',
+  'chat.message.sentAt': 'بھیجا گیا',
+  'chat.message.delivered': 'دکان کو پہنچ گیا',
+  'chat.message.deliveredAt': 'پہنچا',
+  'chat.message.read': 'دکان نے پڑھ لیا',
+  'chat.message.readAt': 'پڑھا گیا',
+  'chat.message.sending': 'بھیجا جا رہا ہے…',
+  'chat.message.failed': 'نہیں گیا',
+  'chat.message.stored': '{shop} نے محفوظ کر لیا',
+  'chat.message.readUnknown': 'یہ دکان پیغام پڑھنے کا وقت نہیں بتاتی۔',
   'chat.repliesIn': 'عموماً 10 منٹ میں جواب دیتے ہیں',
   'chat.voice.record': 'آواز کا پیغام ریکارڈ کریں',
   'chat.voice.stop': 'ریکارڈنگ روکیں',

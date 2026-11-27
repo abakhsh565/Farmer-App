@@ -1,4 +1,4 @@
-import { Mic, Play, Square, Trash2 } from 'lucide-react';
+import { Mic, Play, Send, Trash2 } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { useLocale } from '@/i18n/LocaleProvider';
@@ -12,9 +12,11 @@ import type { PendingRecording, RecorderFailure, RecorderStatus } from './useVoi
  * and taking the thread off screen to record into it would hide the message they are
  * answering.
  *
- *  · **recording** — elapsed time and a stop control. Cancel is always available:
- *    a recording that cannot be thrown away before it is sent is a recording the
- *    farmer sends by accident.
+ *  · **recording** — elapsed time, cancel, and a send arrow. The arrow stops the
+ *    recorder and sends the note in one press, the way the farmer expects the
+ *    composer's send button to behave; there is no separate stop-then-preview step
+ *    to get lost in. Cancel is always available: a recording that cannot be thrown
+ *    away before it is sent is a recording the farmer sends by accident.
  *  · **preview** — the actual audio, playable, with the duration and a send button.
  *
  * Nothing here talks to the shop. Sending is the screen's job, which is what keeps
@@ -24,14 +26,15 @@ export function VoiceComposer({
   status,
   durationMs,
   recording,
-  onStop,
+  onSendNow,
   onCancel,
   onSend,
 }: {
   status: RecorderStatus;
   durationMs: number;
   recording: PendingRecording | null;
-  onStop: () => void;
+  /** Stops a running recording and sends it immediately. */
+  onSendNow: () => void;
   onCancel: () => void;
   onSend: (recording: PendingRecording) => void;
 }) {
@@ -98,10 +101,10 @@ export function VoiceComposer({
           type="button"
           size="icon"
           className="size-11 shrink-0 rounded-full"
-          aria-label={t('chat.voice.stop')}
-          onClick={onStop}
+          aria-label={t('chat.voice.send')}
+          onClick={onSendNow}
         >
-          <Square className="size-4" aria-hidden />
+          <Send className="size-4 rtl:rotate-180" aria-hidden />
         </Button>
       </div>
     );
