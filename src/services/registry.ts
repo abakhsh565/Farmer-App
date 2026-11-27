@@ -123,7 +123,20 @@ export function createServices(
   const dealer: DealerProvider =
     resolved.dealer === 'marketplace'
       ? backendLive
-        ? new ChainedDealerProvider([new SupabaseDealerProvider(), new MarketplaceDealerProvider()])
+        ? /*
+           * The live dealer network first, the app's own projection second.
+           *
+           * The order was the other way round, on the argument that the
+           * projection is what the rest of the app reads. On staging that meant a
+           * farmer in Lahore saw four seeded reference shops 70–100 km away while
+           * the dealer platform held a real Lahore branch 12 km away with an
+           * approved listing — the projection answered, so the marketplace was
+           * never asked. The projection is now the fallback: it is where a shop
+           * this app already knows (a connected shop, a synced profile) still
+           * appears when the network is unreachable. See `providers/fallback` for
+           * why an empty answer does not end the question either way.
+           */
+          new ChainedDealerProvider([new MarketplaceDealerProvider(), new SupabaseDealerProvider()])
         : new MarketplaceDealerProvider()
       : resolved.dealer === 'supabase'
         ? new SupabaseDealerProvider()
