@@ -53,7 +53,9 @@ export function areaNameKey(areaId: AreaId): MessageKey {
 /** The largest radius the product allows; the choice inside it is the farmer's. */
 export const MAX_RADIUS_KM = 100;
 
-export const RADIUS_OPTIONS: readonly number[] = [5, 10, 25, 100];
+/* 50 km is the range the product talks about in every example ("shops within 50
+   kilometres") and it was the one distance a farmer could not pick with one tap. */
+export const RADIUS_OPTIONS: readonly number[] = [5, 10, 25, 50, 100];
 
 /**
  * How a dealer's row is labelled.
