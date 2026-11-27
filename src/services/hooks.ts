@@ -67,7 +67,16 @@ function useResource<T>(
 ): Resource<T> {
   const services = useServices();
   const [attempt, setAttempt] = useState(0);
-  const [sourced, setSourced] = useState<Sourced<T> | null>(null);
+  /**
+   * The last answer *and the request it answers*.
+   *
+   * Keeping the data without its key was how "4 dealers within 10 km" once named
+   * four shops 70–100 km away: the heading read the new radius while the list was
+   * still the old answer. An answer is now only shown for the request that asked
+   * it — a changed radius or area is a loading state, never a stale list wearing a
+   * new label.
+   */
+  const [sourcedState, setSourcedState] = useState<{ key: string; value: Sourced<T> } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loadedAt, setLoadedAt] = useState<number | null>(null);
   const [inFlight, setInFlight] = useState(enabled);
@@ -80,7 +89,10 @@ function useResource<T>(
 
   useEffect(() => {
     if (!enabled) {
-      setInFlight(false);
+      /* Disabled is "not asked yet", not "asked and got nothing". Leaving the
+         spinner state on is what stops a screen printing "0 dealers" before the
+         saved location has even been restored. */
+      setInFlight(true);
       return;
     }
     let cancelled = false;
@@ -90,7 +102,7 @@ function useResource<T>(
       try {
         const result = await loadRef.current(services);
         if (cancelled) return;
-        setSourced(result);
+        setSourcedState({ key, value: result });
         setError(null);
         setLoadedAt(Date.now());
       } catch (failure) {
@@ -108,6 +120,7 @@ function useResource<T>(
 
   const retry = useCallback(() => setAttempt((value) => value + 1), []);
 
+  const sourced = sourcedState !== null && sourcedState.key === key ? sourcedState.value : null;
   const hasContent = sourced !== null;
   return {
     status: error !== null && !hasContent ? 'error' : hasContent || !inFlight ? 'ready' : 'loading',
@@ -175,7 +188,10 @@ export function useMarketRates(commodity?: string): Resource<MarketRate[]> {
  * the farmer's profile location — the provider is told where to look, not who is
  * looking — which is what makes the rule structural rather than a promise.
  */
-export function useDealerSearch(query: DealerSearchQuery): Resource<DealerSummary[]> {
+export function useDealerSearch(
+  query: DealerSearchQuery,
+  enabled = true,
+): Resource<DealerSummary[]> {
   const { radiusKm, query: text, tags, origin } = query;
   const key = [
     'dealers',
@@ -195,6 +211,7 @@ export function useDealerSearch(query: DealerSearchQuery): Resource<DealerSummar
         tags,
         origin,
       }),
+    enabled,
   );
 }
 
@@ -205,7 +222,10 @@ export function useDealerSearch(query: DealerSearchQuery): Resource<DealerSummar
  * a different area is then a different request rather than a cached answer about
  * the old one, which is the mistake the key exists to make impossible.
  */
-export function useProductSearch(query: ProductSearchQuery): Resource<ProductHit[]> {
+export function useProductSearch(
+  query: ProductSearchQuery,
+  enabled = true,
+): Resource<ProductHit[]> {
   const { radiusKm, query: text, origin } = query;
   const key = [
     'product-search',
@@ -218,6 +238,7 @@ export function useProductSearch(query: ProductSearchQuery): Resource<ProductHit
     key,
     EMPTY as unknown as ProductHit[],
     (services) => services.dealer.searchProducts({ radiusKm, query: text, origin }),
+    enabled,
   );
 }
 

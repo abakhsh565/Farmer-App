@@ -275,6 +275,7 @@ export const en = {
   // ── dealers ──────────────────────────────────────────────────────────────
   'dealers.title': 'Shop',
   'dealers.network': 'On the dealer app',
+  'dealers.network.outside': 'Nearest on the dealer app — outside your {km} km',
   'dealers.network.open': 'Open conversation',
   'dealers.network.connected': 'Connected shop',
   'dealers.network.listed': 'Listed by your dealer',
@@ -1158,6 +1159,7 @@ export const en = {
   /* Saved location. */
   'location.title': 'Your location',
   'location.none': 'Not set',
+  'location.restoring': 'Finding your location…',
   'location.current': 'Current location',
   'location.change': 'Change',
   'location.add': 'Add location',
@@ -1803,6 +1805,7 @@ export const ur: Record<MessageKey, string> = {
 
   'dealers.title': 'دکان',
   'dealers.network': 'ڈیلر ایپ اُتے',
+  'dealers.network.outside': 'ڈیلر ایپ اُتے قریب ترین — آپ کے {km} کلومیٹر سے باہر',
   'dealers.network.open': 'گل بات کھولو',
   'dealers.network.connected': 'جُڑی ہوئی دکان',
   'dealers.network.listed': 'تہاڈے ڈیلر نے درج کیتی',
@@ -2596,6 +2599,7 @@ export const ur: Record<MessageKey, string> = {
 
   'location.title': 'آپ کا مقام',
   'location.none': 'مقرر نہیں',
+  'location.restoring': 'آپ کی جگہ تلاش کی جا رہی ہے…',
   'location.current': 'موجودہ مقام',
   'location.change': 'بدلیں',
   'location.add': 'مقام شامل کریں',

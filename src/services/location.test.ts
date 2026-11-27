@@ -52,6 +52,11 @@ describe('reading the saved location', () => {
     expect(rpc).toHaveBeenCalledWith('farmer_location_get');
   });
 
+  it('does not report a failed read as "nothing saved"', async () => {
+    rpc.mockResolvedValue({ data: null, error: { message: 'network unreachable' } });
+    await expect(readSavedLocation()).rejects.toThrow('network unreachable');
+  });
+
   it('does not call a profile row with no coordinates a location', async () => {
     rpc.mockResolvedValue({
       data: [{ label: null, lat: null, lon: null, source: null, set_at: null, radius_km: 10 }],

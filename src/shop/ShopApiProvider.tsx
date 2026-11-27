@@ -600,24 +600,37 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
     const token = credential.token;
     let stopped = false;
 
-    const tick = () => {
-      if (stopped) return;
+    /* One read at a time: a slow reply must not stack a queue of them, each one
+       overwriting the previous answer with an older one when it lands. */
+    let inFlight = false;
+    const tick = async () => {
+      if (stopped || inFlight) return;
       if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
-      void load(token);
+      if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+      inFlight = true;
+      try {
+        await load(token);
+      } finally {
+        inFlight = false;
+      }
     };
 
-    const timer = window.setInterval(tick, 5000);
+    const timer = window.setInterval(() => void tick(), 5000);
     const onVisible = () => {
-      if (document.visibilityState === 'visible') tick();
+      if (document.visibilityState === 'visible') void tick();
     };
+    /* Reconnecting is the one moment the screen is certainly stale. */
+    const onOnline = () => void tick();
     document.addEventListener('visibilitychange', onVisible);
     window.addEventListener('focus', onVisible);
+    window.addEventListener('online', onOnline);
 
     return () => {
       stopped = true;
       window.clearInterval(timer);
       document.removeEventListener('visibilitychange', onVisible);
       window.removeEventListener('focus', onVisible);
+      window.removeEventListener('online', onOnline);
     };
   }, [configured, credential?.token, load, status]);
 

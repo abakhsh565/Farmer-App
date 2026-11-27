@@ -145,6 +145,18 @@ export function DealersScreen({
       .sort((a, b) => (a.km ?? Number.POSITIVE_INFINITY) - (b.km ?? Number.POSITIVE_INFINITY));
   }, [shopApi.shops, location.activePoint]);
 
+  /*
+   * The chosen radius governs the whole screen, including the shops the dealer
+   * platform lists. Those rows used to be shown above the radius result no matter
+   * where they were — a shop 400 km away sat directly over "nothing within 25 km".
+   * Inside the radius they are results; outside it they are suggestions, named as
+   * such.
+   */
+  const shopsInRange = shopRows.filter((shop) => shop.km !== null && shop.km <= location.radiusKm);
+  const shopsBeyondRange = shopRows.filter(
+    (shop) => shop.km === null || shop.km > location.radiusKm,
+  );
+
   const openShop = async (shopId: string) => {
     setShopBusy(shopId);
     try {
@@ -154,6 +166,44 @@ export function DealersScreen({
       setShopBusy(null);
     }
   };
+
+  /** One dealer-platform shop. Rendered in the results or in the suggestions. */
+  const shopRow = (shop: (typeof shopRows)[number]) => (
+    <li key={shop.shopId}>
+      {/*
+        The whole row opens the conversation with *that* shop, and the opening is a
+        call to the dealer's platform rather than a jump into this phone's own chat
+        store — otherwise a shop the farmer just found would receive nothing they
+        typed.
+      */}
+      <button
+        type="button"
+        disabled={shopBusy !== null}
+        onClick={() => void openShop(shop.shopId)}
+        aria-label={t('dealers.network.open')}
+        className="flex w-full items-center gap-3 rounded-xl bg-card p-3.5 text-start disabled:opacity-60"
+      >
+        <div className="min-w-0 flex-1">
+          <p className="truncate text-body font-medium">{shop.name}</p>
+          <p className="mt-0.5 truncate text-caption text-muted-foreground">
+            {shopBusy === shop.shopId
+              ? t('chat.loading')
+              : [
+                  shop.km !== null ? t('common.km', { km: shop.km }) : null,
+                  shop.isLinked
+                    ? t('dealers.network.connected')
+                    : (shop.locationLabel ?? shop.city ?? t('dealers.network.listed')),
+                ]
+                  .filter(Boolean)
+                  .join(' · ')}
+          </p>
+        </div>
+        <span className="grid size-9 shrink-0 place-items-center rounded-full bg-muted">
+          <MessageCircle className="size-4" aria-hidden />
+        </span>
+      </button>
+    </li>
+  );
 
   const searchedArea = PROFILE_AREA;
   /*
@@ -181,11 +231,19 @@ export function DealersScreen({
   /* No free text here any more: the list is browsed by radius and tag, and any
      word the farmer types goes to the search page, where it can answer about
      stock as well as about shops. */
-  const search = useDealerSearch({
-    radiusKm: location.radiusKm,
-    origin: searchOrigin,
-    tags: filter === 'all' || filter === 'open' ? undefined : [filter],
-  });
+  /* Nothing is asked before the saved location has answered: a request fired at
+     the default point and replaced a moment later is the flicker this whole
+     lifecycle exists to remove. */
+  const locationReady = location.status !== 'restoring';
+
+  const search = useDealerSearch(
+    {
+      radiusKm: location.radiusKm,
+      origin: searchOrigin,
+      tags: filter === 'all' || filter === 'open' ? undefined : [filter],
+    },
+    locationReady,
+  );
 
   /*
    * The product half of the shop. No keyword: this tab is the shelf itself —
@@ -193,16 +251,39 @@ export function DealersScreen({
    * shop's own price and stock. A keyword belongs on the search page, one tap
    * away, which answers about shops and stock together.
    */
-  const products = useProductSearch({
-    radiusKm: location.radiusKm,
-    origin: searchOrigin,
-    query: '',
-  });
+  const products = useProductSearch(
+    {
+      radiusKm: location.radiusKm,
+      origin: searchOrigin,
+      query: '',
+    },
+    locationReady,
+  );
 
   const rows =
     filter === 'open'
       ? search.data.filter((dealer) => dealer.openNow === true)
       : search.data;
+
+  /*
+   * The nearest shops when the chosen radius has none.
+   *
+   * The default radius is small and most places have no dealer inside it, so the
+   * honest answer to "within 10 km" used to be an empty screen — which a farmer
+   * reads as "this app is broken", not as "widen the search". The wider query only
+   * runs when the chosen one came back empty, and its rows are labelled with the
+   * radius that produced them, so the screen never says "within 10 km" above a shop
+   * 70 km away.
+   */
+  const wider = useDealerSearch(
+    { radiusKm: MAX_RADIUS_KM, origin: searchOrigin, tags: filter === 'all' || filter === 'open' ? undefined : [filter] },
+    locationReady && search.status === 'ready' && rows.length === 0 && location.radiusKm < MAX_RADIUS_KM,
+  );
+  const widerRows =
+    filter === 'open' ? wider.data.filter((dealer) => dealer.openNow === true) : wider.data;
+  const showsWider = rows.length === 0 && widerRows.length > 0;
+  const listRows = showsWider ? widerRows : rows;
+  const listKm = showsWider ? MAX_RADIUS_KM : location.radiusKm;
 
   /*
    * A provider that reported its own failure is not an empty area. The list says
@@ -336,47 +417,23 @@ export function DealersScreen({
         answers, and showing them here is the difference between "no shop exists"
         and "no shop has priced anything yet".
       */}
-      {shopRows.length > 0 ? (
+      {shopsInRange.length > 0 || shopsBeyondRange.length > 0 ? (
         <section className="mt-4" aria-label={t('dealers.network')}>
-          <SectionLabel>{t('dealers.network')}</SectionLabel>
-          <ul className="mt-2 space-y-2">
-            {shopRows.map((shop) => (
-              <li key={shop.shopId}>
-                {/*
-                  The whole row opens the conversation with *that* shop, and the
-                  opening is a call to the dealer's platform rather than a jump into
-                  this phone's own chat store — otherwise a shop the farmer just
-                  found would receive nothing they typed.
-                */}
-                <button
-                  type="button"
-                  disabled={shopBusy !== null}
-                  onClick={() => void openShop(shop.shopId)}
-                  aria-label={t('dealers.network.open')}
-                  className="flex w-full items-center gap-3 rounded-xl bg-card p-3.5 text-start disabled:opacity-60"
-                >
-                  <div className="min-w-0 flex-1">
-                    <p className="truncate text-body font-medium">{shop.name}</p>
-                    <p className="mt-0.5 truncate text-caption text-muted-foreground">
-                      {shopBusy === shop.shopId
-                        ? t('chat.loading')
-                        : [
-                            shop.km !== null ? t('common.km', { km: shop.km }) : null,
-                            shop.isLinked
-                              ? t('dealers.network.connected')
-                              : (shop.locationLabel ?? shop.city ?? t('dealers.network.listed')),
-                          ]
-                            .filter(Boolean)
-                            .join(' · ')}
-                    </p>
-                  </div>
-                  <span className="grid size-9 shrink-0 place-items-center rounded-full bg-muted">
-                    <MessageCircle className="size-4" aria-hidden />
-                  </span>
-                </button>
-              </li>
-            ))}
-          </ul>
+          {shopsInRange.length > 0 ? (
+            <>
+              <SectionLabel>{t('dealers.network')}</SectionLabel>
+              <ul className="mt-2 space-y-2">{shopsInRange.map(shopRow)}</ul>
+            </>
+          ) : null}
+
+          {shopsBeyondRange.length > 0 ? (
+            <>
+              <SectionLabel className="mt-4">
+                {t('dealers.network.outside', { km: location.radiusKm })}
+              </SectionLabel>
+              <ul className="mt-2 space-y-2">{shopsBeyondRange.map(shopRow)}</ul>
+            </>
+          ) : null}
         </section>
       ) : null}
 
@@ -402,11 +459,20 @@ export function DealersScreen({
 
       {search.status === 'ready' && !searchFailed ? (
         <>
+          {showsWider ? (
+            <p className="mt-3 text-label text-muted-foreground">
+              {t('dealers.empty.body', {
+                km: location.radiusKm,
+                place: location.placeLabel || t(areaNameKey(searchedArea)),
+              })}
+            </p>
+          ) : null}
+
           <SectionLabel className="mt-3.5">
-            {t('dealer.search.count', { count: rows.length, km: location.radiusKm })}
+            {t('dealer.search.count', { count: listRows.length, km: listKm })}
           </SectionLabel>
 
-          {rows.length === 0 ? (
+          {listRows.length === 0 ? (
             <EmptyState
               title={t('dealers.empty.title')}
               body={t('dealers.empty.body', {
@@ -428,7 +494,7 @@ export function DealersScreen({
           ) : null}
 
           <ul className="mt-2 space-y-2.5">
-            {rows.map((entry) => {
+            {listRows.map((entry) => {
               const name = dealerName(entry);
               const verified = entry.verifiedAt !== null;
               const hour = closingHour(entry.id);
