@@ -1492,7 +1492,7 @@ export const en = {
   'agent.source': 'Source: {source} · {age}',
   'dealer.detail.title': 'Dealer',
   'dealer.detail.missingTitle': 'This shop is not in range',
-  'dealer.detail.missingBody': 'The dealer service did not return this shop. It may have closed, or be further than 100 km.',
+  'dealer.detail.missingBody': 'The dealer service did not return this shop. It may have closed, or be further than your search reach.',
   'dealer.detail.since': 'Since {year}',
   'dealer.detail.about': 'About this shop',
   'dealer.detail.hours': 'Open {hours}',
