@@ -9,6 +9,7 @@ import type { MessageKey } from '@/i18n/catalog';
 import { formatMoney, formatNumber, formatRelativeTime } from '@/i18n/format';
 import { useLocation } from '@/location/LocationProvider';
 import { useDealer, useDealerProducts, useStockists } from '@/services/hooks';
+import { useShopApi } from '@/shop/ShopApiProvider';
 
 type Props = {
   canonicalProductId: string;
@@ -51,6 +52,9 @@ export function ProductDetailScreen({
   const { t, locale } = useLocale();
   const location = useLocation();
   const entry = catalogueEntry(canonicalProductId);
+  /* The dealer platform's own record, for the number a stockist row shows. */
+  const shopApi = useShopApi();
+  const phoneFor = (id: string) => shopApi.shops.find((shop) => shop.shopId === id)?.phone ?? null;
 
   const listing = useDealerProducts(dealerId);
   const mine = listing.data.find((product) => product.canonicalProductId === canonicalProductId);
@@ -264,6 +268,14 @@ export function ProductDetailScreen({
                       <span className="block truncate text-body font-medium">
                         {dealerName(row.dealerId, row.name)}
                       </span>
+                      {phoneFor(row.dealerId) ? (
+                        <span
+                          dir="ltr"
+                          className="mt-0.5 block truncate text-caption tabular-nums text-muted-foreground"
+                        >
+                          {phoneFor(row.dealerId)}
+                        </span>
+                      ) : null}
                       <span className="mt-0.5 block text-caption text-muted-foreground">
                         {t('common.km', { km: formatNumber(row.distanceKm, locale) })}
                         {' · '}

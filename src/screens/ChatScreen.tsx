@@ -355,11 +355,17 @@ export function ChatScreen({ onBrowseDealers, onOpenDealer }: Props) {
             where the counter is, or which number to ring, should not have to leave
             the conversation to find out.
           */}
+          {/*
+            The name opens the shop's own page — the one with the number, the address
+            and the listings — not a summary sheet. A farmer who taps the name is
+            asking who this is, and the page answers it with data synced from the
+            dealer's platform.
+          */}
           <button
             type="button"
-            onClick={() => setShopInfo(true)}
+            onClick={() => (onOpenDealer ? onOpenDealer(dealerId) : setShopInfo(true))}
             className="min-w-0 flex-1 text-start"
-            aria-label={t('dealers.network.open')}
+            aria-label={t('dealer.detail.title')}
           >
             <span className="block truncate text-subheading">{nameFor(dealerId)}</span>
             {activeShopDetail.phone ? (

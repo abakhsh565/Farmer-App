@@ -1,12 +1,11 @@
 import {
   BookmarkPlus,
   Check,
-  Map,
+  Map as MapIcon,
   MessageCircle,
   Plus,
   Search,
   ShieldCheck,
-  TriangleAlert,
 } from 'lucide-react';
 import { useMemo, useState } from 'react';
 import { toast } from 'sonner';
@@ -19,7 +18,6 @@ import {
   PROFILE_AREA,
   RADIUS_OPTIONS,
   areaNameKey,
-  closingHour,
   dealerNameKey,
   tagLabel,
   type DealerTag,
@@ -27,13 +25,12 @@ import {
 import { useLocale } from '@/i18n/LocaleProvider';
 import { useLocation } from '@/location/LocationProvider';
 import type { MessageKey } from '@/i18n/catalog';
-import { formatHour, formatMoney, formatNumber, formatRelativeTime } from '@/i18n/format';
+import { formatMoney, formatNumber } from '@/i18n/format';
 import { initialsOf } from '@/lib/initials';
 import { useDealerSearch, useProductSearch } from '@/services/hooks';
 import { useShopApi } from '@/shop/ShopApiProvider';
 import { distanceKmBetween } from '@/shop/geo';
 import { ShopConnectSheet } from '@/shop/ShopRequestSheet';
-import type { DealerSummary } from '@/services/types';
 
 /**
  * Dealer discovery, under the rules the PRD locks: a radius the farmer chooses
@@ -54,6 +51,29 @@ import type { DealerSummary } from '@/services/types';
  */
 
 type FilterId = 'all' | 'open' | DealerTag;
+
+/**
+ * One shop, whichever source described it.
+ *
+ * The screen has two answers about the same shops: the dealer platform's list
+ * (a name, a number, a pin, whether this farmer is linked) and the marketplace's
+ * discovery read (verification, tags, opening hours, distance). Rendering them as
+ * two lists printed the same shop twice with different facts. This is the merge:
+ * one row per shop id, each field taken from whichever source actually has it.
+ */
+type ShopRow = {
+  id: string;
+  name: string;
+  km: number | null;
+  phone: string | null;
+  logoUrl: string | null;
+  isLinked: boolean;
+  verifiedAt: number | null;
+  openNow: boolean | null;
+  place: string | null;
+  tags: string[];
+  acceptsRequests: boolean;
+};
 
 const FILTERS: ReadonlyArray<{ id: FilterId; labelKey: MessageKey }> = [
   { id: 'all', labelKey: 'dealers.filter.all' },
@@ -123,49 +143,6 @@ export function DealersScreen({
   /* The shop being opened, so its row can say so while the platform answers. */
   const [shopBusy, setShopBusy] = useState<string | null>(null);
 
-  /*
-   * The dealer platform's shops, each with how far it is from the farmer.
-   *
-   * The coordinates come from the shop's own record, so this list works from the
-   * shop's position rather than from a product listing: a counter two kilometres
-   * away is at the top even when it has published nothing for sale.
-   */
-  const shopRows = useMemo(() => {
-    const origin = location.activePoint;
-    return shopApi.shops
-      .map((shop) => ({
-        ...shop,
-        km:
-          shop.latitude !== null && shop.longitude !== null
-            ? Number(
-                distanceKmBetween(origin, { lat: shop.latitude, lon: shop.longitude }).toFixed(1),
-              )
-            : null,
-      }))
-      .sort((a, b) => (a.km ?? Number.POSITIVE_INFINITY) - (b.km ?? Number.POSITIVE_INFINITY));
-  }, [shopApi.shops, location.activePoint]);
-
-  /*
-   * The chosen radius governs the whole screen, including the shops the dealer
-   * platform lists. Those rows used to be shown above the radius result no matter
-   * where they were — a shop 400 km away sat directly over "nothing within 25 km".
-   * Inside the radius they are results; outside it they are suggestions, named as
-   * such.
-   */
-  /*
-   * A shop with no coordinates on record has no distance, and a distance can only
-   * come from coordinates. Those rows used to be put in the "outside your radius"
-   * list, which is a claim the app cannot make — the screen then showed every
-   * dealer regardless of where it was. Now only a measured distance can qualify a
-   * shop for either list, and the suggestions are bounded by the product's maximum
-   * reach so a shop on the other side of the country is not offered as "nearby"
-   * either.
-   */
-  const shopsInRange = shopRows.filter((shop) => shop.km !== null && shop.km <= location.radiusKm);
-  const shopsBeyondRange = shopRows.filter(
-    (shop) => shop.km !== null && shop.km > location.radiusKm && shop.km <= MAX_RADIUS_KM,
-  );
-
   const openShop = async (shopId: string) => {
     setShopBusy(shopId);
     try {
@@ -176,56 +153,87 @@ export function DealersScreen({
     }
   };
 
-  /** One dealer-platform shop. Rendered in the results or in the suggestions. */
-  const shopRow = (shop: (typeof shopRows)[number]) => (
-    <li key={shop.shopId}>
-      {/*
-        The whole row opens the conversation with *that* shop, and the opening is a
-        call to the dealer's platform rather than a jump into this phone's own chat
-        store — otherwise a shop the farmer just found would receive nothing they
-        typed.
-      */}
-      <div className="flex w-full items-center gap-2 rounded-xl bg-card p-3.5">
-        {/*
-          The row opens the shop's page, the way a dealer row above it does. The
-          conversation is the round button beside it. The row used to jump straight
-          into the thread, so a shop found by area had no page at all — and the
-          page, with the listings, the hours and the visit request, is what a
-          farmer weighing a trip actually needs.
-        */}
+  /**
+   * One shop, once.
+   *
+   * The same row design on both tabs and in both lists: the shop's own mark (or
+   * its initials where it has none), its name, the number the counter is reached
+   * on, how far it is and what it carries. The row opens the shop's page; the round
+   * button beside it opens the conversation. Two separate lists used to print the
+   * same shop twice, each with half of these facts.
+   */
+  const shopRow = (shop: ShopRow) => (
+    <li key={shop.id}>
+      <div className="flex w-full items-center gap-3 rounded-xl border border-border bg-card p-3">
+        {shop.logoUrl ? (
+          <img
+            src={shop.logoUrl}
+            alt=""
+            className="size-12 shrink-0 rounded-xl object-cover"
+          />
+        ) : (
+          <span className="grid size-12 shrink-0 place-items-center rounded-xl bg-brand-soft text-subheading text-brand">
+            {initialsOf(shop.name)}
+          </span>
+        )}
+
         <button
           type="button"
-          onClick={() => onOpenDealer(shop.shopId)}
+          onClick={() => onOpenDealer(shop.id)}
           className="min-w-0 flex-1 text-start"
         >
-          <p className="truncate text-body font-medium">{shop.name}</p>
+          <span className="flex items-center gap-1.5">
+            <span className="truncate text-body font-medium">{shop.name}</span>
+            {shop.verifiedAt !== null ? (
+              <ShieldCheck className="size-3.5 shrink-0 text-brand" aria-hidden />
+            ) : null}
+          </span>
+
           {shop.phone ? (
-            <p dir="ltr" className="mt-0.5 truncate text-caption tabular-nums text-muted-foreground">
+            <span
+              dir="ltr"
+              className="mt-0.5 block truncate text-caption tabular-nums text-muted-foreground"
+            >
               {shop.phone}
-            </p>
+            </span>
           ) : null}
-          <p className="mt-0.5 truncate text-caption text-muted-foreground">
-            {shopBusy === shop.shopId
+
+          <span className="mt-0.5 block truncate text-caption text-muted-foreground">
+            {shopBusy === shop.id
               ? t('chat.loading')
               : [
                   shop.km !== null ? t('common.km', { km: shop.km }) : null,
                   shop.isLinked
                     ? t('dealers.network.connected')
-                    : (shop.locationLabel ?? shop.city ?? t('dealers.network.listed')),
+                    : (shop.place ?? t('dealers.network.listed')),
                 ]
                   .filter(Boolean)
                   .join(' · ')}
-          </p>
+          </span>
+
+          {shop.tags.length > 0 ? (
+            <span className="mt-1.5 inline-flex items-center gap-1 rounded-sm bg-amber-50 px-2 py-1 text-caption text-amber-700 dark:bg-amber-500/20 dark:text-amber-100">
+              <Check className="size-3 shrink-0" aria-hidden />
+              {t('dealers.carries', {
+                tag: tagLabel(shop.tags[0] ?? '')
+                  ? t(tagLabel(shop.tags[0] ?? '') as MessageKey)
+                  : (shop.tags[0] ?? ''),
+              })}
+            </span>
+          ) : null}
         </button>
-        <button
-          type="button"
-          disabled={shopBusy !== null}
-          onClick={() => void openShop(shop.shopId)}
-          aria-label={t('dealers.network.open')}
-          className="grid size-10 shrink-0 place-items-center rounded-full bg-muted disabled:opacity-60"
-        >
-          <MessageCircle className="size-4" aria-hidden />
-        </button>
+
+        {shop.acceptsRequests ? (
+          <button
+            type="button"
+            disabled={shopBusy !== null}
+            onClick={() => void openShop(shop.id)}
+            aria-label={t('dealers.chatAria', { name: shop.name })}
+            className="grid size-11 shrink-0 place-items-center rounded-full bg-muted disabled:opacity-60"
+          >
+            <MessageCircle className="size-5" aria-hidden />
+          </button>
+        ) : null}
       </div>
     </li>
   );
@@ -279,6 +287,64 @@ export function DealersScreen({
     locationReady,
   );
 
+  /**
+   * Every shop the screen can name, merged from both sources by shop id.
+   *
+   * The dealer platform is authoritative for identity and contact details (name,
+   * number, logo, pin, whether this farmer is linked); the marketplace is
+   * authoritative for what the shop published (verification, tags, opening hours,
+   * whether it takes requests). A shop that exists only in one source stays in the
+   * list — that is the difference between "no shop exists" and "no shop has priced
+   * anything yet" — but no shop is ever printed twice.
+   */
+  const shops = useMemo<ShopRow[]>(() => {
+    const origin = location.activePoint;
+    const merged = new Map<string, ShopRow>();
+
+    for (const shop of shopApi.shops) {
+      merged.set(shop.shopId, {
+        id: shop.shopId,
+        name: shop.name,
+        km:
+          shop.latitude !== null && shop.longitude !== null
+            ? Number(
+                distanceKmBetween(origin, { lat: shop.latitude, lon: shop.longitude }).toFixed(1),
+              )
+            : null,
+        phone: shop.phone,
+        logoUrl: shop.logoUrl,
+        isLinked: shop.isLinked,
+        verifiedAt: null,
+        openNow: null,
+        place: shop.locationLabel ?? shop.city,
+        tags: [],
+        acceptsRequests: true,
+      });
+    }
+
+    for (const entry of search.data) {
+      const existing = merged.get(entry.id);
+      const key = dealerNameKey(entry.id);
+      merged.set(entry.id, {
+        id: entry.id,
+        name: existing?.name || (key ? t(key) : entry.name),
+        km: existing?.km ?? entry.distanceKm,
+        phone: existing?.phone ?? entry.phone ?? null,
+        logoUrl: existing?.logoUrl ?? null,
+        isLinked: existing?.isLinked ?? entry.isYourDealer ?? false,
+        verifiedAt: entry.verifiedAt,
+        openNow: entry.openNow ?? null,
+        place: existing?.place ?? entry.address ?? null,
+        tags: [...entry.tags],
+        acceptsRequests: entry.isAcceptingRequests,
+      });
+    }
+
+    return [...merged.values()].sort(
+      (a, b) => (a.km ?? Number.POSITIVE_INFINITY) - (b.km ?? Number.POSITIVE_INFINITY),
+    );
+  }, [shopApi.shops, search.data, location.activePoint, t]);
+
   /*
    * The product half of the shop. No keyword: this tab is the shelf itself —
    * every listing the shops near the farmer have actually sent, with that
@@ -295,14 +361,20 @@ export function DealersScreen({
     locationReady && shopSection === 'products',
   );
 
-  const allRows =
-    filter === 'open'
-      ? search.data.filter((dealer) => dealer.openNow === true)
-      : search.data;
+  /*
+   * The chosen filter, applied once to the merged list. A shop known only to the
+   * platform has published no tags, so it cannot claim to stock a category; it is
+   * left out of a category filter rather than shown without evidence.
+   */
+  const filteredShops = shops.filter((shop) => {
+    if (filter === 'open') return shop.openNow === true;
+    if (filter === 'all') return true;
+    return shop.tags.includes(filter);
+  });
 
   /* Inside the radius the farmer chose — the only rows that may be called results. */
-  const rows = allRows.filter(
-    (dealer) => dealer.distanceKm === null || dealer.distanceKm <= location.radiusKm,
+  const rows = filteredShops.filter(
+    (shop) => shop.km !== null && shop.km <= location.radiusKm,
   );
 
   /*
@@ -311,20 +383,12 @@ export function DealersScreen({
    * The default radius is small and most places have no dealer inside it, so the
    * honest answer to "within 10 km" used to be an empty screen — which a farmer
    * reads as "this app is broken", not as "widen the search". These rows come from
-   * the same read as the results and are labelled with the reach that produced
-   * them, so the screen never says "within 10 km" above a shop 70 km away.
+   * the same merged list as the results and are labelled with the reach that
+   * produced them, so the screen never says "within 10 km" above a shop 70 km away.
    */
-  const widerRows =
-    filter === 'open'
-      ? allRows.filter(
-          (dealer) =>
-            dealer.openNow === true &&
-            dealer.distanceKm !== null &&
-            dealer.distanceKm > location.radiusKm,
-        )
-      : allRows.filter(
-          (dealer) => dealer.distanceKm !== null && dealer.distanceKm > location.radiusKm,
-        );
+  const widerRows = filteredShops.filter(
+    (shop) => shop.km !== null && shop.km > location.radiusKm && shop.km <= MAX_RADIUS_KM,
+  );
   const showsWider = rows.length === 0 && widerRows.length > 0;
   const listRows = showsWider ? widerRows : rows;
   const listKm = showsWider ? MAX_RADIUS_KM : location.radiusKm;
@@ -336,11 +400,6 @@ export function DealersScreen({
    */
   const searchFailed = search.status === 'ready' && search.sourced?.status === 'failing';
   const productsFailed = products.status === 'ready' && products.sourced?.status === 'failing';
-
-  const dealerName = (entry: DealerSummary) => {
-    const key = dealerNameKey(entry.id);
-    return key ? t(key) : entry.name;
-  };
 
   /** The same naming rule for a row that only carries a dealer id. */
   const dealerLabel = (id: string, fallback: string) => {
@@ -463,35 +522,6 @@ export function DealersScreen({
         })}
       </ul>
 
-      {/*
-        The shops the dealer platform itself lists, above the radius result.
-
-        The list below is built from *listings*, so a shop that has joined the
-        dealer app but has published no product is invisible there even though it
-        exists and can be messaged. Those shops are exactly what `farmer_api_shops`
-        answers, and showing them here is the difference between "no shop exists"
-        and "no shop has priced anything yet".
-      */}
-      {shopsInRange.length > 0 || shopsBeyondRange.length > 0 ? (
-        <section className="mt-4" aria-label={t('dealers.network')}>
-          {shopsInRange.length > 0 ? (
-            <>
-              <SectionLabel>{t('dealers.network')}</SectionLabel>
-              <ul className="mt-2 space-y-2">{shopsInRange.map(shopRow)}</ul>
-            </>
-          ) : null}
-
-          {shopsBeyondRange.length > 0 ? (
-            <>
-              <SectionLabel className="mt-4">
-                {t('dealers.network.outside', { km: location.radiusKm })}
-              </SectionLabel>
-              <ul className="mt-2 space-y-2">{shopsBeyondRange.map(shopRow)}</ul>
-            </>
-          ) : null}
-        </section>
-      ) : null}
-
       {search.status === 'loading' ? <LoadingState label={t('rates.loading')} /> : null}
 
       {search.status === 'error' ? (
@@ -512,7 +542,7 @@ export function DealersScreen({
         />
       ) : null}
 
-      {search.status === 'ready' && !searchFailed ? (
+      {!searchFailed ? (
         <>
           {showsWider ? (
             <p className="mt-3 text-label text-muted-foreground">
@@ -548,99 +578,7 @@ export function DealersScreen({
             />
           ) : null}
 
-          <ul className="mt-2 space-y-2.5">
-            {listRows.map((entry) => {
-              const name = dealerName(entry);
-              const verified = entry.verifiedAt !== null;
-              const hour = closingHour(entry.id);
-              return (
-                <li
-                  key={entry.id}
-                  className={`flex items-center gap-3 rounded-lg border border-border bg-card p-3 ${
-                    entry.isAcceptingRequests ? '' : 'opacity-60'
-                  }`}
-                >
-                  <span
-                    className={`grid size-12 shrink-0 place-items-center rounded-md text-subheading ${
-                      verified ? 'bg-brand-soft text-brand' : 'bg-muted text-muted-foreground'
-                    }`}
-                  >
-                    {initialsOf(name)}
-                  </span>
-
-                  {/* The row body opens the profile; the chat button stays its own
-                      control, so a tap on either does exactly one thing. */}
-                  <button
-                    type="button"
-                    onClick={() => onOpenDealer(entry.id)}
-                    className="min-w-0 flex-1 text-start"
-                  >
-                    <span className="flex flex-wrap items-center gap-1.5">
-                      <span className="truncate text-body font-medium">{name}</span>
-                      {verified ? (
-                        <span className="inline-flex items-center gap-1 rounded-full bg-brand-soft px-2 py-0.5 text-caption font-medium text-brand">
-                          <ShieldCheck className="size-3" aria-hidden />
-                          {t('dealers.verified')}
-                        </span>
-                      ) : null}
-                    </span>
-
-                    <span className="mt-1 block truncate text-label text-muted-foreground">
-                      {[
-                        entry.isYourDealer ? t('dealers.yourDealer') : null,
-                        t('common.km', { km: formatNumber(entry.distanceKm, locale) }),
-                        entry.openNow === true && hour !== null
-                          ? t('dealers.openTill', { time: formatHour(hour, t) })
-                          : entry.openNow === false && hour !== null
-                            ? t('dealers.closedOpens', { time: formatHour(hour, t) })
-                            : (entry.openingHours ?? null),
-                      ]
-                        .filter(Boolean)
-                        .join(' · ')}
-                    </span>
-
-                    {entry.tags.length > 0 ? (
-                      <span className="mt-1.5 inline-flex items-center gap-1 rounded-sm bg-amber-50 px-2 py-1 text-caption text-amber-700 dark:bg-amber-500/20 dark:text-amber-100">
-                        <Check className="size-3 shrink-0" aria-hidden />
-                        {t('dealers.carries', {
-                          tag: tagLabel(entry.tags[0] ?? '')
-                            ? t(tagLabel(entry.tags[0] ?? '') as MessageKey)
-                            : (entry.tags[0] ?? ''),
-                        })}
-                      </span>
-                    ) : null}
-
-                    {entry.syncState !== 'fresh' ? (
-                      <span className="mt-1.5 flex items-center gap-1 text-caption text-amber-700 dark:text-amber-100">
-                        <TriangleAlert className="size-3 shrink-0" aria-hidden />
-                        {entry.syncedAt !== null
-                          ? t(
-                              entry.syncState === 'unreachable'
-                                ? 'dealer.sync.unreachable'
-                                : 'dealer.sync.stale',
-                              { age: formatRelativeTime(entry.syncedAt, Date.now(), t) },
-                            )
-                          : t('dealer.sync.stale', { age: '—' })}
-                      </span>
-                    ) : null}
-                  </button>
-
-                  {entry.isAcceptingRequests ? (
-                    <button
-                      type="button"
-                      onClick={() => onOpenChat(entry.id)}
-                      aria-label={t('dealers.chatAria', { name })}
-                      className={`grid size-11 shrink-0 place-items-center rounded-full ${
-                        entry.isYourDealer ? 'bg-brand text-brand-foreground' : 'bg-muted'
-                      }`}
-                    >
-                      <MessageCircle className="size-5" aria-hidden />
-                    </button>
-                  ) : null}
-                </li>
-              );
-            })}
-          </ul>
+          <ul className="mt-2 space-y-2.5">{listRows.map(shopRow)}</ul>
         </>
       ) : null}
         </>
@@ -835,7 +773,7 @@ function SearchSettingsSheet({
               it. Composed from two icons rather than shipped as an image, so it
               inherits the theme's colour in both themes. */}
           <span className="relative grid size-5 place-items-center">
-            <Map className="size-5" aria-hidden />
+            <MapIcon className="size-5" aria-hidden />
             <ShieldCheck
               className="absolute -bottom-1 -end-1 size-3.5 rounded-full bg-muted"
               aria-hidden
