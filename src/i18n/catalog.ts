@@ -274,6 +274,7 @@ export const en = {
 
   // ── dealers ──────────────────────────────────────────────────────────────
   'dealers.title': 'Shop',
+  'dealers.live': 'Live',
   'dealers.network': 'On the dealer app',
   'dealers.network.outside': 'Nearest on the dealer app — outside your {km} km',
   'dealers.network.open': 'Open conversation',
@@ -345,6 +346,7 @@ export const en = {
   'chat.voice.unavailable': 'This device cannot record a voice message.',
   'chat.voice.label': 'Voice message',
   'chat.photo.send': 'Send a photo',
+  'chat.photo.pick': 'Choose a photo from the gallery',
   'chat.photo.label': 'Photo',
   'chat.photo.tooLarge': 'That photo is too large to send. Try a smaller one.',
   'chat.photo.unsupported': 'This phone cannot send that kind of picture.',
@@ -1804,6 +1806,7 @@ export const ur: Record<MessageKey, string> = {
   'crop.onion': 'پیاز',
 
   'dealers.title': 'دکان',
+  'dealers.live': 'براہِ راست',
   'dealers.network': 'ڈیلر ایپ اُتے',
   'dealers.network.outside': 'ڈیلر ایپ اُتے قریب ترین — آپ کے {km} کلومیٹر سے باہر',
   'dealers.network.open': 'گل بات کھولو',
@@ -1868,6 +1871,7 @@ export const ur: Record<MessageKey, string> = {
   'chat.voice.unavailable': 'یہ فون آواز کا پیغام ریکارڈ نہیں کر سکتا۔',
   'chat.voice.label': 'آواز کا پیغام',
   'chat.photo.send': 'تصویر بھیجیں',
+  'chat.photo.pick': 'گیلری سے تصویر منتخب کریں',
   'chat.photo.label': 'تصویر',
   'chat.photo.tooLarge': 'یہ تصویر بھیجنے کے لیے بہت بڑی ہے۔ چھوٹی تصویر منتخب کریں۔',
   'chat.photo.unsupported': 'یہ فون اس قسم کی تصویر نہیں بھیج سکتا۔',

@@ -182,7 +182,7 @@ function toDealerProduct(row: MarketplaceListing): DealerProduct {
 
 export class MarketplaceDealerProvider implements DealerProvider {
   readonly name = 'Live marketplace';
-  readonly maxRadiusKm = 100 as const;
+  readonly maxRadiusKm = 150 as const;
 
   constructor(private readonly source: MarketplaceConfig = serviceConfig.marketplace) {}
 

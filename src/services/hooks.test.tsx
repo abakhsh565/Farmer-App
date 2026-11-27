@@ -99,7 +99,7 @@ describe('a live dealer list', () => {
     expect(result.current.data).toEqual([before]);
 
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(5000);
+      await vi.advanceTimersByTimeAsync(1000);
     });
 
     expect(search).toHaveBeenCalledTimes(2);
@@ -120,7 +120,7 @@ describe('a live dealer list', () => {
 
     Object.defineProperty(document, 'visibilityState', { value: 'hidden', configurable: true });
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(15_000);
+      await vi.advanceTimersByTimeAsync(5_000);
     });
     expect(search).toHaveBeenCalledTimes(1);
 

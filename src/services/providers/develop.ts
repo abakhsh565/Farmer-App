@@ -595,7 +595,7 @@ const DEALER_FIXTURE: readonly DealerFixture[] = [
    * testable from the top — at the maximum radius the list must still not contain
    * it, which is only provable if there is something on the other side of the line.
    */
-  { id: 'dealer.farMandi', name: 'Far Mandi Depot', point: atDistanceKm(112, 0.99), tags: ['fertilizer'], verifiedDaysAgo: 30, openingHours: '9am – 7pm', hours: [9, 19], accepting: true, syncState: 'fresh', syncedHoursAgo: 1, address: 'Mandi Road, Gujrat', phone: '+92 300 1122334', about: 'Bulk fertiliser depot on the Gujrat mandi road, beyond the app’s search ceiling.', establishedYear: 2003 },
+  { id: 'dealer.farMandi', name: 'Far Mandi Depot', point: atDistanceKm(162, 0.99), tags: ['fertilizer'], verifiedDaysAgo: 30, openingHours: '9am – 7pm', hours: [9, 19], accepting: true, syncState: 'fresh', syncedHoursAgo: 1, address: 'Mandi Road, Gujrat', phone: '+92 300 1122334', about: 'Bulk fertiliser depot on the Gujrat mandi road, beyond the app’s search ceiling.', establishedYear: 2003 },
 ];
 
 const DEALER_PRODUCTS: Readonly<Record<string, readonly DealerProduct[]>> = {
@@ -628,7 +628,7 @@ const DEALER_PRODUCTS: Readonly<Record<string, readonly DealerProduct[]>> = {
 
 export class DevelopmentDealerProvider implements DealerProvider {
   readonly name = 'Development dealer directory';
-  readonly maxRadiusKm = 100 as const;
+  readonly maxRadiusKm = 150 as const;
 
   constructor(
     private readonly now: () => number = Date.now,

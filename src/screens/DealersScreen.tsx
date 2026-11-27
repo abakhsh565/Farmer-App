@@ -238,7 +238,16 @@ export function DealersScreen({
 
   const search = useDealerSearch(
     {
-      radiusKm: location.radiusKm,
+      /*
+       * One read covers both halves of the screen.
+       *
+       * The list used to ask once for the chosen radius and again for the wider
+       * "nearest outside it" answer, which doubled every poll and could print the
+       * two from different moments. The server already reports each shop's own
+       * distance, so a single read at the maximum reach answers both questions at
+       * once — and the in-radius filter below uses that distance, not a guess.
+       */
+      radiusKm: MAX_RADIUS_KM,
       origin: searchOrigin,
       tags: filter === 'all' || filter === 'open' ? undefined : [filter],
     },
@@ -257,30 +266,40 @@ export function DealersScreen({
       origin: searchOrigin,
       query: '',
     },
-    locationReady,
+    /* Only the visible half of the screen spends a request per second. */
+    locationReady && shopSection === 'products',
   );
 
-  const rows =
+  const allRows =
     filter === 'open'
       ? search.data.filter((dealer) => dealer.openNow === true)
       : search.data;
+
+  /* Inside the radius the farmer chose — the only rows that may be called results. */
+  const rows = allRows.filter(
+    (dealer) => dealer.distanceKm === null || dealer.distanceKm <= location.radiusKm,
+  );
 
   /*
    * The nearest shops when the chosen radius has none.
    *
    * The default radius is small and most places have no dealer inside it, so the
    * honest answer to "within 10 km" used to be an empty screen — which a farmer
-   * reads as "this app is broken", not as "widen the search". The wider query only
-   * runs when the chosen one came back empty, and its rows are labelled with the
-   * radius that produced them, so the screen never says "within 10 km" above a shop
-   * 70 km away.
+   * reads as "this app is broken", not as "widen the search". These rows come from
+   * the same read as the results and are labelled with the reach that produced
+   * them, so the screen never says "within 10 km" above a shop 70 km away.
    */
-  const wider = useDealerSearch(
-    { radiusKm: MAX_RADIUS_KM, origin: searchOrigin, tags: filter === 'all' || filter === 'open' ? undefined : [filter] },
-    locationReady && search.status === 'ready' && rows.length === 0 && location.radiusKm < MAX_RADIUS_KM,
-  );
   const widerRows =
-    filter === 'open' ? wider.data.filter((dealer) => dealer.openNow === true) : wider.data;
+    filter === 'open'
+      ? allRows.filter(
+          (dealer) =>
+            dealer.openNow === true &&
+            dealer.distanceKm !== null &&
+            dealer.distanceKm > location.radiusKm,
+        )
+      : allRows.filter(
+          (dealer) => dealer.distanceKm !== null && dealer.distanceKm > location.radiusKm,
+        );
   const showsWider = rows.length === 0 && widerRows.length > 0;
   const listRows = showsWider ? widerRows : rows;
   const listKm = showsWider ? MAX_RADIUS_KM : location.radiusKm;
@@ -307,7 +326,18 @@ export function DealersScreen({
   return (
     <div className="flex flex-col px-4 pt-4 pb-4">
       <header className="flex items-center justify-between gap-3">
-        <h1 className="text-title">{t('dealers.title')}</h1>
+        <div className="flex min-w-0 items-center gap-2">
+          <h1 className="text-title">{t('dealers.title')}</h1>
+          {/*
+            A quiet truth, not decoration: this list re-reads at least once a second
+            while it is on screen. Saying so is what stops a farmer pulling to
+            refresh a screen that is already current.
+          */}
+          <span className="inline-flex shrink-0 items-center gap-1.5 rounded-full bg-brand-soft px-2 py-0.5 text-caption font-medium text-brand">
+            <span className="size-1.5 animate-pulse rounded-full bg-brand" aria-hidden />
+            {t('dealers.live')}
+          </span>
+        </div>
         <div className="flex shrink-0 items-center gap-2">
           {/*
             The manual way in, exactly where a farmer looks for "add": on the

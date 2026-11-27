@@ -373,7 +373,7 @@ const PRODUCT_SEARCH_SHOP_LIMIT = 8;
 
 export class SupabaseDealerProvider implements DealerProvider {
   readonly name = 'Supabase dealer projection';
-  readonly maxRadiusKm = 100 as const;
+  readonly maxRadiusKm = 150 as const;
 
   async search(query: DealerSearchQuery): Promise<Sourced<DealerSummary[]>> {
     const client = await supabase();

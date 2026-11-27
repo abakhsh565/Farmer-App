@@ -1,4 +1,15 @@
-import { Camera, CheckCheck, ChevronLeft, ChevronRight, MessageCircle, Mic, Search, Send, ShieldCheck } from 'lucide-react';
+import {
+  Camera,
+  CheckCheck,
+  ChevronLeft,
+  ChevronRight,
+  Image as ImageIcon,
+  MessageCircle,
+  Mic,
+  Search,
+  Send,
+  ShieldCheck,
+} from 'lucide-react';
 import { useMemo, useRef, useState } from 'react';
 import { EmptyState, LoadingState } from '@/components/States';
 import { Button } from '@/components/ui/button';
@@ -62,6 +73,9 @@ export function ChatScreen({ onBrowseDealers }: Props) {
   const recorderMessage = useRecorderFailureText(recorder.failure);
   const [photoError, setPhotoError] = useState<string | null>(null);
   const photoInput = useRef<HTMLInputElement | null>(null);
+  /* The gallery is a second door on purpose: `capture` forces the camera, and a
+     farmer who already has the photo should not have to retake it. */
+  const galleryInput = useRef<HTMLInputElement | null>(null);
 
   /**
    * The shop's name, which on the live source comes from the shop, not a catalogue.
@@ -418,75 +432,106 @@ export function ChatScreen({ onBrowseDealers }: Props) {
           />
         ) : (
         <form
-          className="flex items-end gap-2 border-t border-border p-3"
+          className="border-t border-border p-3"
           onSubmit={(event) => {
             event.preventDefault();
             send();
           }}
         >
-          <label className="sr-only" htmlFor="chat-composer">
-            {t('chat.placeholder')}
-          </label>
-          <textarea
-            id="chat-composer"
-            rows={1}
-            value={draft}
-            onChange={(event) => setDraft(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === 'Enter' && !event.shiftKey) {
-                event.preventDefault();
-                send();
-              }
-            }}
-            placeholder={t('chat.placeholder')}
-            className="max-h-28 min-h-11 flex-1 resize-none rounded-md bg-muted px-3.5 py-3 text-body placeholder:text-muted-foreground focus-visible:outline-none"
-          />
-          {chat.live && shop.mediaSupported ? (
-            <>
-              {/* One media door for two kinds of file, so the camera appears exactly when
-                  the microphone does: a shop that cannot take a recording cannot take a
-                  picture either. */}
-              <input
-                ref={photoInput}
-                type="file"
-                accept="image/jpeg,image/png,image/webp"
-                capture="environment"
-                className="sr-only"
-                onChange={(event) => {
-                  const file = event.target.files?.[0];
-                  /* Reset first: choosing the same photo twice must send it twice, not
-                     do nothing because the input's value has not changed. */
-                  event.target.value = '';
-                  if (file) sendPhoto(file);
-                }}
-              />
-              <Button
-                type="button"
-                variant="outline"
-                size="icon"
-                className="size-11 shrink-0 rounded-full"
-                aria-label={t('chat.photo.send')}
-                onClick={() => photoInput.current?.click()}
-              >
-                <Camera className="size-4" aria-hidden />
-              </Button>
-              {voiceRecordingSupported() ? (
-                <Button
+          {/* The same composer as the assistant: one bordered pill, the media doors
+              inside it on the left, send on the right. It stays the same in every
+              dealer conversation, whether the shop takes media or not — only the
+              doors disappear, never the shape. */}
+          <div className="flex items-end gap-1 rounded-lg border border-border bg-card px-1.5 py-1.5">
+            <label className="sr-only" htmlFor="chat-composer">
+              {t('chat.placeholder')}
+            </label>
+
+            {chat.live && shop.mediaSupported ? (
+              <>
+                <input
+                  ref={photoInput}
+                  type="file"
+                  accept="image/jpeg,image/png,image/webp"
+                  capture="environment"
+                  className="sr-only"
+                  onChange={(event) => {
+                    const file = event.target.files?.[0];
+                    event.target.value = '';
+                    if (file) sendPhoto(file);
+                  }}
+                />
+                <button
                   type="button"
-                  variant="outline"
-                  size="icon"
-                  className="size-11 shrink-0 rounded-full"
-                  aria-label={t('chat.voice.record')}
-                  onClick={() => void recorder.start()}
+                  onClick={() => photoInput.current?.click()}
+                  aria-label={t('chat.photo.send')}
+                  className="grid size-9 shrink-0 place-items-center rounded-full text-muted-foreground"
                 >
-                  <Mic className="size-4" aria-hidden />
-                </Button>
-              ) : null}
-            </>
-          ) : null}
-          <Button type="submit" size="icon" className="size-11 shrink-0 rounded-full" aria-label={t('chat.send')}>
-            <Send className="size-4 rtl:rotate-180" aria-hidden />
-          </Button>
+                  <Camera className="size-5" aria-hidden />
+                </button>
+
+                {/* The camera opens the camera; this one opens the gallery. Both are
+                    needed: a farmer photographing a leaf and a farmer sending a photo
+                    the shop already sent them take different paths in. */}
+                <input
+                  ref={galleryInput}
+                  type="file"
+                  accept="image/jpeg,image/png,image/webp"
+                  className="sr-only"
+                  onChange={(event) => {
+                    const file = event.target.files?.[0];
+                    event.target.value = '';
+                    if (file) sendPhoto(file);
+                  }}
+                />
+                <button
+                  type="button"
+                  onClick={() => galleryInput.current?.click()}
+                  aria-label={t('chat.photo.pick')}
+                  className="grid size-9 shrink-0 place-items-center rounded-full text-muted-foreground"
+                >
+                  <ImageIcon className="size-5" aria-hidden />
+                </button>
+              </>
+            ) : null}
+
+            <textarea
+              id="chat-composer"
+              rows={1}
+              value={draft}
+              onChange={(event) => setDraft(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' && !event.shiftKey) {
+                  event.preventDefault();
+                  send();
+                }
+              }}
+              placeholder={t('chat.placeholder')}
+              className="max-h-28 min-h-9 flex-1 resize-none bg-transparent px-1.5 py-1.5 text-body placeholder:text-muted-foreground focus-visible:outline-none"
+            />
+
+            {chat.live && shop.mediaSupported && voiceRecordingSupported() ? (
+              <button
+                type="button"
+                onClick={() => void recorder.start()}
+                aria-label={t('chat.voice.record')}
+                aria-pressed={recorder.status !== 'idle'}
+                className="grid size-9 shrink-0 place-items-center rounded-full text-muted-foreground"
+              >
+                <Mic className="size-5" aria-hidden />
+              </button>
+            ) : null}
+
+            <Button
+              type="submit"
+              size="icon"
+              className="size-9 shrink-0 rounded-full"
+              aria-label={t('chat.send')}
+              disabled={draft.trim().length === 0}
+            >
+              <Send className="size-4 rtl:rotate-180" aria-hidden />
+            </Button>
+          </div>
         </form>
         )}
 
