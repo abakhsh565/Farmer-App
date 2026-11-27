@@ -27,7 +27,7 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { PROFILE_POINT } from '@/data/dealers';
+import { MAX_RADIUS_KM, PROFILE_POINT } from '@/data/dealers';
 import { onCatalogChange } from './catalogRealtime';
 import { useServices, type Services } from './registry';
 import type {
@@ -391,7 +391,10 @@ export function useDealer(
        * function raised instead of answering, so every shop opened from a guest's
        * list said it was "not in range".
        */
-      const found = await services.dealer.search({ radiusKm: 100, origin });
+      /* The same reach as the list that opened it. It was hard-coded to 100 km, so a
+         shop found at 106 km opened onto "this shop is not in range" — the list and
+         the page disagreeing about the same record. */
+      const found = await services.dealer.search({ radiusKm: MAX_RADIUS_KM, origin });
       return { ...found, data: found.data.find((dealer) => dealer.id === dealerId) ?? null };
     },
     /* An empty id means "no shop in play" — a product page opened without one
