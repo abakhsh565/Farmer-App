@@ -1,4 +1,4 @@
-import { renderHook, waitFor } from '@testing-library/react';
+import { act, renderHook, waitFor } from '@testing-library/react';
 import type { ReactNode } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 import { useDealerSearch } from './hooks';
@@ -62,6 +62,79 @@ function setup(first: DealerSummary[], second: DealerSummary[]) {
 
   return { ...hook, search, release: () => releaseSecond?.() };
 }
+
+function live(answers: DealerSummary[][]) {
+  const search = vi.fn();
+  for (const answer of answers) search.mockResolvedValueOnce(sourced(answer));
+  const services = {
+    dealer: { name: 'test', maxRadiusKm: 100, search },
+  } as unknown as Services;
+  const wrapper = ({ children }: { children: ReactNode }) => (
+    <ServicesProvider services={services}>{children}</ServicesProvider>
+  );
+  const hook = renderHook(
+    () => useDealerSearch({ radiusKm: 100, origin: { lat: 31.5, lon: 74.3 } }),
+    { wrapper },
+  );
+  return { ...hook, search };
+}
+
+/**
+ * The farmer does not press refresh.
+ *
+ * A dealer opening a branch or approving a product changes the answer, and the
+ * answer is replaced on its own — in place, with no loading state, because a list
+ * that blinks every few seconds is worse than one that updates quietly.
+ */
+describe('a live dealer list', () => {
+  it('replaces the shops on its own, and never shows a loading state over them', async () => {
+    vi.useFakeTimers();
+    const before = shop('a', 12);
+    const after = shop('b', 30);
+    const { result, search } = live([[before], [after]]);
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(result.current.data).toEqual([before]);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5000);
+    });
+
+    expect(search).toHaveBeenCalledTimes(2);
+    expect(result.current.data).toEqual([after]);
+    expect(result.current.status).toBe('ready');
+    expect(result.current.refreshing).toBe(false);
+    vi.useRealTimers();
+  });
+
+  it('stands still while the page is hidden, and reads again when it comes back', async () => {
+    vi.useFakeTimers();
+    const { result, search } = live([[shop('a', 12)], [shop('b', 30)]]);
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(result.current.data).toHaveLength(1);
+
+    Object.defineProperty(document, 'visibilityState', { value: 'hidden', configurable: true });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(15_000);
+    });
+    expect(search).toHaveBeenCalledTimes(1);
+
+    Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true });
+    await act(async () => {
+      document.dispatchEvent(new Event('visibilitychange'));
+      await Promise.resolve();
+    });
+
+    expect(search).toHaveBeenCalledTimes(2);
+    expect(result.current.data).toEqual([shop('b', 30)]);
+    vi.useRealTimers();
+  });
+});
 
 describe('useDealerSearch', () => {
   it('drops the old radius answer instead of showing it under the new radius', async () => {

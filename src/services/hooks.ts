@@ -59,11 +59,26 @@ export type Resource<T> = {
 
 const EMPTY: readonly never[] = [];
 
+/**
+ * How soon a live read asks again.
+ *
+ * The dealer's catalogue lives in the dealer platform, a different project that the
+ * Farmer App cannot make emit events; every read of it is a live request. So "a
+ * dealer approved something" reaches the farmer by asking again, and the only
+ * question is how often. Five seconds is the cadence the connected-shop thread
+ * already uses: fast enough that a change looks automatic, slow enough that a phone
+ * on mobile data is not doing a request a second. It never runs while the page is
+ * hidden or the phone is offline.
+ */
+const LIVE_REFRESH_MS = 5000;
+
 function useResource<T>(
   key: string,
   empty: T,
   load: (services: Services) => Promise<Sourced<T>>,
   enabled = true,
+  /** Keep the answer current on its own, for a read whose source can change. */
+  live = false,
 ): Resource<T> {
   const services = useServices();
   const [attempt, setAttempt] = useState(0);
@@ -86,6 +101,10 @@ function useResource<T>(
      changes every render. */
   const loadRef = useRef(load);
   loadRef.current = load;
+
+  /** The request on screen, readable from a callback that started earlier. */
+  const keyRef = useRef(key);
+  keyRef.current = key;
 
   useEffect(() => {
     if (!enabled) {
@@ -117,6 +136,66 @@ function useResource<T>(
       cancelled = true;
     };
   }, [key, attempt, enabled, services]);
+
+  /*
+   * Keeping a live read current.
+   *
+   * This is deliberately not a second source of truth: it runs the same `load` as
+   * the first read, so there is one definition of "what is near the farmer". What it
+   * adds is timing — the answer is replaced in place (no loading state, no blank
+   * list) as soon as the source says something different, and it stands still while
+   * the page is hidden or the phone is offline.
+   *
+   * An answer is applied only if it still belongs to the request on screen: a tick
+   * that was in flight when the radius changed must not paint the old radius's shops
+   * under the new heading — the same rule the first read follows.
+   */
+  useEffect(() => {
+    if (!enabled || !live) return;
+    let stopped = false;
+    let inFlight = false;
+
+    const revalidate = async () => {
+      if (stopped || inFlight) return;
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+      if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+
+      const asked = keyRef.current;
+      inFlight = true;
+      try {
+        const result = await loadRef.current(services);
+        if (stopped || keyRef.current !== asked) return;
+        setSourcedState({ key: asked, value: result });
+        setError(null);
+        setLoadedAt(Date.now());
+      } catch {
+        /* A failed background read leaves the last answer alone: a shop the farmer
+           could still walk to is better than an empty screen, and the next tick — or
+           the reconnect — tries again. The first read is what reports a failure. */
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    const timer = window.setInterval(() => void revalidate(), LIVE_REFRESH_MS);
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') void revalidate();
+    };
+    /* Coming back to the app, and coming back onto the network, are the two moments
+       the answer is certainly stale — so neither waits for the next tick. */
+    const onOnline = () => void revalidate();
+    document.addEventListener('visibilitychange', onVisible);
+    window.addEventListener('focus', onVisible);
+    window.addEventListener('online', onOnline);
+
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('focus', onVisible);
+      window.removeEventListener('online', onOnline);
+    };
+  }, [enabled, live, services]);
 
   const retry = useCallback(() => setAttempt((value) => value + 1), []);
 
@@ -212,6 +291,9 @@ export function useDealerSearch(
         origin,
       }),
     enabled,
+    /* A dealer opening a branch or approving a product is a change the list has to
+       show without the farmer doing anything. */
+    true,
   );
 }
 
@@ -239,6 +321,7 @@ export function useProductSearch(
     EMPTY as unknown as ProductHit[],
     (services) => services.dealer.searchProducts({ radiusKm, query: text, origin }),
     enabled,
+    true,
   );
 }
 
@@ -273,6 +356,7 @@ export function useDealer(
     /* An empty id means "no shop in play" — a product page opened without one
        must not spend a request asking the service who it is. */
     dealerId.length > 0,
+    true,
   );
 }
 
@@ -282,6 +366,8 @@ export function useDealerProducts(dealerId: string | null): Resource<DealerProdu
     EMPTY as unknown as DealerProduct[],
     (services) => services.dealer.products(dealerId as string),
     dealerId !== null,
+    /* The shelf changes while the farmer is standing in front of it. */
+    true,
   );
 }
 
@@ -309,5 +395,7 @@ export function useStockists(
     key,
     EMPTY as unknown as DealerStockist[],
     (services) => services.dealer.stockists({ canonicalProductId, radiusKm, origin }),
+    true,
+    true,
   );
 }
