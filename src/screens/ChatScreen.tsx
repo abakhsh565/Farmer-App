@@ -105,6 +105,9 @@ export function ChatScreen({ onBrowseDealers }: Props) {
   const recorder = useVoiceRecorder();
   const recorderMessage = useRecorderFailureText(recorder.failure);
   const [photoError, setPhotoError] = useState<string | null>(null);
+  /* Why the last line typed here did not reach the shop. Kept until a send works,
+     because the draft is kept too: the farmer should not have to remember it. */
+  const [sendError, setSendError] = useState<string | null>(null);
   /* The message whose details are being looked at, if any. */
   const [messageInfo, setMessageInfo] = useState<ChatMessage | null>(null);
   const photoInput = useRef<HTMLInputElement | null>(null);
@@ -235,12 +238,29 @@ export function ChatScreen({ onBrowseDealers }: Props) {
 
   if (chat.openThreadKey !== null) {
     const dealerId = chat.openThreadKey;
+    /*
+     * A line of text, handed to the shop.
+     *
+     * The box used to be cleared the moment the send was *started*, so a refusal —
+     * or a conversation the shop backend had never opened — looked like a message
+     * that had gone. It is cleared only after the shop accepted the line, and a
+     * refusal leaves the words in place with the reason above the composer.
+     */
+    const deliver = async (text: string) => {
+      const accepted = chat.live ? await shop.send(text, dealerId) : chat.send(dealerId, text);
+      if (!accepted) {
+        setSendError(shop.failure?.message ?? t('chat.send.failed'));
+        return;
+      }
+      setSendError(null);
+      setDraft('');
+    };
+
     const send = () => {
       const text = draft.trim();
       if (!text) return;
       requestIdentity(() => {
-        chat.send(dealerId, text);
-        setDraft('');
+        void deliver(text);
       }, 'session.why.message');
     };
 
@@ -503,6 +523,12 @@ export function ChatScreen({ onBrowseDealers }: Props) {
         {photoError ? (
           <p role="status" className="mx-3 mt-2 rounded-md bg-muted px-3 py-2 text-caption text-muted-foreground">
             {photoError}
+          </p>
+        ) : null}
+
+        {sendError ? (
+          <p role="alert" className="mx-3 mt-2 rounded-md bg-amber-50 px-3 py-2 text-caption text-amber-800 dark:bg-amber-500/20 dark:text-amber-100">
+            {sendError}
           </p>
         ) : null}
 

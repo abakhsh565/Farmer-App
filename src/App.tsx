@@ -242,6 +242,19 @@ function Shell() {
    * the badge reflects something they actually did rather than a timer.
    */
   const openThread = (dealerId: string) => {
+    /*
+     * A shop the farmer has not opened yet is opened at the shop's side first.
+     *
+     * The chat button on a dealer row used to jump straight to the thread screen,
+     * which left the shop backend still pointed at the previous shop: the heading
+     * named the shop the farmer tapped, the bubbles showed an empty thread, and the
+     * message went into the other shop's conversation. Asking the backend for this
+     * shop is what makes the heading, the thread and the send target the same shop.
+     */
+    if (shop.configured && shop.credential) {
+      const liveShopId = shop.activeShopId ?? shop.credential.shopId;
+      if (dealerId !== liveShopId) void shop.openShopConversation(dealerId);
+    }
     chat.openThread(dealerId);
     /*
      * A conversation opened from a shop or a product leaves the detail trail: the

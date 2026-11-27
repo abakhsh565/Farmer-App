@@ -141,7 +141,14 @@ type ShopApiValue = {
   joinWithCode: (code: string) => Promise<boolean>;
   joinWithLink: (link: string) => Promise<boolean>;
   forget: () => void;
-  send: (text: string) => Promise<boolean>;
+  /**
+   * Writes one line into a shop's thread.
+   *
+   * The shop is named explicitly because the screen can show one shop while the
+   * credential still belongs to another: without it the message went to whichever
+   * shop was opened last, which is not the one the farmer is looking at.
+   */
+  send: (text: string, shopId?: string | null) => Promise<boolean>;
   /** True once the shop backend has answered the media contract — voice and photos. */
   mediaSupported: boolean;
   /** Files on their way to the shop, newest last. */
@@ -929,7 +936,8 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
       },
       activeShopId,
       openShopConversation,
-      send: (text) => run((token) => farmerSendMessage(token, text, activeShop.current)),
+      send: (text, shopId = null) =>
+        run((token) => farmerSendMessage(token, text, shopId ?? activeShop.current)),
       mediaSupported,
       mediaOutbox,
       sendMedia,

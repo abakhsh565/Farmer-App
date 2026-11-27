@@ -155,10 +155,10 @@ export function ChatProvider({ children }: { children: ReactNode }) {
          * message; a bubble that never reached the shop and still looked sent is the
          * one failure a chat must not have. The refresh below is what draws it.
          */
-        send: (_dealerId, text) => {
+        send: (dealerId, text) => {
           const body = text.trim();
           if (!body) return false;
-          void shop.send(body);
+          void shop.send(body, dealerId);
           return true;
         },
         live: true,
