@@ -22,6 +22,16 @@ import { useVisits } from '@/visits/VisitProvider';
 import { ShopQrCard } from '@/shop/ShopQrCard';
 import { useShopApi } from '@/shop/ShopApiProvider';
 import { distanceKmBetween } from '@/shop/geo';
+import type { ShopSummary } from '@/shop/api/types';
+import type { GeoPoint } from '@/services/types';
+
+/** The distance from the farmer to a shop the platform knows, or 0 when it has no pin. */
+function connectedShopDistance(shop: ShopSummary, origin: GeoPoint): number {
+  if (shop.latitude === null || shop.longitude === null) return 0;
+  return Number(
+    distanceKmBetween(origin, { lat: shop.latitude, lon: shop.longitude }).toFixed(1),
+  );
+}
 
 type Props = {
   dealerId: string;
@@ -110,101 +120,44 @@ export function DealerDetailScreen({ dealerId, onBack, onOpenChat, onOpenProduct
     );
   }
 
-  const entry = dealer.data;
+  /*
+   * The shop's page, for every shop.
+   *
+   * The directory's projection is built from listings, so a branch that has
+   * published nothing has no row there — and the conversation's header can still
+   * open it. Rather than a second, shorter page for those shops, the platform's
+   * own record is shaped into the same entry the directory returns, so the page a
+   * farmer sees is the one page this app has: identity, address, number, distance,
+   * specialities, listings, a visit request and the way into the conversation.
+   */
+  const entry =
+    dealer.data ??
+    (connectedShop
+      ? {
+          id: connectedShop.shopId,
+          name: connectedShop.name,
+          distanceKm: connectedShopDistance(connectedShop, location.activePoint),
+          verifiedAt: null,
+          openingHours: null,
+          openNow: null,
+          isAcceptingRequests: true,
+          isYourDealer: connectedShop.isLinked,
+          syncState: 'fresh' as const,
+          syncedAt: null,
+          tags: [],
+          address: connectedShop.locationLabel ?? connectedShop.city ?? null,
+          phone: connectedShop.phone,
+        }
+      : null);
+
   if (!entry) {
-    if (!connectedShop) {
-      return (
-        <div className="flex flex-col">
-          {back}
-          <EmptyState
-            title={t('dealer.detail.missingTitle')}
-            body={t('dealer.detail.missingBody')}
-          />
-        </div>
-      );
-    }
-
-    /*
-     * A shop the dealer platform knows but the marketplace has no listing for.
-     * The page still has to be a page: who it is, where it is, the number to ring
-     * and the way into its conversation. It says nothing about stock, because the
-     * shop has not published any — an invented shelf would be worse than a blank
-     * one.
-     */
-    const km =
-      connectedShop.latitude !== null && connectedShop.longitude !== null
-        ? Number(
-            distanceKmBetween(location.activePoint, {
-              lat: connectedShop.latitude,
-              lon: connectedShop.longitude,
-            }).toFixed(1),
-          )
-        : null;
-    const place = [connectedShop.locationLabel, connectedShop.city].filter(Boolean).join(' · ');
-
     return (
-      <div className="flex flex-col pb-6">
+      <div className="flex flex-col">
         {back}
-        <section className="mt-3 px-4">
-          <div className="flex items-center gap-3">
-            {connectedShop.logoUrl ? (
-              <img
-                src={connectedShop.logoUrl}
-                alt=""
-                className="size-12 shrink-0 rounded-full object-cover"
-              />
-            ) : (
-              <span className="grid size-12 shrink-0 place-items-center rounded-full bg-brand-soft text-subheading text-brand">
-                {connectedShop.name.slice(0, 2).toUpperCase()}
-              </span>
-            )}
-            <div className="min-w-0 flex-1">
-              <h2 className="truncate text-subheading">{connectedShop.name}</h2>
-              <p className="mt-0.5 flex items-center gap-1 text-caption text-brand">
-                <ShieldCheck className="size-3.5" aria-hidden />
-                {t('dealers.network.connected')}
-              </p>
-            </div>
-          </div>
-
-          <div className="mt-3 space-y-2">
-            {place ? (
-              <p className="flex items-start gap-2 text-body-sm text-muted-foreground">
-                <MapPin className="mt-0.5 size-4 shrink-0" aria-hidden />
-                <span>{place}</span>
-              </p>
-            ) : null}
-            {connectedShop.phone ? (
-              <a
-                href={`tel:${connectedShop.phone.replace(/\s/g, '')}`}
-                className="flex items-center gap-2 text-body-sm font-medium text-brand"
-              >
-                <Phone className="size-4 shrink-0" aria-hidden />
-                <span dir="ltr">{connectedShop.phone}</span>
-              </a>
-            ) : null}
-            {km !== null ? (
-              <p className="flex items-center gap-2 text-body-sm text-muted-foreground">
-                <MapPin className="size-4 shrink-0" aria-hidden />
-                <span>{t('common.km', { km: formatNumber(km, locale) })}</span>
-              </p>
-            ) : null}
-          </div>
-
-          <p className="mt-2.5 rounded-md bg-muted px-3.5 py-3 text-body-sm text-muted-foreground">
-            {t('dealer.products.none')}
-          </p>
-        </section>
-
-        <div className="mt-3 px-4">
-          <Button
-            className="h-11 w-full rounded-full"
-            onClick={() => onOpenChat(connectedShop.shopId)}
-          >
-            <MessageCircle className="size-4" aria-hidden />
-            {t('dealers.chatAria', { name: connectedShop.name })}
-          </Button>
-        </div>
+        <EmptyState
+          title={t('dealer.detail.missingTitle')}
+          body={t('dealer.detail.missingBody')}
+        />
       </div>
     );
   }
@@ -252,7 +205,12 @@ export function DealerDetailScreen({ dealerId, onBack, onOpenChat, onOpenProduct
       <section className="mt-3 px-4">
         <div className="flex flex-wrap items-center gap-2">
           <h2 className="text-subheading">{name}</h2>
-          {verified ? (
+          {connectedShop?.isLinked ? (
+            <span className="inline-flex items-center gap-1 rounded-full bg-brand-soft px-2 py-0.5 text-caption font-medium text-brand">
+              <ShieldCheck className="size-3" aria-hidden />
+              {t('dealers.network.connected')}
+            </span>
+          ) : verified ? (
             <span className="inline-flex items-center gap-1 rounded-full bg-brand-soft px-2 py-0.5 text-caption font-medium text-brand">
               <ShieldCheck className="size-3" aria-hidden />
               {t('dealers.verified')}
