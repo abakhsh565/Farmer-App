@@ -205,6 +205,26 @@ export function DealersScreen({
       : search.data;
 
   /*
+   * The nearest shops when the chosen radius has none.
+   *
+   * The default radius is small and most places have no dealer inside it, so the
+   * honest answer to "within 10 km" used to be an empty screen — which a farmer
+   * reads as "this app is broken", not as "widen the search". The wider query only
+   * runs when the chosen one came back empty, and its rows are labelled with the
+   * radius that produced them, so the screen never says "within 10 km" above a shop
+   * 70 km away.
+   */
+  const wider = useDealerSearch(
+    { radiusKm: MAX_RADIUS_KM, origin: searchOrigin, tags: filter === 'all' || filter === 'open' ? undefined : [filter] },
+    search.status === 'ready' && rows.length === 0 && location.radiusKm < MAX_RADIUS_KM,
+  );
+  const widerRows =
+    filter === 'open' ? wider.data.filter((dealer) => dealer.openNow === true) : wider.data;
+  const showsWider = rows.length === 0 && widerRows.length > 0;
+  const listRows = showsWider ? widerRows : rows;
+  const listKm = showsWider ? MAX_RADIUS_KM : location.radiusKm;
+
+  /*
    * A provider that reported its own failure is not an empty area. The list says
    * "could not be loaded" and offers a retry, because "no dealer is within 43 km"
    * is a statement about the farmer's town and this is a statement about a call.
@@ -402,11 +422,20 @@ export function DealersScreen({
 
       {search.status === 'ready' && !searchFailed ? (
         <>
+          {showsWider ? (
+            <p className="mt-3 text-label text-muted-foreground">
+              {t('dealers.empty.body', {
+                km: location.radiusKm,
+                place: location.placeLabel || t(areaNameKey(searchedArea)),
+              })}
+            </p>
+          ) : null}
+
           <SectionLabel className="mt-3.5">
-            {t('dealer.search.count', { count: rows.length, km: location.radiusKm })}
+            {t('dealer.search.count', { count: listRows.length, km: listKm })}
           </SectionLabel>
 
-          {rows.length === 0 ? (
+          {listRows.length === 0 ? (
             <EmptyState
               title={t('dealers.empty.title')}
               body={t('dealers.empty.body', {
@@ -428,7 +457,7 @@ export function DealersScreen({
           ) : null}
 
           <ul className="mt-2 space-y-2.5">
-            {rows.map((entry) => {
+            {listRows.map((entry) => {
               const name = dealerName(entry);
               const verified = entry.verifiedAt !== null;
               const hour = closingHour(entry.id);
