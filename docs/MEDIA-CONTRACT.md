@@ -14,6 +14,13 @@ Farmer App's database, and no farmer session is presented to the dealer.
 > on staging (`bpybjrjenwccowvtrevu`). Verified by this client on 2026-11-24:
 > `farmer_api_media` and `farmer_api_send_attachment` exist, `farmer-media` answers
 > `401 NOT_AUTHORIZED` without a credential.
+>
+> 2026-11-27 — staging now runs `farmer_media_identity(p_token, p_shop_id default null)`
+> and `farmer-media` version 7, which forwards `shop_id` and signs links on the
+> project's https origin. Measured with the multi-shop QA farmer (`6b283ff4…`, four
+> shops): upload with `shop_id` `200` under the named shop, without it `401` naming
+> the ambiguity, unlinked shop `401 NOT_FOUND`, and the 3 000-byte voice note was
+> stored, attached, signed and downloaded back byte-identical (`audio/mp4`).
 
 ## 1. Shape of a message
 
@@ -36,7 +43,7 @@ is a complete message) and every existing row still satisfies the check.
 ### 2.1 Upload the bytes
 
 ```
-POST {shop}/functions/v1/farmer-media?kind=voice&mime=audio/webm&duration_ms=4200
+POST {shop}/functions/v1/farmer-media?kind=voice&mime=audio/webm&duration_ms=4200&shop_id=<uuid>
 Headers: apikey: <shop anon key>
          x-farmer-token: <token from farmer_api_join_shop>
          Content-Type: audio/webm
@@ -46,6 +53,32 @@ Body:    the raw bytes
 `200 → { storage_path, content_type, size_bytes, farmer_id, duration_ms }`
 
 Refusals: `400 VALIDATION`, `401 NOT_AUTHORIZED`, `403 NOT_LINKED`, `413 TOO_LARGE`.
+
+**`shop_id` is required for a farmer with more than one dealer.** A farmer token names
+the farmer, not the conversation; the dealer deployment resolves the folder with
+`farmer_shop_scope(farmer, null)`, which raises `VALIDATION: this farmer deals with more
+than one shop`, and `farmer-media` answers that as **`401 NOT_AUTHORIZED`** — the exact
+failure measured on staging: `farmer_api_*` text calls succeed for every shop while
+`POST farmer-media` is refused. The fix is the dealer side's, one line each:
+
+```sql
+-- farmer_media_identity gains the conversation
+create or replace function public.farmer_media_identity(p_token text, p_shop_id uuid default null)
+… v_shop := public.farmer_shop_scope(v_farmer, p_shop_id);
+```
+```ts
+// farmer-media, upload branch
+const { data } = await admin.rpc("farmer_media_identity", {
+  p_token: farmerToken,
+  p_shop_id: url.searchParams.get("shop_id"),   // null keeps the old single-shop answer
+});
+```
+
+This client sends `shop_id` on every upload, so it works with both the old and the
+repaired function; an old function ignores the extra parameter. Until the dealer
+deployment is repaired, a farmer linked to two or more shops can send text but neither
+voice nor photos — and the app must keep the conversation on screen when that upload is
+refused (a refused upload is not a reason to sign the farmer out).
 
 The mime type is the **bare container**. A recorder reports `audio/webm;codecs=opus`,
 and that string is refused; the app strips the parameter before sending.

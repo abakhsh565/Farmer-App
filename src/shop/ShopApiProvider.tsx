@@ -10,6 +10,7 @@ import {
   type ReactNode,
 } from 'react';
 import { serviceConfig } from '@/services/config';
+import type { ChatMessage } from '@/data/chat';
 import {
   mediaCapability,
   mediaLink,
@@ -49,6 +50,7 @@ import {
 } from './api/credentialSync';
 import { alertDealerReply } from '@/services/dealerAlerts';
 import { parseShopLink } from './api/deepLink';
+import { subscribeShopTopic } from './api/realtime';
 import {
   firstRow,
   normaliseMe,
@@ -109,6 +111,8 @@ export type ShopFailure = { kind: ShopApiFailure; message: string } | null;
  */
 export type MediaOutboxItem = {
   localId: string;
+  /** The shop this file is for, so switching conversations cannot show it in the wrong one. */
+  shopId: string | null;
   kind: MediaKind;
   blob: Blob;
   mimeType: string;
@@ -121,12 +125,37 @@ export type MediaOutboxItem = {
   error: string | null;
 };
 
+/**
+ * One dealer conversation, as the Chat tab lists it.
+ *
+ * Every shop this farmer has opened is here — not only the one the credential was
+ * minted for, and not only the ones near the farmer today. The list is a fact about
+ * the account at the shop network, which is why it survives a change of city, a
+ * branch switch or a reinstall: it is read from `farmer_api_shops`, not from the
+ * nearby-dealer search.
+ */
+export type ShopConversation = {
+  shopId: string;
+  name: string;
+  phone: string | null;
+  messages: ChatMessage[];
+  lastMessage: ChatMessage | null;
+  /** When the newest line was written, ISO. `null` for a conversation with none. */
+  lastAt: string | null;
+  unread: number;
+};
+
 type ShopApiValue = {
   status: ShopApiStatus;
   configured: boolean;
   credential: ShopCredential | null;
   me: ShopMe | null;
+  /** The active conversation's thread. */
   thread: ShopThread | null;
+  /** Every loaded conversation, keyed by shop id. */
+  threads: Record<string, ShopThread>;
+  /** Every dealer conversation the farmer has, newest first. */
+  conversations: ShopConversation[];
   /** The shops the dealer platform lists for this farmer, connected or not. */
   shops: ShopSummary[];
   /** The shop whose conversation `thread` holds; null means the credential's shop. */
@@ -140,7 +169,14 @@ type ShopApiValue = {
   joinWithCode: (code: string) => Promise<boolean>;
   joinWithLink: (link: string) => Promise<boolean>;
   forget: () => void;
-  send: (text: string) => Promise<boolean>;
+  /**
+   * Writes one line into a shop's thread.
+   *
+   * The shop is named explicitly because the screen can show one shop while the
+   * credential still belongs to another: without it the message went to whichever
+   * shop was opened last, which is not the one the farmer is looking at.
+   */
+  send: (text: string, shopId?: string | null) => Promise<boolean>;
   /** True once the shop backend has answered the media contract — voice and photos. */
   mediaSupported: boolean;
   /** Files on their way to the shop, newest last. */
@@ -154,7 +190,8 @@ type ShopApiValue = {
   askVisit: (purpose: string | null, window: string | null) => Promise<boolean>;
   answerOffer: (requestId: string, accept: boolean, note: string | null) => Promise<boolean>;
   refresh: () => Promise<void>;
-  markNotificationsRead: () => void;
+  /** Marks one conversation's notices read; no argument marks all of them. */
+  markNotificationsRead: (shopId?: string) => void;
   /** The notices the farmer has already seen, so the badge counts something real. */
   seenNotificationIds: string[];
 };
@@ -162,6 +199,15 @@ type ShopApiValue = {
 const ShopApiContext = createContext<ShopApiValue | null>(null);
 
 const SEEN_KEY = 'farmer.shop.notifications.seen';
+/**
+ * How many conversations are read on one refresh.
+ *
+ * The dealer platform lists up to 500 shops, but a farmer's opened conversations
+ * are a handful. The cap exists so a pathological account cannot make the app open
+ * hundreds of sockets' worth of reads on every poll; a conversation beyond it still
+ * opens normally when the farmer taps it.
+ */
+const MAX_CONVERSATIONS = 20;
 /**
  * The shop list as it was last seen, so the Shop tab paints shops before the
  * network answers.
@@ -240,7 +286,16 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
     configured ? (loadShopCredential() ? 'loading' : 'no-credential') : 'unconfigured',
   );
   const [me, setMe] = useState<ShopMe | null>(null);
-  const [thread, setThread] = useState<ShopThread | null>(null);
+  /*
+   * One thread per dealer the farmer has opened.
+   *
+   * The provider used to hold exactly one, because one credential named one shop.
+   * The dealer platform lists every shop to the same farmer now, and the Chat tab
+   * is a list of all of them, so the threads are kept side by side: switching a
+   * conversation is a lookup, not a reload, and a reply that arrives in another
+   * conversation still updates that conversation's row.
+   */
+  const [threads, setThreads] = useState<Record<string, ShopThread>>({});
   const [shops, setShops] = useState<ShopSummary[]>(() => (configured ? loadCachedShops() : []));
   /* Which dealer messages this session has already shown. A ref, because the
      comparison happens inside a callback that outlives the render. */
@@ -273,7 +328,7 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
     setActiveShopId(null);
     setCredential(null);
     setMe(null);
-    setThread(null);
+    setThreads({});
     setNotifications([]);
     setStatus('expired');
   }, []);
@@ -327,33 +382,71 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
         saveCachedShops(listed);
       }
 
+      /*
+       * The conversations are the shops this farmer has opened with, plus the shop
+       * the credential was minted for.
+       *
+       * A shop the directory lists but the farmer has never written to is
+       * discovery, not a conversation: it belongs on the Dealers tab, and opening
+       * its chat is what creates the link at the shop's side. Listing all 500
+       * directory shops here instead would make the Chat tab a second Dealers tab.
+       *
+       * The credential's shop comes first, then the platform's order (linked
+       * first, by name), so the first open of a fresh install lands on the counter
+       * whose invitation this phone holds.
+       */
+      const linked = listed.filter((shop) => shop.isLinked).map((shop) => shop.shopId);
+      const conversationIds = [...new Set([identity.shopId, ...linked])]
+        .filter((id): id is string => Boolean(id))
+        .slice(0, MAX_CONVERSATIONS);
+
       let shopId = activeShop.current;
-      if (!shopId && listed.length > 1) {
-        const preferred =
-          listed.find((shop) => shop.shopId === identity.shopId) ??
-          listed.find((shop) => shop.isLinked) ??
-          listed[0];
-        shopId = preferred?.shopId ?? null;
+      if (!shopId || !conversationIds.includes(shopId)) {
+        shopId = conversationIds[0] ?? null;
         activeShop.current = shopId;
         setActiveShopId(shopId);
       }
 
-      const [threadResult, notificationsResult, mediaResult] = await Promise.all([
-        farmerThread(token, shopId),
+      /*
+       * Every conversation, read together.
+       *
+       * Each shop's thread is its own call, so a list of conversations is a list
+       * of reads. A thread that fails on its own keeps the copy already on screen:
+       * a bad minute on the platform must not blank a conversation the farmer can
+       * read, and the next refresh fills it.
+       */
+      const [threadResults, notificationsResult] = await Promise.all([
+        Promise.all(
+          conversationIds.map(async (id) => {
+            const [threadResult, mediaResult] = await Promise.all([
+              farmerThread(token, id),
+              fetchShopMedia(token, serviceConfig.shopApi, id),
+            ]);
+            /* The thread says who said what; the media call says which of those
+               messages carry a file and how long it runs. A conversation of plain
+               text answers `[]`, and a backend without the call at all is not a
+               reason to blank the messages. */
+            return threadResult.ok
+              ? ([id, normaliseThread(threadResult.data, mediaResult.ok ? mediaResult.data : [])] as const)
+              : null;
+          }),
+        ),
         farmerNotifications(token),
-        fetchShopMedia(token, serviceConfig.shopApi, shopId),
       ]);
 
-      /* A thread that failed on its own is not a reason to blank the screen the
-         farmer just opened: an empty conversation with the shop named above it is
-         the honest rendering, and the next refresh fills it. */
-      /* The thread says who said what; the media call says which of those messages
-         carry a file and how long it runs. A conversation of plain text answers `[]`,
-         and a backend without the call at all is not a reason to blank the messages. */
-      const nextThread = threadResult.ok
-        ? normaliseThread(threadResult.data, mediaResult.ok ? mediaResult.data : [])
-        : null;
-      setThread(nextThread);
+      const nextThreads: Record<string, ShopThread> = {};
+      for (const entry of threadResults) {
+        if (entry) nextThreads[entry[0]] = entry[1];
+      }
+
+      setThreads((previous) => {
+        const merged: Record<string, ShopThread> = {};
+        for (const id of conversationIds) {
+          const next = nextThreads[id] ?? previous[id];
+          if (next) merged[id] = next;
+        }
+        return merged;
+      });
       setNotifications(notificationsResult.ok ? normaliseNotifications(notificationsResult.data) : []);
 
       /*
@@ -364,7 +457,9 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
        * dealer message this session has not seen is announced through the phone
        * when the page is hidden, which is exactly the case the farmer asked about.
        */
-      const dealerMessages = nextThread ? nextThread.messages.filter((message) => message.from === 'dealer') : [];
+      const dealerMessages = Object.values(nextThreads).flatMap((entry) =>
+        entry.messages.filter((message) => message.from === 'dealer'),
+      );
       const unseen = dealerMessages.filter((message) => !knownMessages.current.has(message.id));
       for (const message of dealerMessages) knownMessages.current.add(message.id);
       const wasBaseline = baselineSeen.current;
@@ -588,12 +683,44 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
   }, [activeShopId, configured, credential?.token, status]);
 
   /**
-   * A reply arrives while the farmer is looking at the conversation.
+   * A reply arrives while the farmer is looking at the conversation — immediately.
    *
-   * The dealer platform offers no channel this build subscribes to, so the open
-   * app re-reads the thread on a timer — a few seconds, the way a chat app feels,
-   * rather than "close and reopen to see the answer". It costs nothing while the
-   * app is in the background: a hidden page does not tick.
+   * The shop writes the message, the credit decision or the visit move and broadcasts
+   * it in the same transaction (the dealer app's `0339`), so the wait is a socket
+   * frame rather than a poll interval. The subject is `realtime_topic`, which only
+   * this credential is given: the app cannot derive it, and losing the credential
+   * loses the channel.
+   *
+   * A `ready` event after the first join is a reconnection, and is treated as "read
+   * again" — frames missed while offline are not replayed.
+   */
+  const realtimeTopic = me?.realtimeTopic ?? null;
+  useEffect(() => {
+    if (!configured || status !== 'ready' || !credential?.token || !realtimeTopic) return;
+    const token = credential.token;
+    let inFlight = false;
+
+    const resync = async () => {
+      if (inFlight) return;
+      if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+      inFlight = true;
+      try {
+        await load(token);
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    return subscribeShopTopic(serviceConfig.shopApi, realtimeTopic, () => void resync());
+  }, [configured, credential?.token, load, realtimeTopic, status]);
+
+  /**
+   * The fallback: a shop backend with no channel, or a socket that will not open.
+   *
+   * It was the only mechanism before the shop broadcast existed, and it is kept
+   * deliberately — a phone on a network that blocks WebSockets still converges, and
+   * "slower" is a different failure from "never". It costs nothing in the
+   * background: a hidden page does not tick.
    */
   useEffect(() => {
     if (!configured || status !== 'ready' || !credential?.token) return;
@@ -671,12 +798,25 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
           kind: item.kind,
           blob: item.blob,
           mimeType: item.mimeType,
+          /* The shop this file is for. Without it the shop has to guess which of
+             the farmer's conversations the bytes belong to, and a farmer with two
+             dealers is exactly the case it refuses. */
+          shopId: item.shopId ?? activeShop.current,
           durationMs: item.durationMs,
           onProgress: (fraction) => patchOutbox(item.localId, { progress: fraction }),
         });
 
         if (!uploaded.ok) {
-          if (isTerminal(uploaded.error)) expire();
+          /*
+           * A refused upload does not end the conversation.
+           *
+           * Only the shop's own message contract can say the credential is gone.
+           * The file endpoint is a separate function, and a 401 from it — a missing
+           * secret, a gateway rule — used to clear a credential that still read and
+           * sent text perfectly: the farmer lost every conversation because one
+           * voice note would not upload. The failure stays on the file, with its
+           * retry, and the thread stays.
+           */
           patchOutbox(item.localId, { status: 'failed', error: uploaded.message });
           return false;
         }
@@ -692,7 +832,10 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
         mimeType: stored.mimeType,
         sizeBytes: stored.sizeBytes,
         durationMs: item.kind === 'voice' ? item.durationMs : undefined,
-        shopId: activeShop.current,
+        /* The shop this file was recorded for, not whichever conversation is on
+           screen when the upload finishes: a farmer who switches to another dealer
+           mid-upload must not deliver a voice note to that dealer. */
+        shopId: item.shopId ?? activeShop.current,
       });
 
       if (!sent.ok) {
@@ -714,6 +857,7 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
     async (file: { kind: MediaKind; blob: Blob; mimeType: string; durationMs?: number }) => {
       const item: MediaOutboxItem = {
         localId: `m-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        shopId: activeShop.current,
         kind: file.kind,
         blob: file.blob,
         mimeType: file.mimeType,
@@ -871,10 +1015,115 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
     [expire, load],
   );
 
+  /** The conversation the Chat screen has open. */
+  const activeId = activeShopId ?? credential?.shopId ?? null;
+  const thread = activeId ? (threads[activeId] ?? null) : null;
+
+  /**
+   * Unread messages, counted per conversation.
+   *
+   * The shop's notice names the message, not the shop, so each notice is credited
+   * to the conversation whose thread holds that message. A notice whose message
+   * this app has not read yet is not attributed to anybody: guessing a shop would
+   * put a badge on the wrong conversation, which is worse than a missing badge.
+   */
+  const unreadByShop = useMemo(() => {
+    const shopOfMessage = new Map<string, string>();
+    for (const [shopId, entry] of Object.entries(threads)) {
+      for (const message of entry.messages) {
+        if (message.serverId) shopOfMessage.set(message.serverId, shopId);
+      }
+    }
+    const counts = new Map<string, number>();
+    for (const notice of notifications) {
+      if (notice.kind !== 'message' || seen.includes(notice.id) || !notice.messageId) continue;
+      const shopId = shopOfMessage.get(notice.messageId);
+      if (!shopId) continue;
+      counts.set(shopId, (counts.get(shopId) ?? 0) + 1);
+    }
+    return counts;
+  }, [notifications, seen, threads]);
+
+  /**
+   * Every dealer conversation, newest first.
+   *
+   * Built from the threads read above, so a conversation exists in the list only
+   * when the shop network answered for it — the account's conversations, not the
+   * nearby shops and not the shop last opened.
+   */
+  const conversations = useMemo<ShopConversation[]>(() => {
+    const rows = Object.keys(threads).map((shopId) => {
+      const entry = threads[shopId];
+      const summary = shops.find((shop) => shop.shopId === shopId);
+      const messages = entry?.messages ?? [];
+      const lastMessage = messages[messages.length - 1] ?? null;
+      const name =
+        entry?.shopName ||
+        summary?.name ||
+        (shopId === credential?.shopId ? credential.shopName : '') ||
+        '';
+
+      return {
+        shopId,
+        name,
+        phone: entry?.shopPhone ?? summary?.phone ?? null,
+        messages,
+        lastMessage,
+        lastAt: lastMessage?.sentAt ?? null,
+        unread: unreadByShop.get(shopId) ?? 0,
+      } satisfies ShopConversation;
+    });
+
+    /* Newest conversation first, as a message list should be; a conversation that
+       has not been written to yet follows those, under its own name. */
+    return rows
+      .filter((row) => row.name.length > 0)
+      .sort((a, b) => {
+        if (a.lastAt && b.lastAt) return b.lastAt.localeCompare(a.lastAt);
+        if (a.lastAt) return -1;
+        if (b.lastAt) return 1;
+        return a.name.localeCompare(b.name);
+      });
+  }, [credential?.shopId, credential?.shopName, shops, threads, unreadByShop]);
+
+  /**
+   * Marks one conversation's notices read, or all of them when no shop is named.
+   *
+   * Reading a conversation is what clears its badge, and clearing one must not
+   * clear the others: a farmer who answers Auto Shop has not read Dealer B's
+   * message.
+   */
+  const markNotificationsRead = useCallback(
+    (shopId?: string) => {
+      const ids = !shopId
+        ? notifications.map((notice) => notice.id)
+        : (() => {
+            const shopOfMessage = new Map<string, string>();
+            for (const [id, entry] of Object.entries(threads)) {
+              for (const message of entry.messages) {
+                if (message.serverId) shopOfMessage.set(message.serverId, id);
+              }
+            }
+            return notifications
+              .filter(
+                (notice) =>
+                  notice.kind === 'message' &&
+                  notice.messageId &&
+                  shopOfMessage.get(notice.messageId) === shopId,
+              )
+              .map((notice) => notice.id);
+          })();
+
+      if (ids.length === 0) return;
+      const next = [...new Set([...seen, ...ids])];
+      saveSeen(next);
+      setSeen(next);
+    },
+    [notifications, seen, threads],
+  );
+
   const value = useMemo<ShopApiValue>(() => {
-    const unread = notifications.filter(
-      (entry) => entry.kind === 'message' && !seen.includes(entry.id),
-    ).length;
+    const unread = conversations.reduce((total, conversation) => total + conversation.unread, 0);
 
     return {
       status,
@@ -882,6 +1131,8 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
       credential,
       me,
       thread,
+      threads,
+      conversations,
       shops,
       notifications,
       unread,
@@ -896,7 +1147,8 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
       },
       activeShopId,
       openShopConversation,
-      send: (text) => run((token) => farmerSendMessage(token, text, activeShop.current)),
+      send: (text, shopId = null) =>
+        run((token) => farmerSendMessage(token, text, shopId ?? activeShop.current)),
       mediaSupported,
       mediaOutbox,
       sendMedia,
@@ -910,15 +1162,13 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
       answerOffer: (requestId, accept, note) =>
         run((token) => farmerAnswerOffer(token, requestId, accept, note)),
       refresh,
-      markNotificationsRead: () => {
-        const next = [...new Set([...seen, ...notifications.map((entry) => entry.id)])];
-        saveSeen(next);
-        setSeen(next);
-      },
+      markNotificationsRead,
       seenNotificationIds: seen,
     };
   }, [
     activeShopId,
+    conversations,
+    markNotificationsRead,
     openShopConversation,
     credential,
     configured,
@@ -939,6 +1189,7 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
     status,
     shops,
     thread,
+    threads,
     busy,
   ]);
 

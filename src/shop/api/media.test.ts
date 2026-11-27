@@ -8,6 +8,7 @@ import {
   mediaCapability,
   mediaFunctionUrl,
   mediaLink,
+  playableLink,
   readMediaRows,
   sendAttachment,
   uploadMedia,
@@ -123,6 +124,46 @@ describe('uploading', () => {
       'Content-Type': 'audio/webm',
     });
     expect(progress.at(-1)).toBe(1);
+  });
+
+  it('names the conversation, so a farmer with two dealers can still upload', async () => {
+    /* The shop resolves the folder from the token alone, and a token that names two
+       shops is refused with 401. The shop id is how it learns which one. */
+    const transport = vi.fn<MediaTransport>(async () => ({
+      ok: true,
+      data: { storage_path: 'shop/farmer/uuid.webm' },
+    }));
+
+    await uploadMedia({
+      token: 'tok',
+      kind: 'voice',
+      blob: blob(),
+      mimeType: 'audio/webm',
+      durationMs: 1200,
+      shopId: 'shop-2',
+      transport,
+      config,
+    });
+
+    expect(transport.mock.calls[0]![0]).toContain('shop_id=shop-2');
+  });
+
+  it('loads a signed link over https when the shop signed an http url', () => {
+    /*
+     * The hosted shop signs against an http origin behind its TLS proxy. An audio
+     * element on an https app refuses that as mixed content, so the bubble played
+     * nothing; the scheme is corrected to the project's own origin.
+     */
+    const config = { url: 'https://shop.example', key: 'anon-key', configured: true };
+    expect(
+      playableLink(
+        'http://shop.example/storage/v1/object/sign/farmer-chat-media/a/b.m4a?token=abc',
+        config,
+      ),
+    ).toBe('https://shop.example/storage/v1/object/sign/farmer-chat-media/a/b.m4a?token=abc');
+    expect(playableLink('https://shop.example/x?token=1', config)).toBe(
+      'https://shop.example/x?token=1',
+    );
   });
 
   it('sends no duration for a photo, because the shop refuses one', async () => {

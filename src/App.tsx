@@ -242,6 +242,19 @@ function Shell() {
    * the badge reflects something they actually did rather than a timer.
    */
   const openThread = (dealerId: string) => {
+    /*
+     * A shop the farmer has not opened yet is opened at the shop's side first.
+     *
+     * The chat button on a dealer row used to jump straight to the thread screen,
+     * which left the shop backend still pointed at the previous shop: the heading
+     * named the shop the farmer tapped, the bubbles showed an empty thread, and the
+     * message went into the other shop's conversation. Asking the backend for this
+     * shop is what makes the heading, the thread and the send target the same shop.
+     */
+    if (shop.configured && shop.credential) {
+      const liveShopId = shop.activeShopId ?? shop.credential.shopId;
+      if (dealerId !== liveShopId) void shop.openShopConversation(dealerId);
+    }
     chat.openThread(dealerId);
     /*
      * A conversation opened from a shop or a product leaves the detail trail: the
@@ -280,8 +293,18 @@ function Shell() {
   }
 
   return (
-    <div className="mx-auto flex h-dvh w-full max-w-[430px] flex-col bg-background text-foreground">
-      <main className="flex-1 overflow-y-auto">
+    /*
+     * The shell owns the viewport, so a screen can own its own scrolling.
+     *
+     * `h-dvh` alone is not enough on a phone: some WebViews report a viewport
+     * shorter than the window (measured on a device: the whole app drew in the top
+     * two-thirds, with blank page below the tab bar). Pinning the shell to the
+     * viewport fixes it to the actual window, and `overflow-hidden` keeps the page
+     * itself from scrolling — a chat that scrolls the page and the thread at the
+     * same time is what leaves the composer floating above empty space.
+     */
+    <div className="fixed inset-0 mx-auto flex w-full max-w-[430px] flex-col overflow-hidden bg-background text-foreground">
+      <main className="min-h-0 flex-1 overflow-y-auto">
         {view === 'profile' ? (
           <ProfileScreen
             onBack={() => setView('tabs')}

@@ -54,7 +54,15 @@ export function classifyFailure(status: number, body: unknown): ShopApiFailure {
      farmer's fault and it is not their credential's: the shop backend has not
      published the call, which is a deployment fact worth naming as such. */
   if (record.code === 'PGRST202') return 'unavailable';
-  if (status === 401 || status === 403) return 'unauthorized';
+  /*
+   * A bare 401/403 is the *gateway* refusing the call — a rate limit, a proxy, a
+   * rotated anonymous key — and not the shop saying this farmer's invitation is
+   * over. The shop's own words arrive as `NOT_AUTHORIZED` in a 400 body and are
+   * caught above. Reading every 401 as "your credential is gone" was what cleared
+   * a working conversation on a single transient refusal; the farmer then had to
+   * ask the shop for a new code while nothing was actually wrong.
+   */
+  if (status === 401 || status === 403) return 'unavailable';
   if (status === 404) return 'unavailable';
   if (status === 400 || status === 422) return 'validation';
   return 'unavailable';

@@ -56,6 +56,13 @@ export type ChatImage = {
 
 export type ChatMessage = {
   id: number;
+  /**
+   * The message's id on the shop's side, when it came from the shop's thread.
+   *
+   * The bubble's React key is the thread's own order (`id`); this is the id the
+   * shop knows, used to join a message to its file and to the notice it produced.
+   */
+  serverId?: string;
   from: 'me' | 'dealer';
   /** Catalog key for seeded messages; absent once the user types freely. */
   key?: MessageKey;
@@ -65,6 +72,12 @@ export type ChatMessage = {
   audio?: ChatAudio;
   /** Present on a photo; `text` carries its caption when there is one. */
   image?: ChatImage;
+  /** The shop's own time for the message, when it returned one. */
+  sentAt?: string | null;
+  /** When the shop's system recorded the message as delivered, if it says. */
+  deliveredAt?: string | null;
+  /** When the shop says it read the message, if it says. Never inferred. */
+  readAt?: string | null;
 };
 
 export type Threads = Record<string, ChatMessage[]>;

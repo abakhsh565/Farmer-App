@@ -169,10 +169,36 @@ function build(): ServiceConfig {
    * that silently read production's listings would look like it worked.
    */
   const shopEnvironment = resolveShopEnvironment(read('VITE_APP_ENV'));
-  const marketplaceUrl = read('VITE_MARKETPLACE_URL') ?? shopEnvironment?.marketplace.url ?? null;
-  const marketplaceKey = read('VITE_MARKETPLACE_KEY') ?? shopEnvironment?.marketplace.key ?? null;
-  const shopApiUrl = read('VITE_SHOP_API_URL') ?? shopEnvironment?.shopApi.url ?? null;
-  const shopApiKey = read('VITE_SHOP_API_KEY') ?? shopEnvironment?.shopApi.key ?? null;
+  /*
+   * The shop is one project, not two.
+   *
+   * Its directory (`farmer_api_shops`, `search_marketplace`) and its message
+   * contract (`farmer_api_thread`, `farmer_api_send_message`, `farmer_api_media`,
+   * the Realtime topic) are published by the same AgriShop project. Reading shops
+   * from one project and writing messages into another is exactly the failure a
+   * farmer saw as "the dealer is listed, but my message does not send": the
+   * directory was the staging project's and the chat was a local POS container,
+   * which answered `NOT_FOUND: this farmer is not linked to that shop`.
+   *
+   * So a build names one shop project. `VITE_SHOP_API_URL` states it; a
+   * marketplace-only override is read as the same statement, because a build that
+   * points its listings somewhere must talk to that same shop app. Both endpoints
+   * below therefore resolve to the project chosen here, and `VITE_APP_ENV`
+   * supplies it when neither override is set. There is no configuration in which
+   * the Chat tab writes into a project the Shop tab never read.
+   */
+  const shopOverrideUrl = read('VITE_SHOP_API_URL') ?? read('VITE_MARKETPLACE_URL');
+  const shopOverrideKey = read('VITE_SHOP_API_URL')
+    ? read('VITE_SHOP_API_KEY')
+    : read('VITE_MARKETPLACE_KEY');
+  const shopProjectUrl = shopOverrideUrl ?? shopEnvironment?.shopApi.url ?? null;
+  const shopProjectKey = shopOverrideUrl
+    ? shopOverrideKey
+    : (shopEnvironment?.shopApi.key ?? null);
+  const marketplaceUrl = shopProjectUrl;
+  const marketplaceKey = shopProjectKey;
+  const shopApiUrl = shopProjectUrl;
+  const shopApiKey = shopProjectKey;
   const aiEndpoint = read('VITE_AI_ENDPOINT');
   const otpEndpoint = read('VITE_OTP_ENDPOINT');
   const dealerEndpoint = read('VITE_DEALER_ENDPOINT');

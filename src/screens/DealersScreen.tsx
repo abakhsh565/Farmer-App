@@ -152,9 +152,18 @@ export function DealersScreen({
    * Inside the radius they are results; outside it they are suggestions, named as
    * such.
    */
+  /*
+   * A shop with no coordinates on record has no distance, and a distance can only
+   * come from coordinates. Those rows used to be put in the "outside your radius"
+   * list, which is a claim the app cannot make — the screen then showed every
+   * dealer regardless of where it was. Now only a measured distance can qualify a
+   * shop for either list, and the suggestions are bounded by the product's maximum
+   * reach so a shop on the other side of the country is not offered as "nearby"
+   * either.
+   */
   const shopsInRange = shopRows.filter((shop) => shop.km !== null && shop.km <= location.radiusKm);
   const shopsBeyondRange = shopRows.filter(
-    (shop) => shop.km === null || shop.km > location.radiusKm,
+    (shop) => shop.km !== null && shop.km > location.radiusKm && shop.km <= MAX_RADIUS_KM,
   );
 
   const openShop = async (shopId: string) => {
