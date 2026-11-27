@@ -23,6 +23,13 @@ export type ShopMe = {
   shopId: string;
   shopName: string;
   shopPhone: string | null;
+  /**
+   * The shop's live channel for this credential (`farmer_api_me` → `realtime_topic`).
+   * Derived by the shop from the credential's own hash, so only its holder is given
+   * it. Optional because an older shop backend does not answer it — a missing topic
+   * means "poll", never an error.
+   */
+  realtimeTopic?: string | null;
 };
 
 export type ShopOffer = {
@@ -162,6 +169,13 @@ export function normaliseMe(value: unknown): ShopMe | null {
   /* Without these two the credential points at nothing this app can show. */
   if (!farmerId || !shopId) return null;
 
+  /*
+   * The live channel, when the shop answers one. It is omitted rather than set to
+   * `null` when absent, so "this backend does not publish a channel" is a missing
+   * field and not a second kind of absent — and an older payload keeps its shape.
+   */
+  const realtimeTopic = text(firstOf(row, ['realtime_topic', 'realtimeTopic']));
+
   return {
     farmerId,
     farmerName: text(firstOf(row, ['farmer_name', 'farmerName', 'name'])),
@@ -172,6 +186,7 @@ export function normaliseMe(value: unknown): ShopMe | null {
       text(firstOf(joined, ['shop_name', 'shopName', 'name'])) ??
       '',
     shopPhone: text(firstOf(row, ['shop_phone', 'phone'])) ?? text(shop.phone),
+    ...(realtimeTopic ? { realtimeTopic } : {}),
   };
 }
 
@@ -274,6 +289,21 @@ function normaliseMessage(
   const mine =
     role === 'farmer' || direction === 'farmer' || direction === 'outbound' || direction === 'out';
 
+  /*
+   * The shop's own clock, read from whichever name it uses. Nothing here is
+   * guessed: a time it does not send stays absent, and the screen then shows the
+   * message without a timestamp rather than one this app invented.
+   *
+   * `delivered_to_app_at` is the shop's delivery record for a message it pushed to
+   * the farmer's app; `read_at` is a receipt the shop may publish. Both are rare on
+   * the farmer side — the bubble draws only what is present.
+   */
+  const sentAt = text(firstOf(row, ['created_at', 'sent_at', 'sentAt']));
+  const deliveredAt = text(
+    firstOf(row, ['delivered_to_app_at', 'delivered_at', 'deliveredAt']),
+  );
+  const readAt = text(firstOf(row, ['read_at', 'owner_read_at', 'readAt']));
+
   return {
     /* The thread's own order is the identity React needs: ids from two servers
        (a uuid here, an integer in the local store) must not be mixed. */
@@ -285,6 +315,9 @@ function normaliseMessage(
     text: body ?? undefined,
     ...(voice ? { audio: voice } : {}),
     ...(image ? { image } : {}),
+    ...(sentAt ? { sentAt } : {}),
+    ...(deliveredAt ? { deliveredAt } : {}),
+    ...(readAt ? { readAt } : {}),
   };
 }
 

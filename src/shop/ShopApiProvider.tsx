@@ -49,6 +49,7 @@ import {
 } from './api/credentialSync';
 import { alertDealerReply } from '@/services/dealerAlerts';
 import { parseShopLink } from './api/deepLink';
+import { subscribeShopTopic } from './api/realtime';
 import {
   firstRow,
   normaliseMe,
@@ -588,12 +589,44 @@ export function ShopApiProvider({ children }: { children: ReactNode }) {
   }, [activeShopId, configured, credential?.token, status]);
 
   /**
-   * A reply arrives while the farmer is looking at the conversation.
+   * A reply arrives while the farmer is looking at the conversation — immediately.
    *
-   * The dealer platform offers no channel this build subscribes to, so the open
-   * app re-reads the thread on a timer — a few seconds, the way a chat app feels,
-   * rather than "close and reopen to see the answer". It costs nothing while the
-   * app is in the background: a hidden page does not tick.
+   * The shop writes the message, the credit decision or the visit move and broadcasts
+   * it in the same transaction (the dealer app's `0339`), so the wait is a socket
+   * frame rather than a poll interval. The subject is `realtime_topic`, which only
+   * this credential is given: the app cannot derive it, and losing the credential
+   * loses the channel.
+   *
+   * A `ready` event after the first join is a reconnection, and is treated as "read
+   * again" — frames missed while offline are not replayed.
+   */
+  const realtimeTopic = me?.realtimeTopic ?? null;
+  useEffect(() => {
+    if (!configured || status !== 'ready' || !credential?.token || !realtimeTopic) return;
+    const token = credential.token;
+    let inFlight = false;
+
+    const resync = async () => {
+      if (inFlight) return;
+      if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+      inFlight = true;
+      try {
+        await load(token);
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    return subscribeShopTopic(serviceConfig.shopApi, realtimeTopic, () => void resync());
+  }, [configured, credential?.token, load, realtimeTopic, status]);
+
+  /**
+   * The fallback: a shop backend with no channel, or a socket that will not open.
+   *
+   * It was the only mechanism before the shop broadcast existed, and it is kept
+   * deliberately — a phone on a network that blocks WebSockets still converges, and
+   * "slower" is a different failure from "never". It costs nothing in the
+   * background: a hidden page does not tick.
    */
   useEffect(() => {
     if (!configured || status !== 'ready' || !credential?.token) return;
