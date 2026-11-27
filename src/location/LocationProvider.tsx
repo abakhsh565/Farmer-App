@@ -4,6 +4,7 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from 'react';
@@ -104,6 +105,16 @@ export type LocationValue = {
    * because the radius the server searches with is part of the record.
    */
   radiusKm: number;
+  /**
+   * Where the restore stands.
+   *
+   * `restoring` is not "there is no location": a screen that renders the empty
+   * state during this window is telling the farmer to choose a place they already
+   * chose. `error` means the account could not be read — the last known location (if
+   * any) stays, and the screen says the read failed rather than pretending the
+   * farmer has none.
+   */
+  status: 'restoring' | 'ready' | 'error';
   setRadiusKm: (next: number) => void;
   /** False for a guest: saving needs an account. */
   canSave: boolean;
@@ -203,14 +214,35 @@ function writeStoredLocation(location: SavedLocation | null): void {
 
 export function LocationProvider({ children }: { children: ReactNode }) {
   const { account } = useSession();
-  const [saved, setSaved] = useState<SavedLocation | null>(null);
+  /* The device copy paints the first frame, so a returning farmer never sees the
+     empty state while the account is answering. */
+  const [saved, setSaved] = useState<SavedLocation | null>(readStoredLocation);
   const [temporary, setTemporaryState] = useState<TemporaryArea | null>(null);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
   const [radiusKm, setRadiusKmState] = useState<number>(readStoredRadius);
+  const [status, setStatus] = useState<'restoring' | 'ready' | 'error'>(() =>
+    serviceConfig.supabase.configured && account !== null ? 'restoring' : 'ready',
+  );
 
+  /* Read inside callbacks that outlive the render they were created in. */
+  const savedRef = useRef<SavedLocation | null>(saved);
+  savedRef.current = saved;
+  const signedInRef = useRef(account !== null);
+  signedInRef.current = account !== null;
+  const radiusTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  /**
+   * The radius is one setting, owned by the account when there is one.
+   *
+   * It used to be written to the phone only. The account's copy (the one
+   * `dealers_within_radius` reads) therefore kept its old value, and the next launch
+   * adopted it — which is exactly how a 100 km search came back as 10 km. Changing
+   * the radius now writes the server record too, debounced so dragging the slider
+   * is one write, not thirty.
+   */
   const setRadiusKm = useCallback((next: number) => {
     const clamped = Math.min(MAX_RADIUS_KM, Math.max(1, Math.round(next)));
     setRadiusKmState(clamped);
@@ -219,6 +251,28 @@ export function LocationProvider({ children }: { children: ReactNode }) {
     } catch {
       /* storage unavailable — the choice still applies for this session */
     }
+
+    const place = savedRef.current;
+    if (!signedInRef.current || !place) return;
+    if (radiusTimer.current) clearTimeout(radiusTimer.current);
+    radiusTimer.current = setTimeout(() => {
+      void writeSavedLocation({
+        label: place.label,
+        lat: place.lat,
+        lon: place.lon,
+        source: place.source,
+        radiusKm: clamped,
+      })
+        .then((updated) => {
+          setSaved(updated);
+          setError(null);
+        })
+        .catch((failure: unknown) => {
+          setError(
+            failure instanceof Error ? failure.message : 'The search radius could not be saved.',
+          );
+        });
+    }, 600);
   }, []);
 
   const backendLive = serviceConfig.supabase.configured;
@@ -241,11 +295,13 @@ export function LocationProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (!signedIn || !backendLive) {
       setSaved(readStoredLocation());
+      setStatus('ready');
       return;
     }
 
     let cancelled = false;
     setLoading(true);
+    setStatus('restoring');
 
     void (async () => {
       try {
@@ -267,7 +323,12 @@ export function LocationProvider({ children }: { children: ReactNode }) {
            * overwriting it. One owner per value — the account when there is one,
            * the phone otherwise.
            */
-          setRadiusKm(found.radiusKm);
+          setRadiusKmState(found.radiusKm);
+          try {
+            localStorage.setItem(RADIUS_KEY, String(found.radiusKm));
+          } catch {
+            /* storage unavailable — the account's answer still applies */
+          }
           /*
            * And the phone's own copy goes now, for the same reason it goes in the
            * hand-over below: the account has answered, so there is exactly one
@@ -279,6 +340,7 @@ export function LocationProvider({ children }: { children: ReactNode }) {
            */
           writeStoredLocation(null);
           setError(null);
+          setStatus('ready');
           return;
         }
 
@@ -286,6 +348,7 @@ export function LocationProvider({ children }: { children: ReactNode }) {
         if (!onDevice) {
           setSaved(null);
           setError(null);
+          setStatus('ready');
           return;
         }
 
@@ -300,9 +363,22 @@ export function LocationProvider({ children }: { children: ReactNode }) {
         setSaved(migrated);
         writeStoredLocation(null);
         setError(null);
+        setStatus('ready');
       } catch (failure) {
         if (cancelled) return;
-        setError(failure instanceof Error ? failure.message : 'The saved location could not be read.');
+        /*
+         * A failed read is not an empty account. The last known location — the
+         * phone's copy — stays on screen, and the screen can say the account could
+         * not be reached. Clearing it here is how a bad minute cost a farmer the
+         * place they had already chosen.
+         */
+        const known = savedRef.current ?? readStoredLocation();
+        setSaved(known);
+        if (known) setRadiusKmState(known.radiusKm);
+        setError(
+          failure instanceof Error ? failure.message : 'The saved location could not be read.',
+        );
+        setStatus('error');
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -311,7 +387,7 @@ export function LocationProvider({ children }: { children: ReactNode }) {
     return () => {
       cancelled = true;
     };
-  }, [backendLive, signedIn, account?.partyId, attempt, setRadiusKm]);
+  }, [backendLive, signedIn, account?.partyId, attempt]);
 
   const setTemporary = useCallback((area: TemporaryArea | null) => {
     setTemporaryState(area);
@@ -342,7 +418,9 @@ export function LocationProvider({ children }: { children: ReactNode }) {
         throw new Error('There is no location to save yet.');
       }
 
-      const radiusKm = input.radiusKm ?? saved?.radiusKm ?? DEFAULT_RADIUS_KM;
+      /* The radius on screen wins: choosing a place must not quietly reset a range
+         the farmer set before choosing it. */
+      const radius = input.radiusKm ?? radiusKm;
 
       setSaving(true);
       try {
@@ -353,14 +431,21 @@ export function LocationProvider({ children }: { children: ReactNode }) {
          */
         let result: SavedLocation;
         if (signedIn) {
-          result = await writeSavedLocation({ label, lat, lon, source, radiusKm });
+          result = await writeSavedLocation({ label, lat, lon, source, radiusKm: radius });
         } else {
-          result = { label, lat, lon, source, setAt: Date.now(), radiusKm };
+          result = { label, lat, lon, source, setAt: Date.now(), radiusKm: radius };
           writeStoredLocation(result);
         }
 
         setSaved(result);
+        setRadiusKmState(result.radiusKm);
+        try {
+          localStorage.setItem(RADIUS_KEY, String(result.radiusKm));
+        } catch {
+          /* storage unavailable — the choice still applies for this session */
+        }
         setError(null);
+        setStatus('ready');
         return result;
       } catch (failure) {
         const message =
@@ -371,7 +456,7 @@ export function LocationProvider({ children }: { children: ReactNode }) {
         setSaving(false);
       }
     },
-    [temporary, saved, signedIn],
+    [temporary, saved, signedIn, radiusKm],
   );
 
   const forget = useCallback(async () => {
@@ -401,6 +486,7 @@ export function LocationProvider({ children }: { children: ReactNode }) {
       saved,
       temporary,
       radiusKm,
+      status,
       setRadiusKm,
       activePoint,
       // Only a temporary area is passed as an origin. Absent means "ask the
@@ -431,6 +517,7 @@ export function LocationProvider({ children }: { children: ReactNode }) {
     saved,
     temporary,
     radiusKm,
+    status,
     setRadiusKm,
     loading,
     saving,

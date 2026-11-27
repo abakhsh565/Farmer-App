@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { LocationProvider, useLocation } from '@/location/LocationProvider';
 import {
@@ -95,6 +95,14 @@ function Probe() {
       <dd data-testid="radius">{location.radiusKm}</dd>
       <dt>On the phone</dt>
       <dd data-testid="on-device">{String(location.savedOnDevice)}</dd>
+      <dt>Status</dt>
+      <dd data-testid="status">{location.status}</dd>
+      <dt>Change range</dt>
+      <dd>
+        <button type="button" onClick={() => location.setRadiusKm(100)}>
+          set-100
+        </button>
+      </dd>
     </dl>
   );
 }
@@ -172,6 +180,36 @@ describe('a signed-in farmer', () => {
     // account.
     expect(localStorage.getItem(DEVICE_KEY)).toBeNull();
     expect(screen.getByTestId('on-device')).toHaveTextContent('false');
+  });
+
+  it('keeps the last known area when the account cannot be read', async () => {
+    /* A dropped request used to read as "no saved location", which put the empty
+       state in front of a farmer who had one. The phone's copy is the last known
+       answer and survives the failure. */
+    localStorage.setItem(DEVICE_KEY, JSON.stringify(GUEST_AREA));
+    vi.mocked(readSavedLocation).mockRejectedValue(new Error('offline'));
+
+    open();
+
+    await waitFor(() => expect(screen.getByTestId('status')).toHaveTextContent('error'));
+    expect(screen.getByTestId('area')).toHaveTextContent('Alipur');
+    expect(localStorage.getItem(DEVICE_KEY)).not.toBeNull();
+  });
+
+  it('writes a changed range to the account, so the next launch keeps it', async () => {
+    vi.mocked(readSavedLocation).mockResolvedValue(ACCOUNT_AREA);
+
+    open();
+    await waitFor(() => expect(screen.getByTestId('area')).toHaveTextContent('Gujranwala'));
+
+    fireEvent.click(screen.getByText('set-100'));
+
+    await waitFor(() =>
+      expect(writeSavedLocation).toHaveBeenCalledWith(
+        expect.objectContaining({ label: 'Gujranwala', radiusKm: 100 }),
+      ),
+    );
+    expect(localStorage.getItem(RADIUS_KEY)).toBe('100');
   });
 
   it('says nothing is saved when neither the account nor the phone has an area', async () => {

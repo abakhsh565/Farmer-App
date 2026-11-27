@@ -348,13 +348,17 @@ export function HomeScreen({
           */}
           <button
             type="button"
-            aria-label={`${t('location.title')}: ${location.placeLabel || t('location.none')}`}
+            aria-label={`${t('location.title')}: ${
+              location.placeLabel ||
+              (location.status === 'restoring' ? t('location.restoring') : t('location.none'))
+            }`}
             onClick={onOpenLocationSearch}
             className="mt-0.5 flex max-w-full items-center gap-1 text-label text-muted-foreground"
           >
             <MapPin className="size-3.5 shrink-0" aria-hidden />
             <span className="truncate">
-              {location.placeLabel || t('location.none')}
+              {location.placeLabel ||
+                (location.status === 'restoring' ? t('location.restoring') : t('location.none'))}
             </span>
             {location.isTemporary ? (
               <span className="shrink-0 rounded-full bg-muted px-1.5 py-0.5 text-caption">

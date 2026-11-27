@@ -81,13 +81,21 @@ function rowToLocation(row: LocationRow): SavedLocation | null {
   };
 }
 
-/** The signed-in farmer's saved location, or null — including for a guest. */
+/**
+ * The signed-in farmer's saved location, or null — including for a guest.
+ *
+ * A failed read throws. It used to return null for every outcome, which made a
+ * dropped request indistinguishable from "this farmer never chose a place" — and
+ * the screen then told a farmer with a saved location to set one again. Callers
+ * keep the last known location on a throw; they clear it only when the server
+ * says, successfully, that there is none.
+ */
 export async function readSavedLocation(): Promise<SavedLocation | null> {
   const client = await getSupabaseClient(serviceConfig.supabase);
-  if (!client) return null;
+  if (!client) throw new Error('The backend is not configured.');
 
   const { data, error } = await client.rpc('farmer_location_get');
-  if (error) return null;
+  if (error) throw new Error(error.message);
 
   const rows = (data as LocationRow[] | null) ?? [];
   const row = rows[0];

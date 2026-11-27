@@ -89,7 +89,10 @@ function useResource<T>(
 
   useEffect(() => {
     if (!enabled) {
-      setInFlight(false);
+      /* Disabled is "not asked yet", not "asked and got nothing". Leaving the
+         spinner state on is what stops a screen printing "0 dealers" before the
+         saved location has even been restored. */
+      setInFlight(true);
       return;
     }
     let cancelled = false;
@@ -219,7 +222,10 @@ export function useDealerSearch(
  * a different area is then a different request rather than a cached answer about
  * the old one, which is the mistake the key exists to make impossible.
  */
-export function useProductSearch(query: ProductSearchQuery): Resource<ProductHit[]> {
+export function useProductSearch(
+  query: ProductSearchQuery,
+  enabled = true,
+): Resource<ProductHit[]> {
   const { radiusKm, query: text, origin } = query;
   const key = [
     'product-search',
@@ -232,6 +238,7 @@ export function useProductSearch(query: ProductSearchQuery): Resource<ProductHit
     key,
     EMPTY as unknown as ProductHit[],
     (services) => services.dealer.searchProducts({ radiusKm, query: text, origin }),
+    enabled,
   );
 }
 
