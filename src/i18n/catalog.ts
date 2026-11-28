@@ -354,6 +354,9 @@ export const en = {
   'chat.voice.discard': 'Delete recording',
   'chat.voice.failed': 'Voice message not sent',
   'chat.send.failed': 'Message not sent. Try again.',
+  'chat.notConnected':
+    'Connect to your shop to send messages, voice notes and photos here.',
+  'chat.connectAction': 'Connect to a shop',
   'chat.voice.uploading': 'Sending {percent}%',
   'chat.voice.recording': 'Recording {duration}',
   'chat.voice.preview': 'Ready to send · {duration}',
@@ -3037,6 +3040,8 @@ export const ur: Record<MessageKey, string> = {
   'weather.todayTab': 'آج',
 
   // ── joining a shop by its code ───────────────────────────────────────────
+  'chat.notConnected': 'یہاں پیغام، آواز یا تصویر بھیجنے کے لیے اپنی دکان سے جڑیں۔',
+  'chat.connectAction': 'دکان سے جڑیں',
   'shop.join.title': 'اس دکان میں شامل ہوں',
   'shop.join.body': 'آپ نے دکان کا کوڈ اسکین کیا۔ شامل ہو کر دیکھیں کہ دکان میں کیا ملتا ہے اور پیغام بھیجیں۔',
   'shop.join.confirm': 'شامل ہوں',

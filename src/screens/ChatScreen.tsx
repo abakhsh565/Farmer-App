@@ -273,6 +273,17 @@ export function ChatScreen({ onBrowseDealers, onOpenDealer }: Props) {
   if (chat.openThreadKey !== null) {
     const dealerId = chat.openThreadKey;
     /*
+     * Whether this conversation can actually be written in.
+     *
+     * A live conversation is a thread at the shop backend, and writing to it needs
+     * this phone's credential. A farmer can open a shop from the directory before
+     * connecting — the screen used to show the full composer for that state, and
+     * every send came back as "Message not sent. Try again." with no way to tell
+     * why. Saying which step is missing, and offering it, is the honest version:
+     * the composer belongs to a conversation, and there isn't one yet.
+     */
+    const connected = !chat.live || shop.credential !== null;
+    /*
      * A line of text, handed to the shop.
      *
      * The box used to be cleared the moment the send was *started*, so a refusal —
@@ -607,6 +618,16 @@ export function ChatScreen({ onBrowseDealers, onOpenDealer }: Props) {
             onCancel={recorder.cancel}
             onSend={sendVoice}
           />
+        ) : !connected ? (
+          <div className="shrink-0 border-t border-border p-3">
+            <p className="text-caption text-muted-foreground">{t('chat.notConnected')}</p>
+            <Button
+              className="mt-2 h-11 w-full rounded-full"
+              onClick={() => setConnecting(true)}
+            >
+              {t('chat.connectAction')}
+            </Button>
+          </div>
         ) : (
         <form
           className="shrink-0 border-t border-border p-3"
@@ -729,6 +750,9 @@ export function ChatScreen({ onBrowseDealers, onOpenDealer }: Props) {
         ) : null}
 
         {sheet ? <ShopRequestSheet mode={sheet} onClose={() => setSheet(null)} /> : null}
+
+        {/* The way out of a conversation that cannot be written in yet. */}
+        {connecting ? <ShopConnectSheet onClose={() => setConnecting(false)} /> : null}
       </div>
     );
   }
