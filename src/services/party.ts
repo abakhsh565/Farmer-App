@@ -19,9 +19,9 @@
 
 import { serviceConfig } from './config';
 import {
-  currentSessionUser,
+  currentSession,
   getSupabaseClient,
-  type SessionUser,
+  type SessionProbe,
   type SupabaseLike,
 } from './supabaseClient';
 
@@ -62,10 +62,34 @@ export async function resolvePartyId(): Promise<string | null> {
   return ensureParty(client);
 }
 
-/** Who Supabase has a session for, or null. Local read — no network. */
-export async function sessionUser(): Promise<SessionUser | null> {
-  if (!backendConfigured()) return null;
+/**
+ * Whether a session is present, absent, or simply unreadable right now.
+ *
+ * The third answer is the point: a client that could not be created, a storage
+ * read that threw, or a token refresh that failed offline are not evidence that
+ * the farmer signed out, and callers must be able to tell them apart from the
+ * client's own "nobody is signed in".
+ */
+export async function probeSession(): Promise<SessionProbe> {
+  if (!backendConfigured()) return { status: 'unknown' };
   const client = await getSupabaseClient(serviceConfig.supabase);
-  if (!client) return null;
-  return currentSessionUser();
+  if (!client) return { status: 'unknown' };
+  return currentSession();
+}
+
+/**
+ * Whether a refusal is the "your session has no party" shape.
+ *
+ * Lives here, beside `ensureParty`, because it is the recognition half of the same
+ * repair: the write calls this to decide whether `ensure_party` plus one retry can
+ * fix the refusal. Deliberately narrow — these are the messages Postgres, PostgREST
+ * and the app's own functions produce for that state, not every permission error. A
+ * genuine "you may not do this" must not be retried into a second identical
+ * failure, and the services layer must not have to reach into `src/session` to
+ * learn that.
+ */
+export function needsPartyRepair(message: string): boolean {
+  return /sign in to|not authenticated|no party|party id|jwt|row-level security|permission denied for function|invalid claim/i.test(
+    message,
+  );
 }

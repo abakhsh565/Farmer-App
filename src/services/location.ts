@@ -17,9 +17,8 @@
  * 'map') is translated here, in one place, so the two cannot drift apart.
  */
 
-import { needsPartyRepair } from '@/session/reconcile';
 import { serviceConfig } from './config';
-import { ensureParty } from './party';
+import { ensureParty, needsPartyRepair } from './party';
 import { getSupabaseClient, type SupabaseLike } from './supabaseClient';
 
 /** The server's closed set. Kept in step with the check constraint on the column. */

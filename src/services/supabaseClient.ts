@@ -45,7 +45,17 @@ export type SupabaseLike = {
     args?: Record<string, unknown>,
   ) => Promise<{ data: unknown; error: { message: string; code?: string } | null }>;
   auth: {
-    getSession: () => Promise<{ data: { session: SupabaseSession | null } }>;
+    /**
+     * `error` is part of the shape because it is the difference between "nobody is
+     * signed in" and "the session could not be read this time". A refresh that
+     * failed for want of a network returns an error with a null session, and
+     * treating that as a sign-out is how a farmer opening the app on a dead spot
+     * loses their account.
+     */
+    getSession: () => Promise<{
+      data: { session: SupabaseSession | null };
+      error?: { message: string } | null;
+    }>;
     /** Supabase sends its own SMS when phone auth is configured; we never hold the code. */
     signInWithOtp: (input: {
       phone?: string;
@@ -227,6 +237,44 @@ export async function currentSessionUser(): Promise<SessionUser | null> {
     return { id: user.id, phone: user.phone ?? null, email: user.email ?? null };
   } catch {
     return null;
+  }
+}
+
+/**
+ * What the local session read can tell us — three answers, not two.
+ *
+ * `absent` is evidence: the client answered, without an error, that nobody is
+ * signed in. `unknown` is the opposite — no client, a throw, or a refresh that
+ * failed (offline, a cold start racing the token restore, a backend mid-deploy).
+ * Collapsing the two into `null` is what made "I could not read it" look exactly
+ * like "you are signed out".
+ */
+export type SessionProbe =
+  | { status: 'present'; user: SessionUser }
+  | { status: 'absent' }
+  | { status: 'unknown' };
+
+/**
+ * The session as this device holds it, read locally and without the network.
+ *
+ * Safe to ask on every launch: it is a storage read plus, at most, a token
+ * refresh. A refresh that fails is reported as `unknown` rather than as an
+ * absence, so an offline phone keeps the account it already had.
+ */
+export async function currentSession(): Promise<SessionProbe> {
+  const client = cachedClient;
+  if (!client) return { status: 'unknown' };
+  try {
+    const { data, error } = await client.auth.getSession();
+    if (error) return { status: 'unknown' };
+    const user = data.session?.user;
+    if (!user) return { status: 'absent' };
+    return {
+      status: 'present',
+      user: { id: user.id, phone: user.phone ?? null, email: user.email ?? null },
+    };
+  } catch {
+    return { status: 'unknown' };
   }
 }
 
