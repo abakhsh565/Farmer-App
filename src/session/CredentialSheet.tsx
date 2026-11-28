@@ -7,6 +7,7 @@ import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sh
 import { useLocale } from '@/i18n/LocaleProvider';
 import type { MessageKey } from '@/i18n/catalog';
 import { serviceConfig } from '@/services/config';
+import { ensureParty } from '@/services/party';
 import { getSupabaseClient, toE164, type SupabaseLike } from '@/services/supabaseClient';
 import { useSession } from './SessionProvider';
 import { isEmail, isPhone } from './store';
@@ -895,23 +896,6 @@ async function contactExists(client: SupabaseLike, contact: string): Promise<boo
     return row.exists_ === true || row.exists === true;
   }
   return false;
-}
-
-/**
- * The party id for the session just established.
- *
- * `ensure_party()` is idempotent, and a session without a party id is a real state
- * the app can show rather than a failure to hide — so this returns null instead of
- * throwing when the backend does not answer.
- */
-async function ensureParty(client: SupabaseLike): Promise<string | null> {
-  try {
-    const { data, error } = await client.rpc('ensure_party');
-    if (error) return null;
-    return typeof data === 'string' ? data : null;
-  } catch {
-    return null;
-  }
 }
 
 function isWrongCredentials(message: string): boolean {
