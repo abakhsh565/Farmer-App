@@ -24,7 +24,7 @@
 
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { zipDirectory } from './lib/zip.mjs';
 import { buildEnvFor } from './lib/build-environment.mjs';
@@ -109,6 +109,20 @@ const REPO = resolveRepo();
 /** Printed so a workflow log states which repository it is writing to. */
 console.log(`ota-publish: channel ${tag} on ${REPO}`);
 
+/**
+ * The URL this bundle watches, which has to be *inside* it.
+ *
+ * `src/services/liveUpdate.ts` reads `VITE_OTA_BASE` and no-ops without it, so a
+ * bundle built without this variable lands on the phone and then never looks for
+ * another update again — the update channel quietly ending at the first update.
+ * Only `scripts/build-apk.mjs` used to set it, which is why an APK could move once
+ * and never again.
+ *
+ * It is derived from the same `REPO` and `tag` the assets are uploaded to, so a
+ * build cannot watch a different repository from the one this command publishes.
+ */
+const CHANNEL_BASE = `https://github.com/${REPO}/releases/download/${tag}`;
+
 const sha = git(['rev-parse', '--short', 'HEAD']);
 const builtAt = new Date().toISOString();
 const bundleId = `${sha}-${builtAt.replace(/[-:.TZ]/g, '').slice(0, 14)}`;
@@ -120,7 +134,7 @@ console.log(`ota-publish: building the ${env} web bundle…`);
 /* CI has no `.env.local`, but this is also run by hand on a developer's machine,
    where it does — and a bundle that points at localhost reaches every phone on
    the channel. See `scripts/lib/build-environment.mjs`. */
-const buildEnv = buildEnvFor(env);
+const buildEnv = { ...buildEnvFor(env), VITE_OTA_BASE: CHANNEL_BASE };
 const run = (script, args) => {
   const result = spawnSync(process.execPath, [join(ROOT, 'node_modules', ...script), ...args], {
     cwd: ROOT,
@@ -131,6 +145,25 @@ const run = (script, args) => {
 };
 run(['typescript', 'bin', 'tsc'], ['--noEmit']);
 run(['vite', 'bin', 'vite.js'], ['build']);
+
+/*
+ * Prove the channel reached the bundle before it is published.
+ *
+ * This is the check for the failure above: the build succeeds either way, the zip
+ * uploads either way, and the only symptom is a phone that never updates again.
+ * A missing string here is a failed release, not a warning.
+ */
+const builtFiles = readdirSync(join(DIST, 'assets')).filter((name) => name.endsWith('.js'));
+const carriesChannel = builtFiles.some((name) =>
+  readFileSync(join(DIST, 'assets', name), 'utf8').includes(CHANNEL_BASE),
+);
+if (!carriesChannel) {
+  fail(
+    'the built bundle does not contain its own update channel.',
+    `  Expected ${CHANNEL_BASE} in dist/assets/*.js.\n  A bundle without it installs and can never update again.`,
+  );
+}
+console.log(`ota-publish: bundle carries its channel — ${CHANNEL_BASE}`);
 
 /**
  * The voice folder stays out of the bundle, if a build ever puts one back.
