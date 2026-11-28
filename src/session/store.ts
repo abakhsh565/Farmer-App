@@ -153,6 +153,40 @@ export function markContextMigrated(state: SessionState): SessionState {
 }
 
 /**
+ * Take on a session the server still holds, when the app's own record was lost.
+ *
+ * A reinstall, a cleared document or a launch that raced the token restore leaves
+ * a valid Supabase session with no account beside it. Asking for a code again in
+ * that state is a lie about what the app knows — the server has already proved this
+ * number, and the token is in hand. The contact is not re-validated here because
+ * the server, not the field, is where it came from.
+ */
+export function adoptAccount(
+  state: SessionState,
+  input: {
+    userId: string;
+    contact: string;
+    phone: string | null;
+    email: string | null;
+    partyId: string | null;
+  },
+  now: number,
+): SessionState {
+  const method: 'phone' | 'email' = input.phone ? 'phone' : 'email';
+  const contact = input.contact.trim();
+  const account: Account = {
+    id: input.partyId ?? input.userId,
+    name: contact === '' ? defaultName(method, input.userId) : defaultName(method, contact),
+    phone: input.phone,
+    email: input.email,
+    method,
+    verifiedAt: now,
+    partyId: input.partyId,
+  };
+  return { ...state, account, pendingReason: null };
+}
+
+/**
  * Record the party id learned for an account that is already signed in.
  *
  * The account id *is* the party id, because that is the row key every policy in

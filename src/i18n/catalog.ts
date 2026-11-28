@@ -731,6 +731,8 @@ export const en = {
     'Demo build: the account is created on this phone only. No SMS or email is sent yet.',
   'session.welcome': 'Welcome, {name}',
   'session.welcomeMigrated': 'Welcome, {name}. Your crops and village were saved to the account.',
+  'session.expired':
+    'Your account signed out on this phone. Sign in again to save your location and orders.',
   'session.error.phoneRequired': 'Enter your mobile number',
   'session.error.phone': 'A Pakistani mobile number is 11 digits, like 0300 1234567',
   'session.error.emailRequired': 'Enter your email',
@@ -2222,6 +2224,8 @@ export const ur: Record<MessageKey, string> = {
     'یہ ڈیمو ہے: اکاؤنٹ صرف اسی فون پر بنتا ہے۔ ابھی کوئی ایس ایم ایس یا ای میل نہیں جاتا۔',
   'session.welcome': 'خوش آمدید، {name}',
   'session.welcomeMigrated': 'خوش آمدید، {name}۔ آپ کی فصلیں اور گاؤں اکاؤنٹ میں محفوظ ہو گئے۔',
+  'session.expired':
+    'اس فون پر آپ کا اکاؤنٹ سائن آؤٹ ہو گیا ہے۔ مقام اور آرڈر محفوظ کرنے کے لیے دوبارہ سائن اِن کریں۔',
   'session.error.phoneRequired': 'اپنا موبائل نمبر لکھیں',
   'session.error.phone': 'پاکستانی موبائل نمبر 11 ہندسوں کا ہوتا ہے، جیسے 0300 1234567',
   'session.error.emailRequired': 'اپنا ای میل لکھیں',

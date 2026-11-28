@@ -17,8 +17,10 @@
  * 'map') is translated here, in one place, so the two cannot drift apart.
  */
 
+import { needsPartyRepair } from '@/session/reconcile';
 import { serviceConfig } from './config';
-import { getSupabaseClient } from './supabaseClient';
+import { ensureParty } from './party';
+import { getSupabaseClient, type SupabaseLike } from './supabaseClient';
 
 /** The server's closed set. Kept in step with the check constraint on the column. */
 export type LocationSource = 'profile_entry' | 'device_permission' | 'dealer_record';
@@ -104,15 +106,7 @@ export async function readSavedLocation(): Promise<SavedLocation | null> {
   return rowToLocation(row);
 }
 
-/**
- * Save, explicitly. Throws with the server's own message when it refuses, so the
- * screen can show the real reason (not signed in, coordinates out of range, name
- * missing) instead of a generic failure.
- */
-export async function writeSavedLocation(input: LocationWrite): Promise<SavedLocation> {
-  const client = await getSupabaseClient(serviceConfig.supabase);
-  if (!client) throw new Error('The backend is not configured.');
-
+async function saveOnce(client: SupabaseLike, input: LocationWrite): Promise<SavedLocation> {
   const { data, error } = await client.rpc('farmer_location_save', {
     p_label: input.label,
     p_lat: input.lat,
@@ -129,6 +123,43 @@ export async function writeSavedLocation(input: LocationWrite): Promise<SavedLoc
   if (!saved) throw new Error('The saved location was not returned by the server.');
 
   return saved;
+}
+
+/**
+ * Save, explicitly. Throws with the server's own message when it refuses, so the
+ * screen can show the real reason (coordinates out of range, name missing) instead
+ * of a generic failure.
+ *
+ * ## The one refusal that repairs itself
+ *
+ * `farmer_location_save` raises "Sign in to save a location." when
+ * `current_party_id()` is null — a session that is perfectly valid but carries no
+ * party row. That is a real state, not a stale token: an account made before the
+ * signup trigger existed, or a sign-in that completed while the backend was
+ * briefly unreachable. The app used to surface it to a farmer who had just signed
+ * in, which is the exact complaint this fixes.
+ *
+ * The refusal is narrow enough to recognise, and `ensure_party()` is idempotent, so
+ * the write asks for the party once and tries again. A second refusal is thrown as
+ * it is: at that point the session genuinely cannot write, and repeating the call
+ * would only tell the farmer the same thing more slowly. Every other refusal — out
+ * of range, a policy that really does say no — is rethrown untouched and never
+ * retried.
+ */
+export async function writeSavedLocation(input: LocationWrite): Promise<SavedLocation> {
+  const client = await getSupabaseClient(serviceConfig.supabase);
+  if (!client) throw new Error('The backend is not configured.');
+
+  try {
+    return await saveOnce(client, input);
+  } catch (failure) {
+    const message = failure instanceof Error ? failure.message : String(failure);
+    if (!needsPartyRepair(message)) throw failure;
+
+    const partyId = await ensureParty(client);
+    if (!partyId) throw failure;
+    return saveOnce(client, input);
+  }
 }
 
 /** Forget the saved location. The next search falls back to the farmer's area. */
